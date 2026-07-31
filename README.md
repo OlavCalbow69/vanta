@@ -42,11 +42,11 @@ Stable releases use semantic version tags that must match
 `VANTA_VERSION_STRING` in `src\version.hpp`. For example:
 
 ```powershell
-git tag -a v1.0.0 -m "Vanta v1.0.0"
-git push origin v1.0.0
+git tag -a vX.Y.Z -m "Vanta vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
-The tag workflow publishes `vanta-v1.0.0-win64.zip` and its SHA-256 checksum
+The tag workflow publishes `vanta-vX.Y.Z-win64.zip` and its SHA-256 checksum
 as permanent GitHub Release assets. The ZIP contains `vanta.exe`, OpenCV and
 MAKCU runtime DLLs, and this README.
 
