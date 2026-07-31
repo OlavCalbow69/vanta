@@ -9,8 +9,10 @@
     <Filter Include="Resources"><UniqueIdentifier>{0E29C4C0-B5A4-4DBE-AE9A-ED3A22BF95C5}</UniqueIdentifier></Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\bomb_timer_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\main.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\capture_controller.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\config_manager.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\logger.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\makcu_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\overlay_app.cpp"><Filter>Source</Filter></ClCompile>
@@ -28,6 +30,9 @@
     <ClCompile Include="vendor\imgui\custom\custom_widgets.cpp"><Filter>Vendor\ImGui\Custom</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\bomb_timer_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\app_settings.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\config_manager.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\color_targets.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\logger.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\makcu_controller.hpp"><Filter>Source</Filter></ClInclude>

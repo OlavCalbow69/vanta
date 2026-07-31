@@ -297,6 +297,7 @@ namespace vanta
         std::atomic<bool> hitRightState{false};
         std::atomic<int> matchingPixels{0};
         std::atomic<TestClickState> state{TestClickState::offline};
+        std::atomic<std::uint64_t> settingsRevision{0};
 
         int    burstCount{0};
         double lastShotTime{0.0};
@@ -593,11 +594,6 @@ namespace vanta
         auto& impl = *implementation_;
         impl.capture = capture;
         impl.makcu   = makcu;
-        if (impl.capture != nullptr)
-        {
-            impl.capture->SetColorTargetIndex(
-                impl.hsvRangeIndex);
-        }
         impl.Start();
         vanta::log::Info("TestClick controller initialized");
     }
@@ -671,45 +667,24 @@ namespace vanta
 
         {
             std::lock_guard<std::mutex> lk(impl.settingsMutex);
+            bool settingsChanged = false;
+            const auto drawCategory =
+                [](const char* label)
+                {
+                    ImGui::Spacing();
+                    ImGui::TextColored(
+                        ImGui::GetStyleColorVec4(
+                            ImGuiCol_CheckMark),
+                        "%s",
+                        label);
+                    custom::Separator();
+                };
 
             custom::Checkbox("Enable TestClick", &impl.enabled);
 
             if (impl.enabled)
             {
-            ImGui::Spacing();
-
-            const char* colorTargets[
-                vanta::kHsvColorTargets.size()]{};
-            for (std::size_t index = 0;
-                 index < vanta::kHsvColorTargets.size();
-                 ++index)
-            {
-                colorTargets[index] =
-                    vanta::kHsvColorTargets[index].label;
-            }
-            if (custom::Combo(
-                "Color target",
-                &impl.hsvRangeIndex,
-                colorTargets,
-                static_cast<int>(
-                    vanta::kHsvColorTargets.size())) &&
-                impl.capture != nullptr)
-            {
-                impl.capture->SetColorTargetIndex(
-                    impl.hsvRangeIndex);
-            }
-            ImGui::TextDisabled(
-                "%s",
-                vanta::kHsvColorTargets[
-                    static_cast<std::size_t>(
-                        std::clamp(
-                            impl.hsvRangeIndex,
-                            0,
-                            static_cast<int>(
-                                vanta::kHsvColorTargets.size()) - 1))]
-                    .description);
-
-            custom::Separator();
+            drawCategory("ACTIVATION");
 
             const char* keyNames[]{
                 "Mouse4 (XButton1)", "Mouse5 (XButton2)",
@@ -734,68 +709,170 @@ namespace vanta
             if (custom::Combo("Hold key", &selectedKey, keyNames, keyCount))
             {
                 impl.triggerKey = keyValues[selectedKey];
+                settingsChanged = true;
             }
+            settingsChanged |= custom::Checkbox(
+                "Pause while moving (WASD)",
+                &impl.respectMovement);
 
-            custom::Separator();
+            drawCategory("TARGET");
 
-            const char* modeNames[]{"Strict (All 3 Rays Required)", "Flexible (At Least 2 Rays)"};
-            custom::Combo("Detection Mode", &impl.hitMode, modeNames, 2);
+            const char* colorTargets[
+                vanta::kHsvColorTargets.size()]{};
+            for (std::size_t index = 0;
+                 index < vanta::kHsvColorTargets.size();
+                 ++index)
+            {
+                colorTargets[index] =
+                    vanta::kHsvColorTargets[index].label;
+            }
+            settingsChanged |= custom::Combo(
+                "Color target",
+                &impl.hsvRangeIndex,
+                colorTargets,
+                static_cast<int>(
+                    vanta::kHsvColorTargets.size()));
 
-            custom::SliderInt(
+            drawCategory("DETECTION");
+
+            const char* modeNames[]{
+                "Strict (3 rays)",
+                "Flexible (2+ rays)"};
+            settingsChanged |= custom::Combo(
+                "Detection Mode",
+                &impl.hitMode,
+                modeNames,
+                2);
+
+            settingsChanged |= custom::SliderInt(
                 "Capture Radius", &impl.roiOffset, 10, 150, "%d px");
             impl.rayLength = std::clamp(
                 impl.rayLength,
                 1,
                 std::max(1, impl.roiOffset - 1));
 
-            custom::SliderInt(
+            settingsChanged |= custom::SliderInt(
                 "Ray Length",
                 &impl.rayLength,
                 1,
                 std::max(1, impl.roiOffset - 1),
                 "%d px");
-            ImGui::TextDisabled(
-                "Limited to the active capture radius");
 
-            custom::SliderInt(
+            settingsChanged |= custom::SliderInt(
                 "Ray Thickness", &impl.rayHalfWidth, 0, 5, "+/- %d px");
-            ImGui::TextDisabled("Width tolerance around the 1D ray path");
 
-            custom::Separator();
+            drawCategory("FIRE CONTROL");
 
-            custom::Checkbox(
+            settingsChanged |= custom::Checkbox(
                 "Enable burst limiter",
                 &impl.burstLimiter);
             if (impl.burstLimiter)
             {
-                custom::SliderFloat(
+                settingsChanged |= custom::SliderFloat(
                     "Shot delay", &impl.burstDelay,
                     0.00F, 0.50F, "%.3f s");
-                custom::SliderFloat(
+                settingsChanged |= custom::SliderFloat(
                     "Burst pause", &impl.burstPause,
                     0.00F, 1.50F, "%.3f s");
-                custom::SliderInt(
+                settingsChanged |= custom::SliderInt(
                     "Burst size", &impl.burstSize, 1, 8, "%d shots");
             }
-            else
-            {
-                ImGui::TextDisabled(
-                    "Immediate mode: one click per matching captured frame");
             }
-
-            custom::Separator();
-
-            custom::Checkbox("Pause while moving (WASD)", &impl.respectMovement);
-
+            if (settingsChanged)
+            {
+                impl.settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
             }
         }
 
-        ImGui::Spacing();
-        ImGui::TextDisabled(
-            "Zero-Delay Condition Variable Sync + Pointer Ray Marching.\n"
-            "Evaluates instantaneous GPU capture frames on arrival.");
-
         ImGui::PopStyleVar();
         custom::EndChild();
+    }
+
+    TestClickConfig TestClickController::GetConfig() const
+    {
+        auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.settingsMutex);
+        TestClickConfig result;
+        result.enabled = impl.enabled;
+        result.hsvRangeIndex =
+            impl.hsvRangeIndex;
+        result.triggerKey = impl.triggerKey;
+        result.roiOffset = impl.roiOffset;
+        result.rayLength = impl.rayLength;
+        result.rayHalfWidth =
+            impl.rayHalfWidth;
+        result.hitMode = impl.hitMode;
+        result.burstLimiter =
+            impl.burstLimiter;
+        result.burstDelay = impl.burstDelay;
+        result.burstPause = impl.burstPause;
+        result.burstSize = impl.burstSize;
+        result.respectMovement =
+            impl.respectMovement;
+        return result;
+    }
+
+    void TestClickController::ApplyConfig(
+        const TestClickConfig& config)
+    {
+        auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.settingsMutex);
+        impl.enabled = config.enabled;
+        impl.hsvRangeIndex = std::clamp(
+            config.hsvRangeIndex,
+            0,
+            static_cast<int>(
+                kHsvColorTargets.size()) - 1);
+        impl.triggerKey =
+            config.triggerKey != 0
+            ? config.triggerKey
+            : VK_XBUTTON1;
+        impl.roiOffset =
+            std::clamp(config.roiOffset, 10, 150);
+        impl.rayLength =
+            std::clamp(
+                config.rayLength,
+                1,
+                std::max(
+                    1,
+                    impl.roiOffset - 1));
+        impl.rayHalfWidth =
+            std::clamp(
+                config.rayHalfWidth,
+                0,
+                5);
+        impl.hitMode =
+            std::clamp(config.hitMode, 0, 1);
+        impl.burstLimiter =
+            config.burstLimiter;
+        impl.burstDelay =
+            std::clamp(
+                config.burstDelay,
+                0.0F,
+                0.50F);
+        impl.burstPause =
+            std::clamp(
+                config.burstPause,
+                0.0F,
+                1.50F);
+        impl.burstSize =
+            std::clamp(config.burstSize, 1, 8);
+        impl.respectMovement =
+            config.respectMovement;
+        impl.settingsRevision.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    std::uint64_t
+    TestClickController::SettingsRevision() const noexcept
+    {
+        return implementation_->
+            settingsRevision.load(
+                std::memory_order_relaxed);
     }
 }

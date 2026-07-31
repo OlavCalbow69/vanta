@@ -17,8 +17,11 @@ namespace vanta
         void Shutdown();
         void Tick();
         void RenderPanel();
+        bool TryAutoConnect();
+        void Disconnect();
         bool TryClick();
         bool TryMove(int x, int y);
+        bool ForceReleaseLeftButton();
         bool IsConnected() const noexcept;
 
     private:

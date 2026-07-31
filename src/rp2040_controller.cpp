@@ -80,9 +80,15 @@ namespace vanta
         std::string status{"RP2040 device not scanned"};
         int testMoveX{};
         int testMoveY{};
+        bool releasePending{};
 
-        void CloseLocked()
+        void CloseLocked(bool attemptRelease = true)
         {
+            if (attemptRelease &&
+                device != INVALID_HANDLE_VALUE)
+            {
+                ForceReleaseLocked(false);
+            }
             connected.store(false, std::memory_order_release);
             if (device != INVALID_HANDLE_VALUE)
             {
@@ -93,6 +99,85 @@ namespace vanta
             productName.clear();
             outputReportLength =
                 kFirmwarePayloadSize + 1;
+        }
+
+        bool WriteReportLocked(
+            std::int16_t dx,
+            std::int16_t dy,
+            std::uint8_t buttons)
+        {
+            if (device == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+
+            std::vector<std::uint8_t> report(
+                outputReportLength,
+                0);
+            report[0] = kOutputReportId;
+            // Complete 65-byte host report: report ID, int16 X, int16 Y,
+            // then the application button bitmask.
+            report[1] =
+                static_cast<std::uint8_t>(dx & 0xFF);
+            report[2] =
+                static_cast<std::uint8_t>(
+                    (static_cast<std::uint16_t>(dx) >> 8) &
+                    0xFF);
+            report[3] =
+                static_cast<std::uint8_t>(dy & 0xFF);
+            report[4] =
+                static_cast<std::uint8_t>(
+                    (static_cast<std::uint16_t>(dy) >> 8) &
+                    0xFF);
+            report[5] = buttons;
+
+            DWORD written = 0;
+            return
+                WriteFile(
+                    device,
+                    report.data(),
+                    static_cast<DWORD>(report.size()),
+                    &written,
+                    nullptr) &&
+                written ==
+                    static_cast<DWORD>(report.size());
+        }
+
+        bool ForceReleaseLocked(bool reportFailure = true)
+        {
+            if (device == INVALID_HANDLE_VALUE)
+            {
+                releasePending = true;
+                return false;
+            }
+
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                if (WriteReportLocked(0, 0, 0))
+                {
+                    if (releasePending)
+                    {
+                        vanta::log::Info(
+                            "RP2040 left-button release recovered");
+                    }
+                    releasePending = false;
+                    return true;
+                }
+                if (attempt != 2)
+                {
+                    Sleep(1);
+                }
+            }
+
+            releasePending = true;
+            status =
+                "RP2040 left-button release failed; recovery pending";
+            if (reportFailure)
+            {
+                vanta::log::Warning(
+                    "RP2040 left-button release failed after 3 attempts");
+            }
+            return false;
         }
 
         bool Refresh()
@@ -218,6 +303,11 @@ namespace vanta
                 productName = WideToUtf8(product.data());
                 outputReportLength =
                     capabilities.OutputReportByteLength;
+                if (!ForceReleaseLocked())
+                {
+                    CloseLocked(false);
+                    continue;
+                }
                 connected.store(
                     true,
                     std::memory_order_release);
@@ -251,41 +341,13 @@ namespace vanta
                 return false;
             }
 
-            std::vector<std::uint8_t> report(
-                outputReportLength,
-                0);
-            report[0] = kOutputReportId;
-            // TinyUSB removes the report ID before invoking the firmware
-            // callback. Firmware payload bytes 1..5 are dx, dy, buttons.
-            report[2] =
-                static_cast<std::uint8_t>(dx & 0xFF);
-            report[3] =
-                static_cast<std::uint8_t>(
-                    (static_cast<std::uint16_t>(dx) >> 8) &
-                    0xFF);
-            report[4] =
-                static_cast<std::uint8_t>(dy & 0xFF);
-            report[5] =
-                static_cast<std::uint8_t>(
-                    (static_cast<std::uint16_t>(dy) >> 8) &
-                    0xFF);
-            report[6] = buttons;
-
-            DWORD written = 0;
             const bool succeeded =
-                WriteFile(
-                    device,
-                    report.data(),
-                    static_cast<DWORD>(report.size()),
-                    &written,
-                    nullptr) &&
-                written ==
-                    static_cast<DWORD>(report.size());
+                WriteReportLocked(dx, dy, buttons);
             if (!succeeded)
             {
                 status =
                     "RP2040 HID write failed; rescan the device";
-                CloseLocked();
+                CloseLocked(false);
             }
             return succeeded;
         }
@@ -293,14 +355,38 @@ namespace vanta
         bool TryClick()
         {
             std::lock_guard<std::mutex> lock(deviceMutex);
-            return
-                SendLocked(0, 0, 1) &&
-                SendLocked(0, 0, 0);
+            if (releasePending &&
+                !ForceReleaseLocked())
+            {
+                return false;
+            }
+            if (device == INVALID_HANDLE_VALUE ||
+                !connected.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+            if (!WriteReportLocked(0, 0, 1))
+            {
+                releasePending = true;
+                ForceReleaseLocked();
+                status =
+                    "RP2040 left-button press failed; rescan the device";
+                CloseLocked(false);
+                return false;
+            }
+            releasePending = true;
+            Sleep(1);
+            return ForceReleaseLocked();
         }
 
         bool TryMove(int x, int y)
         {
             std::lock_guard<std::mutex> lock(deviceMutex);
+            if (releasePending &&
+                !ForceReleaseLocked())
+            {
+                return false;
+            }
             while (x != 0 || y != 0)
             {
                 const int stepX =
@@ -320,6 +406,34 @@ namespace vanta
             return true;
         }
 
+        void Tick()
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (releasePending &&
+                device != INVALID_HANDLE_VALUE)
+            {
+                ForceReleaseLocked();
+            }
+        }
+
+        bool ForceReleaseLeftButton()
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            return ForceReleaseLocked();
+        }
+
+        void Disconnect()
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (device != INVALID_HANDLE_VALUE)
+            {
+                ForceReleaseLocked();
+            }
+            CloseLocked(false);
+            status =
+                "RP2040 ready; use Rescan to connect";
+        }
+
         void Shutdown()
         {
             if (!initialized)
@@ -327,7 +441,8 @@ namespace vanta
                 return;
             }
             std::lock_guard<std::mutex> lock(deviceMutex);
-            CloseLocked();
+            ForceReleaseLocked();
+            CloseLocked(false);
             status = "RP2040 HID bridge released";
             initialized = false;
             vanta::log::Info(
@@ -353,7 +468,10 @@ namespace vanta
             return;
         }
         implementation_->initialized = true;
-        implementation_->Refresh();
+        implementation_->status =
+            "RP2040 ready; use Rescan to connect";
+        vanta::log::Info(
+            "RP2040 HID runtime loaded without auto-connect");
     }
 
     void Rp2040Controller::Shutdown()
@@ -366,6 +484,7 @@ namespace vanta
 
     void Rp2040Controller::Tick()
     {
+        implementation_->Tick();
     }
 
     void Rp2040Controller::RenderPanel()
@@ -447,6 +566,16 @@ namespace vanta
         }
     }
 
+    bool Rp2040Controller::TryAutoConnect()
+    {
+        return implementation_->Refresh();
+    }
+
+    void Rp2040Controller::Disconnect()
+    {
+        implementation_->Disconnect();
+    }
+
     bool Rp2040Controller::TryClick()
     {
         return implementation_->TryClick();
@@ -455,6 +584,11 @@ namespace vanta
     bool Rp2040Controller::TryMove(int x, int y)
     {
         return implementation_->TryMove(x, y);
+    }
+
+    bool Rp2040Controller::ForceReleaseLeftButton()
+    {
+        return implementation_->ForceReleaseLeftButton();
     }
 
     bool Rp2040Controller::IsConnected() const noexcept

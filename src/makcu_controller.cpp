@@ -12,6 +12,8 @@
 #include "custom_widgets.hpp"
 #include "font_defines.h"
 
+#include <Windows.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -53,22 +55,92 @@ namespace vanta
         std::vector<std::string> deviceLabels;
         std::future<ConnectionResult> connectionFuture;
         int selectedDevice{};
+        std::string preferredPort;
         int movementX{};
         int movementY{};
         bool initialized{};
         bool connectionPending{};
         bool highPerformanceMode{true};
+        bool autoDetectAndConnect{true};
+        ULONGLONG nextAutoDetectTick{};
         std::atomic_bool connected{false};
+        std::atomic_bool releasePending{false};
+        std::atomic<std::uint64_t> settingsRevision{0};
         std::string status{
             "Scanning for MAKCU devices..."};
         std::string firmwareVersion;
         makcu_device_info_t connectedDevice{};
 
-        bool Initialize()
+        bool ForceReleaseLocked(bool reportFailure = true)
+        {
+            if (device == nullptr ||
+                !makcu_is_connected(device))
+            {
+                releasePending.store(
+                    true,
+                    std::memory_order_release);
+                return false;
+            }
+
+            for (int attempt = 0; attempt < 3; ++attempt)
+            {
+                if (makcu_mouse_up(
+                        device,
+                        MAKCU_MOUSE_LEFT) ==
+                    MAKCU_SUCCESS)
+                {
+                    if (releasePending.exchange(
+                            false,
+                            std::memory_order_acq_rel))
+                    {
+                        vanta::log::Info(
+                            "MAKCU left-button release recovered");
+                    }
+                    return true;
+                }
+                if (attempt != 2)
+                {
+                    Sleep(1);
+                }
+            }
+
+            releasePending.store(
+                true,
+                std::memory_order_release);
+            status =
+                "MAKCU left-button release failed; recovery pending";
+            if (reportFailure)
+            {
+                vanta::log::Warning(
+                    "MAKCU left-button release failed after 3 attempts");
+            }
+            return false;
+        }
+
+        bool Initialize(
+            const MouseOutputConfig* initialConfig)
         {
             if (initialized)
             {
                 return true;
+            }
+
+            if (initialConfig != nullptr)
+            {
+                outputBackend.store(
+                    std::clamp(
+                        initialConfig->backendIndex,
+                        0,
+                        1),
+                    std::memory_order_release);
+                preferredPort =
+                    initialConfig->makcuPort;
+                highPerformanceMode =
+                    initialConfig->
+                        highPerformanceMode;
+                autoDetectAndConnect =
+                    initialConfig->
+                        autoDetectAndConnect;
             }
 
             {
@@ -87,9 +159,32 @@ namespace vanta
             initialized = true;
             vanta::log::Info(
                 "MAKCU 1.3.5 runtime loaded");
-            RefreshDevices();
             rp2040.Initialize();
+            if (autoDetectAndConnect)
+            {
+                TryAutoDetectAndConnect(true);
+            }
+            else
+            {
+                RefreshDevices();
+            }
             return true;
+        }
+
+        void SelectOutputBackend(int backend)
+        {
+            const int selected =
+                std::clamp(backend, 0, 1);
+            const int previous =
+                outputBackend.exchange(
+                    selected,
+                    std::memory_order_acq_rel);
+            if (previous != selected)
+            {
+                settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
         }
 
         void RefreshDevices()
@@ -102,6 +197,10 @@ namespace vanta
                 selectedPort =
                     devices[static_cast<std::size_t>(
                         selectedDevice)].port;
+            }
+            if (selectedPort.empty())
+            {
+                selectedPort = preferredPort;
             }
 
             constexpr int maximumDevices = 32;
@@ -137,6 +236,18 @@ namespace vanta
                     selectedDevice =
                         static_cast<int>(index);
                 }
+            }
+            if (!devices.empty() &&
+                selectedDevice >= 0 &&
+                selectedDevice <
+                    static_cast<int>(
+                        devices.size()))
+            {
+                preferredPort =
+                    devices[
+                        static_cast<std::size_t>(
+                            selectedDevice)]
+                        .port;
             }
 
             if (!connected && !connectionPending)
@@ -197,6 +308,13 @@ namespace vanta
                     {
                         return result;
                     }
+                    if (!ForceReleaseLocked())
+                    {
+                        result.error =
+                            MAKCU_ERROR_COMMAND_FAILED;
+                        makcu_disconnect(device);
+                        return result;
+                    }
 
                     const makcu_error_t performanceError =
                         makcu_enable_high_performance_mode(
@@ -241,6 +359,42 @@ namespace vanta
                 });
         }
 
+        void TryAutoDetectAndConnect(bool force = false)
+        {
+            if (!initialized ||
+                !autoDetectAndConnect ||
+                connectionPending ||
+                connected.load(std::memory_order_acquire))
+            {
+                return;
+            }
+
+            const ULONGLONG now = GetTickCount64();
+            if (!force && now < nextAutoDetectTick)
+            {
+                return;
+            }
+            nextAutoDetectTick = now + 2000;
+
+            // Always scan MAKCU first, even while RP2040 is active.
+            // This lets a newly attached MAKCU take priority without
+            // interrupting the currently working fallback device.
+            RefreshDevices();
+            if (!devices.empty())
+            {
+                BeginConnection();
+                return;
+            }
+
+            if (!rp2040.IsConnected() &&
+                rp2040.TryAutoConnect())
+            {
+                SelectOutputBackend(1);
+                vanta::log::Info(
+                    "Mouse output auto-selected RP2040 fallback");
+            }
+        }
+
         void CompleteConnectionIfReady()
         {
             if (!connectionPending ||
@@ -275,6 +429,11 @@ namespace vanta
                 std::memory_order_release);
             if (connectionSucceeded)
             {
+                if (rp2040.IsConnected())
+                {
+                    rp2040.Disconnect();
+                }
+                SelectOutputBackend(0);
                 connectedDevice = result.device;
                 firmwareVersion =
                     std::move(result.version);
@@ -305,6 +464,14 @@ namespace vanta
                     "MAKCU connection failed: %s",
                     MakcuErrorMessage(
                         result.error).c_str());
+                if (autoDetectAndConnect &&
+                    !rp2040.IsConnected() &&
+                    rp2040.TryAutoConnect())
+                {
+                    SelectOutputBackend(1);
+                    vanta::log::Info(
+                        "MAKCU unavailable; mouse output auto-selected RP2040");
+                }
             }
         }
 
@@ -314,16 +481,17 @@ namespace vanta
             {
                 return;
             }
-            connected.store(false, std::memory_order_release);
             {
                 std::lock_guard<std::mutex> lock(deviceMutex);
                 if (device != nullptr &&
                     makcu_is_connected(device))
                 {
+                    ForceReleaseLocked();
                     makcu_disconnect(device);
                     vanta::log::Info("MAKCU disconnected");
                 }
             }
+            connected.store(false, std::memory_order_release);
             connectedDevice = {};
             firmwareVersion.clear();
             status = devices.empty()
@@ -377,6 +545,122 @@ namespace vanta
                 makcu_is_connected(device);
         }
 
+        bool TryClick()
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (device == nullptr ||
+                !connected.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+            if (releasePending.load(
+                    std::memory_order_acquire) &&
+                !ForceReleaseLocked())
+            {
+                return false;
+            }
+
+            const makcu_error_t downResult =
+                makcu_mouse_down(
+                    device,
+                    MAKCU_MOUSE_LEFT);
+            if (downResult != MAKCU_SUCCESS)
+            {
+                releasePending.store(
+                    true,
+                    std::memory_order_release);
+                ForceReleaseLocked();
+                if (!makcu_is_connected(device))
+                {
+                    connected.store(
+                        false,
+                        std::memory_order_release);
+                }
+                status =
+                    "MAKCU left-button press failed";
+                return false;
+            }
+
+            releasePending.store(
+                true,
+                std::memory_order_release);
+            Sleep(1);
+            return ForceReleaseLocked();
+        }
+
+        bool TryMove(int x, int y)
+        {
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (device == nullptr ||
+                !connected.load(std::memory_order_acquire))
+            {
+                return false;
+            }
+            if (releasePending.load(
+                    std::memory_order_acquire) &&
+                !ForceReleaseLocked())
+            {
+                return false;
+            }
+
+            const makcu_error_t result =
+                makcu_mouse_move(device, x, y);
+            if (result != MAKCU_SUCCESS &&
+                !makcu_is_connected(device))
+            {
+                connected.store(
+                    false,
+                    std::memory_order_release);
+            }
+            return result == MAKCU_SUCCESS;
+        }
+
+        bool ForceReleaseLeftButton()
+        {
+            if (outputBackend.load(
+                    std::memory_order_acquire) == 1)
+            {
+                return rp2040.ForceReleaseLeftButton();
+            }
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            return ForceReleaseLocked();
+        }
+
+        void ForceReleaseBackendIfConnected(int backend)
+        {
+            if (backend == 1)
+            {
+                if (rp2040.IsConnected())
+                {
+                    rp2040.ForceReleaseLeftButton();
+                }
+                return;
+            }
+
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (device != nullptr &&
+                connected.load(std::memory_order_acquire) &&
+                makcu_is_connected(device))
+            {
+                ForceReleaseLocked();
+            }
+        }
+
+        void RecoverReleaseIfNeeded()
+        {
+            if (!releasePending.load(
+                    std::memory_order_acquire))
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(deviceMutex);
+            if (releasePending.load(
+                    std::memory_order_acquire))
+            {
+                ForceReleaseLocked();
+            }
+        }
+
         void Shutdown()
         {
             if (!initialized)
@@ -395,12 +679,17 @@ namespace vanta
                 std::lock_guard<std::mutex> lock(deviceMutex);
                 if (device != nullptr)
                 {
+                    if (makcu_is_connected(device))
+                    {
+                        ForceReleaseLocked();
+                    }
                     makcu_device_destroy(device);
                     device = nullptr;
                 }
             }
             devices.clear();
             deviceLabels.clear();
+            autoDetectAndConnect = false;
             initialized = false;
             vanta::log::Info(
                 "MAKCU 1.3.5 runtime released");
@@ -418,9 +707,11 @@ namespace vanta
         Shutdown();
     }
 
-    bool MakcuController::Initialize()
+    bool MakcuController::Initialize(
+        const MouseOutputConfig* initialConfig)
     {
-        return implementation_->Initialize();
+        return implementation_->Initialize(
+            initialConfig);
     }
 
     void MakcuController::Shutdown()
@@ -436,6 +727,7 @@ namespace vanta
         auto& implementation = *implementation_;
         implementation.rp2040.Tick();
         implementation.CompleteConnectionIfReady();
+        implementation.RecoverReleaseIfNeeded();
         if (implementation.connected.load(
                 std::memory_order_acquire) &&
             !implementation.DeviceIsConnected())
@@ -449,7 +741,9 @@ namespace vanta
                 "MAKCU connection was lost";
             vanta::log::Warning(
                 "MAKCU connection was lost");
+            implementation.nextAutoDetectTick = 0;
         }
+        implementation.TryAutoDetectAndConnect();
     }
 
     void MakcuController::RenderPanel()
@@ -478,9 +772,25 @@ namespace vanta
                     sizeof(outputBackends) /
                     sizeof(outputBackends[0]))))
         {
-            implementation.outputBackend.store(
-                selectedBackend,
-                std::memory_order_release);
+            implementation.ForceReleaseBackendIfConnected(
+                implementation.outputBackend.load(
+                    std::memory_order_acquire));
+            implementation.SelectOutputBackend(
+                selectedBackend);
+        }
+
+        bool autoConnect =
+            implementation.autoDetectAndConnect;
+        if (custom::Checkbox(
+                "Auto detect / connect (MAKCU preferred)",
+                &autoConnect))
+        {
+            implementation.autoDetectAndConnect =
+                autoConnect;
+            implementation.nextAutoDetectTick = 0;
+            implementation.settingsRevision.fetch_add(
+                1,
+                std::memory_order_relaxed);
         }
         custom::Separator();
 
@@ -520,7 +830,7 @@ namespace vanta
             implementation.connectionPending ||
             implementation.connected ||
             deviceItems.empty());
-        custom::Combo(
+        if (custom::Combo(
             ICON_DEVICE_LINE "  Device",
             &implementation.selectedDevice,
             deviceItems.empty()
@@ -528,7 +838,23 @@ namespace vanta
                 : deviceItems.data(),
             deviceItems.empty()
                 ? 1
-                : static_cast<int>(deviceItems.size()));
+                : static_cast<int>(deviceItems.size())))
+        {
+            if (implementation.selectedDevice >= 0 &&
+                implementation.selectedDevice <
+                    static_cast<int>(
+                        implementation.devices.size()))
+            {
+                implementation.preferredPort =
+                    implementation.devices[
+                        static_cast<std::size_t>(
+                            implementation.selectedDevice)]
+                        .port;
+            }
+            implementation.settingsRevision.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         ImGui::EndDisabled();
 
         ImGui::BeginDisabled(
@@ -585,6 +911,9 @@ namespace vanta
             {
                 implementation.highPerformanceMode =
                     highPerformance;
+                implementation.settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
                 implementation.LogCommand(
                     "high performance mode",
                     implementation.ExecuteCommand(
@@ -630,15 +959,13 @@ namespace vanta
                     "Left click",
                     ImVec2(130.0F, 36.0F)))
             {
-                implementation.LogCommand(
-                    "left click",
-                    implementation.ExecuteCommand(
-                        [](makcu_device_t* device)
-                        {
-                            return makcu_mouse_click(
-                                device,
-                                MAKCU_MOUSE_LEFT);
-                        }));
+                const bool result =
+                    implementation.TryClick();
+                vanta::log::Info(
+                    "MAKCU left click: %s",
+                    result
+                        ? "success"
+                        : "failed or release recovery pending");
             }
             ImGui::SameLine();
             if (custom::Button(
@@ -694,24 +1021,7 @@ namespace vanta
         {
             return impl.rp2040.TryClick();
         }
-        std::lock_guard<std::mutex> lock(impl.deviceMutex);
-        if (impl.device == nullptr ||
-            !impl.connected.load(std::memory_order_acquire))
-        {
-            return false;
-        }
-        const makcu_error_t result =
-            makcu_mouse_click(
-                impl.device,
-                MAKCU_MOUSE_LEFT);
-        if (result != MAKCU_SUCCESS &&
-            !makcu_is_connected(impl.device))
-        {
-            impl.connected.store(
-                false,
-                std::memory_order_release);
-        }
-        return result == MAKCU_SUCCESS;
+        return impl.TryClick();
     }
 
     bool MakcuController::IsConnected() const noexcept
@@ -733,21 +1043,82 @@ namespace vanta
         {
             return impl.rp2040.TryMove(x, y);
         }
-        std::lock_guard<std::mutex> lock(impl.deviceMutex);
-        if (impl.device == nullptr ||
-            !impl.connected.load(std::memory_order_acquire))
+        return impl.TryMove(x, y);
+    }
+
+    bool MakcuController::ForceReleaseLeftButton()
+    {
+        return implementation_->ForceReleaseLeftButton();
+    }
+
+    MouseOutputConfig MakcuController::GetConfig() const
+    {
+        const auto& impl = *implementation_;
+        MouseOutputConfig result;
+        result.backendIndex =
+            impl.outputBackend.load(
+                std::memory_order_acquire);
+        result.makcuPort =
+            impl.preferredPort;
+        result.highPerformanceMode =
+            impl.highPerformanceMode;
+        result.autoDetectAndConnect =
+            impl.autoDetectAndConnect;
+        return result;
+    }
+
+    void MakcuController::ApplyConfig(
+        const MouseOutputConfig& config)
+    {
+        auto& impl = *implementation_;
+        const int configuredBackend =
+            std::clamp(
+                config.backendIndex,
+                0,
+                1);
+        const int previousBackend =
+            impl.outputBackend.load(
+                std::memory_order_acquire);
+        if (impl.initialized &&
+            configuredBackend != previousBackend)
         {
-            return false;
+            impl.ForceReleaseBackendIfConnected(
+                previousBackend);
         }
-        const makcu_error_t result =
-            makcu_mouse_move(impl.device, x, y);
-        if (result != MAKCU_SUCCESS &&
-            !makcu_is_connected(impl.device))
+        impl.outputBackend.store(
+            configuredBackend,
+            std::memory_order_release);
+        impl.preferredPort =
+            config.makcuPort;
+        impl.highPerformanceMode =
+            config.highPerformanceMode;
+        const bool autoConnectChanged =
+            impl.autoDetectAndConnect !=
+                config.autoDetectAndConnect;
+        impl.autoDetectAndConnect =
+            config.autoDetectAndConnect;
+        if (impl.initialized)
         {
-            impl.connected.store(
-                false,
-                std::memory_order_release);
+            if (autoConnectChanged &&
+                impl.autoDetectAndConnect)
+            {
+                impl.nextAutoDetectTick = 0;
+            }
+            else if (!impl.autoDetectAndConnect)
+            {
+                impl.RefreshDevices();
+            }
         }
-        return result == MAKCU_SUCCESS;
+        impl.settingsRevision.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    std::uint64_t
+    MakcuController::SettingsRevision() const noexcept
+    {
+        return implementation_->
+            settingsRevision.load(
+                std::memory_order_relaxed);
     }
 }

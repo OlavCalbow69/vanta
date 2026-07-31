@@ -1,5 +1,8 @@
 #pragma once
 
+#include "app_settings.hpp"
+
+#include <cstdint>
 #include <memory>
 
 namespace vanta
@@ -22,6 +25,9 @@ namespace vanta
         void Shutdown();
         void Tick();
         void RenderPanel();
+        TestClickConfig GetConfig() const;
+        void ApplyConfig(const TestClickConfig& config);
+        std::uint64_t SettingsRevision() const noexcept;
 
     private:
         struct Implementation;

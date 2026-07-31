@@ -1,5 +1,7 @@
 #pragma once
 
+#include "app_settings.hpp"
+
 #include <Windows.h>
 #include <d3d11.h>
 
@@ -18,6 +20,15 @@ namespace vanta
         int thickness{1};
     };
 
+    struct NormalizedCaptureRegion
+    {
+        bool enabled{};
+        float left{};
+        float top{};
+        float width{1.0F};
+        float height{1.0F};
+    };
+
     class CaptureController
     {
     public:
@@ -30,7 +41,8 @@ namespace vanta
         bool Initialize(
             ID3D11Device* previewDevice,
             ID3D11DeviceContext* previewContext,
-            DWORD ownProcessId);
+            DWORD ownProcessId,
+            const CaptureConfig* initialConfig = nullptr);
         void Shutdown();
         void Tick();
         void RenderPanel();
@@ -38,7 +50,12 @@ namespace vanta
             bool desktopDuplication,
             bool windowSource = false);
         void SetColorTargetIndex(int index) noexcept;
+        CaptureConfig GetConfig() const;
+        void ApplyConfig(const CaptureConfig& config);
+        std::uint64_t SettingsRevision() const noexcept;
         CaptureOutline GetOutline() const noexcept;
+        bool GetCaptureScreenRectangle(
+            RECT& rectangle) const noexcept;
         // Returns the most recently processed centered capture frame (BGRA, CV_8UC4).
         // Returns an empty Mat if no frame is available yet.
         bool GetLatestCenteredFrame(cv::Mat& out) const;
@@ -48,6 +65,17 @@ namespace vanta
             std::uint64_t& sequence,
             std::int64_t& captureTimestampNanoseconds,
             std::uint32_t timeoutMilliseconds) const;
+        void SetAuxiliaryNormalizedRegion(
+            const NormalizedCaptureRegion& region);
+        bool WaitForAuxiliaryFrame(
+            std::uint64_t afterSequence,
+            cv::Mat& out,
+            std::uint64_t& sequence,
+            std::int64_t& captureTimestampNanoseconds,
+            RECT& screenRectangle,
+            std::uint32_t timeoutMilliseconds) const;
+        bool GetAuxiliaryScreenRectangle(
+            RECT& rectangle) const noexcept;
 
     private:
         struct Implementation;

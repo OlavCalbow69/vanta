@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -32,6 +33,63 @@
 
 namespace
 {
+    constexpr bool AxisVerticalActive(
+        vanta::AxisMovementMode mode,
+        std::int64_t elapsedMilliseconds,
+        int activeTimeMilliseconds) noexcept
+    {
+        return
+            mode == vanta::AxisMovementMode::standard ||
+            (mode == vanta::AxisMovementMode::hybrid &&
+             elapsedMilliseconds <
+                 activeTimeMilliseconds);
+    }
+
+    static_assert(
+        !AxisVerticalActive(
+            vanta::AxisMovementMode::horizontalOnly,
+            0,
+            100));
+    static_assert(
+        AxisVerticalActive(
+            vanta::AxisMovementMode::hybrid,
+            99,
+            100));
+    static_assert(
+        !AxisVerticalActive(
+            vanta::AxisMovementMode::hybrid,
+            100,
+            100));
+    static_assert(
+        AxisVerticalActive(
+            vanta::AxisMovementMode::standard,
+            5000,
+            100));
+
+    constexpr bool ShouldIgnoreTargetBelowCrosshair(
+        int aimY,
+        int crosshairY,
+        bool enabled) noexcept
+    {
+        return enabled && aimY > crosshairY;
+    }
+
+    static_assert(
+        ShouldIgnoreTargetBelowCrosshair(
+            101,
+            100,
+            true));
+    static_assert(
+        !ShouldIgnoreTargetBelowCrosshair(
+            100,
+            100,
+            true));
+    static_assert(
+        !ShouldIgnoreTargetBelowCrosshair(
+            101,
+            100,
+            false));
+
     // ─────────────────────────────────────────────────────────────────────────
     // State machine
     // ─────────────────────────────────────────────────────────────────────────
@@ -42,6 +100,8 @@ namespace
         waitingForKey,
         waitingForCapture,
         waitingForMakcu,
+        waitingForNewTarget,
+        briefPause,
         tracking,
         locked
     };
@@ -54,6 +114,9 @@ namespace
         case TestMoveState::waitingForKey:     return "WAITING FOR KEY";
         case TestMoveState::waitingForCapture: return "WAITING FOR CAPTURE";
         case TestMoveState::waitingForMakcu:   return "WAITING FOR MAKCU";
+        case TestMoveState::waitingForNewTarget:
+            return "NEW TARGET DELAY";
+        case TestMoveState::briefPause:        return "BRIEF PAUSE";
         case TestMoveState::tracking:          return "TRACKING";
         case TestMoveState::locked:            return "LOCKED ON";
         default:                               return "OFFLINE";
@@ -184,11 +247,37 @@ namespace vanta
         // FOV: only targets within this radius from screen centre are considered.
         // Python used kill_fov = 100.
         int killFov{100};
+        bool drawFovOutline{true};
+        float fovColor[4]{
+            0.68F, 0.56F, 0.91F, 1.0F};
 
         // Movement parameters — exact Python defaults
+        MovementMethod movementMethod{
+            MovementMethod::direct};
         float speed{1.125F};
         float smooth{0.90F};
         int   deadzone{2};
+        float windGravity{9.0F};
+        float windStrength{3.0F};
+        float windMaximumStep{15.0F};
+        float windSlowdownRadius{12.0F};
+        AxisMovementMode axisMode{
+            AxisMovementMode::standard};
+        float axisHorizontalMultiplier{1.125F};
+        float axisVerticalMultiplier{1.125F};
+        float axisSmoothing{0.90F};
+        int hybridVerticalTimeMilliseconds{300};
+        bool antiBelowObjects{};
+        bool shortStopEnabled{};
+        ShortStopMode shortStopMode{
+            ShortStopMode::slowMove};
+        int shortStopChancePercent{5};
+        int shortStopMinimumPauseMilliseconds{30};
+        int shortStopMaximumPauseMilliseconds{90};
+        float shortStopSlowMultiplierMinimum{2.0F};
+        float shortStopSlowMultiplierMaximum{4.0F};
+        int newTargetDelayMinimumMilliseconds{};
+        int newTargetDelayMaximumMilliseconds{};
 
         // Rectangle merge proximity — same as Python call: proximity=10
         int mergeProximity{10};
@@ -205,6 +294,7 @@ namespace vanta
         std::atomic<bool>          targetVisible{false};
         std::atomic<int>           targetDx{0};
         std::atomic<int>           targetDy{0};
+        std::atomic<std::uint64_t> settingsRevision{0};
 
         static double NowSeconds()
         {
@@ -228,6 +318,53 @@ namespace vanta
             std::uint64_t sequence    = 0;
             std::int64_t  timestamp   = 0;
             double        nextSampleTime = 0.0;
+            float         windX = 0.0F;
+            float         windY = 0.0F;
+            float         velocityX = 0.0F;
+            float         velocityY = 0.0F;
+            std::mt19937  randomEngine{
+                std::random_device{}()};
+            std::uniform_real_distribution<float> randomUnit(
+                -1.0F,
+                1.0F);
+            bool aimKeyWasHeld = false;
+            int previousAimKey = 0;
+            MovementMethod previousMovementMethod =
+                MovementMethod::direct;
+            AxisMovementMode previousAxisMode =
+                AxisMovementMode::standard;
+            std::chrono::steady_clock::time_point
+                hybridWindowStarted{};
+            bool trackedTargetValid = false;
+            int trackedTargetX{};
+            int trackedTargetY{};
+            bool pendingTargetValid = false;
+            int pendingTargetX{};
+            int pendingTargetY{};
+            std::chrono::steady_clock::time_point
+                pendingTargetReadyTime{};
+            std::chrono::steady_clock::time_point
+                shortPauseEndTime{};
+            float shortPauseSlowFactor{1.0F};
+
+            const auto resetWind = [&]()
+            {
+                windX = 0.0F;
+                windY = 0.0F;
+                velocityX = 0.0F;
+                velocityY = 0.0F;
+            };
+            const auto resetShortPause = [&]()
+            {
+                shortPauseEndTime = {};
+                shortPauseSlowFactor = 1.0F;
+            };
+            const auto resetTargetTracking = [&]()
+            {
+                trackedTargetValid = false;
+                pendingTargetValid = false;
+                resetShortPause();
+            };
 
             // 4x4 dilation kernel — identical to Python:
             //   cv2.dilate(mask, np.ones((4,4), np.uint8), iterations=1)
@@ -238,25 +375,81 @@ namespace vanta
             {
                 // Snapshot settings under lock
                 bool  snapEnabled;
+                bool  snapAntiBelowObjects,
+                      snapShortStopEnabled;
                 int   snapHsvRange, snapAimKey, snapKillFov,
-                      snapDeadzone, snapMergeProx;
-                float snapSpeed, snapSmooth;
+                      snapDeadzone, snapMergeProx,
+                      snapHybridVerticalTimeMilliseconds,
+                      snapShortStopChancePercent,
+                      snapShortStopMinimumPauseMilliseconds,
+                      snapShortStopMaximumPauseMilliseconds,
+                      snapNewTargetDelayMinimumMilliseconds,
+                      snapNewTargetDelayMaximumMilliseconds;
+                MovementMethod snapMovementMethod;
+                AxisMovementMode snapAxisMode;
+                ShortStopMode snapShortStopMode;
+                float snapSpeed, snapSmooth, snapWindGravity,
+                      snapWindStrength, snapWindMaximumStep,
+                      snapWindSlowdownRadius,
+                      snapAxisHorizontalMultiplier,
+                      snapAxisVerticalMultiplier,
+                      snapAxisSmoothing,
+                      snapShortStopSlowMultiplierMinimum,
+                      snapShortStopSlowMultiplierMaximum;
                 {
                     std::lock_guard<std::mutex> lk(settingsMutex);
                     snapEnabled    = enabled;
                     snapHsvRange   = hsvRangeIndex;
                     snapAimKey     = aimKey;
                     snapKillFov    = killFov;
+                    snapMovementMethod = movementMethod;
                     snapSpeed      = speed;
                     snapSmooth     = smooth;
                     snapDeadzone   = deadzone;
                     snapMergeProx  = mergeProximity;
+                    snapWindGravity = windGravity;
+                    snapWindStrength = windStrength;
+                    snapWindMaximumStep = windMaximumStep;
+                    snapWindSlowdownRadius =
+                        windSlowdownRadius;
+                    snapAxisMode = axisMode;
+                    snapAxisHorizontalMultiplier =
+                        axisHorizontalMultiplier;
+                    snapAxisVerticalMultiplier =
+                        axisVerticalMultiplier;
+                    snapAxisSmoothing =
+                        axisSmoothing;
+                    snapHybridVerticalTimeMilliseconds =
+                        hybridVerticalTimeMilliseconds;
+                    snapAntiBelowObjects =
+                        antiBelowObjects;
+                    snapShortStopEnabled =
+                        shortStopEnabled;
+                    snapShortStopMode =
+                        shortStopMode;
+                    snapShortStopChancePercent =
+                        shortStopChancePercent;
+                    snapShortStopMinimumPauseMilliseconds =
+                        shortStopMinimumPauseMilliseconds;
+                    snapShortStopMaximumPauseMilliseconds =
+                        shortStopMaximumPauseMilliseconds;
+                    snapShortStopSlowMultiplierMinimum =
+                        shortStopSlowMultiplierMinimum;
+                    snapShortStopSlowMultiplierMaximum =
+                        shortStopSlowMultiplierMaximum;
+                    snapNewTargetDelayMinimumMilliseconds =
+                        newTargetDelayMinimumMilliseconds;
+                    snapNewTargetDelayMaximumMilliseconds =
+                        newTargetDelayMaximumMilliseconds;
                 }
 
                 if (!snapEnabled)
                 {
                     state.store(TestMoveState::disabled);
                     targetVisible.store(false);
+                    resetWind();
+                    aimKeyWasHeld = false;
+                    resetTargetTracking();
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(5));
                     continue;
@@ -265,31 +458,65 @@ namespace vanta
                 // Aimbot is only active while the aim key is held
                 // Python: win32api.GetAsyncKeyState(KEY_LEFT_MOUSE) < 0
                 //          (<0 means high-bit set, same as & 0x8000)
-                if ((GetAsyncKeyState(snapAimKey) & 0x8000) == 0)
+                const bool aimKeyHeld =
+                    (GetAsyncKeyState(snapAimKey) &
+                     0x8000) != 0;
+                if (!aimKeyHeld)
                 {
                     state.store(TestMoveState::waitingForKey);
                     targetVisible.store(false);
+                    resetWind();
+                    aimKeyWasHeld = false;
+                    resetTargetTracking();
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(2));
                     continue;
                 }
+                if (!aimKeyWasHeld ||
+                    previousAimKey != snapAimKey ||
+                    previousMovementMethod !=
+                        snapMovementMethod ||
+                    previousAxisMode != snapAxisMode)
+                {
+                    hybridWindowStarted =
+                        std::chrono::steady_clock::now();
+                }
+                aimKeyWasHeld = true;
+                previousAimKey = snapAimKey;
+                previousMovementMethod =
+                    snapMovementMethod;
+                previousAxisMode = snapAxisMode;
 
                 if (makcu == nullptr || !makcu->IsConnected())
                 {
                     state.store(TestMoveState::waitingForMakcu);
                     targetVisible.store(false);
+                    resetWind();
+                    resetTargetTracking();
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(5));
                     continue;
                 }
 
                 // Block until a fresh capture frame arrives
-                if (capture == nullptr ||
-                    !capture->WaitForCenteredFrame(
-                        lastSequence, frame, sequence, timestamp, 10))
+                if (capture == nullptr)
                 {
                     state.store(TestMoveState::waitingForCapture);
                     targetVisible.store(false);
+                    resetWind();
+                    resetTargetTracking();
+                    continue;
+                }
+                if (!capture->WaitForCenteredFrame(
+                        lastSequence,
+                        frame,
+                        sequence,
+                        timestamp,
+                        10))
+                {
+                    state.store(TestMoveState::waitingForCapture);
+                    targetVisible.store(false);
+                    resetWind();
                     continue;
                 }
                 lastSequence = sequence;
@@ -297,12 +524,20 @@ namespace vanta
                 if (frame.empty())
                 {
                     state.store(TestMoveState::waitingForCapture);
+                    resetWind();
+                    resetTargetTracking();
                     continue;
                 }
 
                 // Frame centre — equivalent to Python:  cf = view_fov // 2
                 const int fcx = frame.cols / 2;
                 const int fcy = frame.rows / 2;
+                const int effectiveKillFov =
+                    std::min(
+                        snapKillFov,
+                        std::max(
+                            0,
+                            std::min(fcx, fcy) - 3));
 
                 // ── Convert BGRA → BGR (capture produces BGRA) ──────────────
                 cv::Mat bgr;
@@ -390,7 +625,8 @@ namespace vanta
                 //         dist = np.hypot(hx - cf, hy - cf)
                 //         if dist < self.kill_fov  →  candidate
                 const auto& bl = Blacklist();
-                float minDist  = static_cast<float>(snapKillFov);
+                float minDist  =
+                    static_cast<float>(effectiveKillFov);
                 bool  found    = false;
                 int   bestDx   = 0;
                 int   bestDy   = 0;
@@ -402,6 +638,13 @@ namespace vanta
                     const int hy =
                         r.y + static_cast<int>(
                             static_cast<float>(r.height) * 0.15F);
+                    if (ShouldIgnoreTargetBelowCrosshair(
+                            hy,
+                            fcy,
+                            snapAntiBelowObjects))
+                    {
+                        continue;
+                    }
 
                     const float dist = std::hypot(
                         static_cast<float>(hx - fcx),
@@ -429,6 +672,104 @@ namespace vanta
 
                 if (found)
                 {
+                    const int selectedAimX =
+                        fcx + bestDx;
+                    const int selectedAimY =
+                        fcy + bestDy;
+                    const int associationRadius =
+                        std::max(
+                            24,
+                            snapMergeProx * 2 + 16);
+                    const auto matchesTarget =
+                        [&](int leftX,
+                            int leftY,
+                            int rightX,
+                            int rightY)
+                    {
+                        const std::int64_t deltaX =
+                            static_cast<std::int64_t>(
+                                leftX) -
+                            rightX;
+                        const std::int64_t deltaY =
+                            static_cast<std::int64_t>(
+                                leftY) -
+                            rightY;
+                        return
+                            deltaX * deltaX +
+                                deltaY * deltaY <=
+                            static_cast<std::int64_t>(
+                                associationRadius) *
+                                associationRadius;
+                    };
+                    const bool sameTrackedTarget =
+                        trackedTargetValid &&
+                        matchesTarget(
+                            selectedAimX,
+                            selectedAimY,
+                            trackedTargetX,
+                            trackedTargetY);
+                    const auto targetNow =
+                        std::chrono::steady_clock::now();
+                    if (sameTrackedTarget)
+                    {
+                        trackedTargetX = selectedAimX;
+                        trackedTargetY = selectedAimY;
+                        pendingTargetValid = false;
+                    }
+                    else
+                    {
+                        resetShortPause();
+                        const int minimumDelay =
+                            std::clamp(
+                                snapNewTargetDelayMinimumMilliseconds,
+                                0,
+                                1000);
+                        const int maximumDelay =
+                            std::clamp(
+                                snapNewTargetDelayMaximumMilliseconds,
+                                minimumDelay,
+                                1000);
+                        if (maximumDelay > 0)
+                        {
+                            const bool samePendingTarget =
+                                pendingTargetValid &&
+                                matchesTarget(
+                                    selectedAimX,
+                                    selectedAimY,
+                                    pendingTargetX,
+                                    pendingTargetY);
+                            if (!samePendingTarget)
+                            {
+                                std::uniform_int_distribution<int>
+                                    waitDistribution(
+                                        minimumDelay,
+                                        maximumDelay);
+                                pendingTargetReadyTime =
+                                    targetNow +
+                                    std::chrono::milliseconds(
+                                        waitDistribution(
+                                            randomEngine));
+                                pendingTargetValid = true;
+                            }
+                            pendingTargetX = selectedAimX;
+                            pendingTargetY = selectedAimY;
+                            if (targetNow <
+                                pendingTargetReadyTime)
+                            {
+                                state.store(
+                                    TestMoveState::
+                                        waitingForNewTarget);
+                                resetWind();
+                                continue;
+                            }
+                        }
+
+                        trackedTargetValid = true;
+                        trackedTargetX = selectedAimX;
+                        trackedTargetY = selectedAimY;
+                        pendingTargetValid = false;
+                    }
+
                     state.store(TestMoveState::locked);
 
                     // ── Mouse movement formula — exactly as Python: ───────────
@@ -436,26 +777,263 @@ namespace vanta
                     // my = int(dy * self.speed * self.smooth)
                     // if abs(mx) > self.deadzone or abs(my) > self.deadzone:
                     //     self.mouse.move(mx, my)
-                    const int mx = static_cast<int>(
+                    int moveX = static_cast<int>(
                         static_cast<float>(bestDx) *
                         snapSpeed * snapSmooth);
-                    const int my = static_cast<int>(
+                    int moveY = static_cast<int>(
                         static_cast<float>(bestDy) *
                         snapSpeed * snapSmooth);
 
-                    if (std::abs(mx) > snapDeadzone ||
-                        std::abs(my) > snapDeadzone)
+                    if (snapMovementMethod ==
+                        MovementMethod::windMouse)
                     {
-                        if (makcu->TryMove(mx, my))
+                        const float distance =
+                            std::hypot(
+                                static_cast<float>(bestDx),
+                                static_cast<float>(bestDy));
+                        if (distance <=
+                            static_cast<float>(snapDeadzone))
+                        {
+                            resetWind();
+                            continue;
+                        }
+
+                        constexpr float rootThree =
+                            1.73205080757F;
+                        constexpr float rootFive =
+                            2.23606797750F;
+                        const float limitedWind =
+                            std::min(
+                                snapWindStrength,
+                                distance);
+                        if (distance >=
+                            snapWindSlowdownRadius)
+                        {
+                            windX =
+                                windX / rootThree +
+                                randomUnit(randomEngine) *
+                                    limitedWind / rootFive;
+                            windY =
+                                windY / rootThree +
+                                randomUnit(randomEngine) *
+                                    limitedWind / rootFive;
+                        }
+                        else
+                        {
+                            windX /= rootThree;
+                            windY /= rootThree;
+                        }
+
+                        velocityX +=
+                            windX +
+                            snapWindGravity *
+                                static_cast<float>(bestDx) /
+                                distance;
+                        velocityY +=
+                            windY +
+                            snapWindGravity *
+                                static_cast<float>(bestDy) /
+                                distance;
+
+                        float maximumVelocity =
+                            snapWindMaximumStep;
+                        if (distance <
+                            snapWindSlowdownRadius)
+                        {
+                            maximumVelocity =
+                                std::max(
+                                    1.0F,
+                                    snapWindMaximumStep *
+                                        distance /
+                                        snapWindSlowdownRadius);
+                        }
+                        const float velocityLength =
+                            std::hypot(
+                                velocityX,
+                                velocityY);
+                        if (velocityLength >
+                            maximumVelocity)
+                        {
+                            const float randomScale =
+                                0.70F +
+                                0.15F *
+                                    (randomUnit(randomEngine) +
+                                     1.0F);
+                            velocityX =
+                                velocityX /
+                                velocityLength *
+                                maximumVelocity *
+                                randomScale;
+                            velocityY =
+                                velocityY /
+                                velocityLength *
+                                maximumVelocity *
+                                randomScale;
+                        }
+
+                        moveX = static_cast<int>(
+                            std::lround(velocityX));
+                        moveY = static_cast<int>(
+                            std::lround(velocityY));
+                        if (moveX == 0 &&
+                            std::abs(bestDx) > snapDeadzone)
+                        {
+                            moveX =
+                                bestDx > 0 ? 1 : -1;
+                        }
+                        if (moveY == 0 &&
+                            std::abs(bestDy) > snapDeadzone)
+                        {
+                            moveY =
+                                bestDy > 0 ? 1 : -1;
+                        }
+                    }
+                    else if (snapMovementMethod ==
+                        MovementMethod::axisControl)
+                    {
+                        resetWind();
+                        moveX = static_cast<int>(
+                            std::lround(
+                                static_cast<float>(bestDx) *
+                                snapAxisHorizontalMultiplier *
+                                snapAxisSmoothing));
+                        const bool verticalActive =
+                            AxisVerticalActive(
+                                snapAxisMode,
+                                std::chrono::duration_cast<
+                                    std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    hybridWindowStarted).count(),
+                                snapHybridVerticalTimeMilliseconds);
+                        moveY = verticalActive
+                            ? static_cast<int>(
+                                std::lround(
+                                    static_cast<float>(bestDy) *
+                                    snapAxisVerticalMultiplier *
+                                    snapAxisSmoothing))
+                            : 0;
+                    }
+                    else
+                    {
+                        resetWind();
+                    }
+
+                    const auto pauseNow =
+                        std::chrono::steady_clock::now();
+                    if (!snapShortStopEnabled)
+                    {
+                        resetShortPause();
+                    }
+                    else
+                    {
+                        bool pauseActive =
+                            pauseNow < shortPauseEndTime;
+                        if (!pauseActive)
+                        {
+                            resetShortPause();
+                            std::uniform_int_distribution<int>
+                                chanceDistribution(1, 100);
+                            const int chance =
+                                std::clamp(
+                                    snapShortStopChancePercent,
+                                    1,
+                                    20);
+                            if (chanceDistribution(
+                                    randomEngine) <= chance)
+                            {
+                                const int minimumPause =
+                                    std::clamp(
+                                        snapShortStopMinimumPauseMilliseconds,
+                                        10,
+                                        200);
+                                const int maximumPause =
+                                    std::clamp(
+                                        snapShortStopMaximumPauseMilliseconds,
+                                        minimumPause,
+                                        500);
+                                std::uniform_int_distribution<int>
+                                    pauseDistribution(
+                                        minimumPause,
+                                        maximumPause);
+                                shortPauseEndTime =
+                                    pauseNow +
+                                    std::chrono::milliseconds(
+                                        pauseDistribution(
+                                            randomEngine));
+                                if (snapShortStopMode ==
+                                    ShortStopMode::slowMove)
+                                {
+                                    const float minimumMultiplier =
+                                        std::clamp(
+                                            snapShortStopSlowMultiplierMinimum,
+                                            1.0F,
+                                            10.0F);
+                                    const float maximumMultiplier =
+                                        std::clamp(
+                                            snapShortStopSlowMultiplierMaximum,
+                                            minimumMultiplier,
+                                            10.0F);
+                                    std::uniform_real_distribution<float>
+                                        multiplierDistribution(
+                                            minimumMultiplier,
+                                            maximumMultiplier);
+                                    shortPauseSlowFactor =
+                                        multiplierDistribution(
+                                            randomEngine);
+                                }
+                                pauseActive = true;
+                            }
+                        }
+
+                        if (pauseActive)
+                        {
+                            state.store(
+                                TestMoveState::briefPause);
+                            if (snapShortStopMode ==
+                                ShortStopMode::fullStop)
+                            {
+                                moveX = 0;
+                                moveY = 0;
+                            }
+                            else
+                            {
+                                const float factor =
+                                    std::max(
+                                        1.0F,
+                                        shortPauseSlowFactor);
+                                moveX = static_cast<int>(
+                                    std::lround(
+                                        static_cast<float>(moveX) /
+                                        factor));
+                                moveY = static_cast<int>(
+                                    std::lround(
+                                        static_cast<float>(moveY) /
+                                        factor));
+                            }
+                        }
+                    }
+
+                    if (std::abs(moveX) > snapDeadzone ||
+                        std::abs(moveY) > snapDeadzone)
+                    {
+                        if (makcu->TryMove(moveX, moveY))
                         {
                             movesMade.fetch_add(
                                 1, std::memory_order_relaxed);
+                            trackedTargetX -= moveX;
+                            trackedTargetY -= moveY;
+                        }
+                        else
+                        {
+                            resetWind();
                         }
                     }
                 }
                 else
                 {
                     state.store(TestMoveState::tracking);
+                    resetWind();
+                    resetTargetTracking();
                 }
             }
 
@@ -502,10 +1080,6 @@ namespace vanta
         auto& impl = *implementation_;
         impl.capture = capture;
         impl.makcu   = makcu;
-        if (impl.capture != nullptr)
-        {
-            impl.capture->SetColorTargetIndex(impl.hsvRangeIndex);
-        }
         impl.Start();
         vanta::log::Info("TestMove controller initialized");
     }
@@ -547,18 +1121,17 @@ namespace vanta
                     ? ImVec4(0.45F, 0.96F, 0.65F, 1.0F)  // green: searching
                     : currentState == TestMoveState::waitingForKey  ||
                       currentState == TestMoveState::waitingForCapture ||
-                      currentState == TestMoveState::waitingForMakcu
+                      currentState == TestMoveState::waitingForMakcu ||
+                      currentState == TestMoveState::waitingForNewTarget ||
+                      currentState == TestMoveState::briefPause
                         ? ImVec4(1.0F, 0.75F, 0.32F, 1.0F)  // amber: standby
                         : ImVec4(0.72F, 0.72F, 0.78F, 1.0F); // grey: offline
 
         ImGui::TextColored(statusColor, "%s", StateLabel(currentState));
         ImGui::SameLine();
-        ImGui::TextDisabled(" | Moves: %d", impl.movesMade.load());
-        ImGui::SameLine();
-        ImGui::TextDisabled(" | Pixels: %d", impl.matchingPixels.load());
-        ImGui::SameLine();
         ImGui::TextDisabled(
-            " | dX: %d  dY: %d",
+            " | Moves %d  |  Target %d, %d",
+            impl.movesMade.load(),
             impl.targetDx.load(),
             impl.targetDy.load());
 
@@ -566,46 +1139,24 @@ namespace vanta
 
         {
             std::lock_guard<std::mutex> lk(impl.settingsMutex);
+            bool settingsChanged = false;
+            const auto drawCategory =
+                [](const char* label)
+                {
+                    ImGui::Spacing();
+                    ImGui::TextColored(
+                        ImGui::GetStyleColorVec4(
+                            ImGuiCol_CheckMark),
+                        "%s",
+                        label);
+                    custom::Separator();
+                };
 
             custom::Checkbox("Enable TestMove", &impl.enabled);
 
             if (impl.enabled)
             {
-                ImGui::Spacing();
-
-                // Color target combo (shared with capture pipeline)
-                const char* colorTargets[
-                    vanta::kHsvColorTargets.size()]{};
-                for (std::size_t index = 0;
-                     index < vanta::kHsvColorTargets.size();
-                     ++index)
-                {
-                    colorTargets[index] =
-                        vanta::kHsvColorTargets[index].label;
-                }
-                if (custom::Combo(
-                        "Color target",
-                        &impl.hsvRangeIndex,
-                        colorTargets,
-                        static_cast<int>(
-                            vanta::kHsvColorTargets.size())) &&
-                    impl.capture != nullptr)
-                {
-                    impl.capture->SetColorTargetIndex(
-                        impl.hsvRangeIndex);
-                }
-                ImGui::TextDisabled(
-                    "%s",
-                    vanta::kHsvColorTargets[
-                        static_cast<std::size_t>(
-                            std::clamp(
-                                impl.hsvRangeIndex,
-                                0,
-                                static_cast<int>(
-                                    vanta::kHsvColorTargets.size()) - 1))]
-                        .description);
-
-                custom::Separator();
+                drawCategory("ACTIVATION");
 
                 // Aim key selection
                 const char* keyNames[]{
@@ -639,51 +1190,505 @@ namespace vanta
                         keyCount))
                 {
                     impl.aimKey = keyValues[selectedKey];
+                    settingsChanged = true;
                 }
 
-                custom::Separator();
+                drawCategory("TARGET");
 
-                custom::SliderInt(
+                const char* colorTargets[
+                    vanta::kHsvColorTargets.size()]{};
+                for (std::size_t index = 0;
+                     index < vanta::kHsvColorTargets.size();
+                     ++index)
+                {
+                    colorTargets[index] =
+                        vanta::kHsvColorTargets[index].label;
+                }
+                settingsChanged |= custom::Combo(
+                        "Color target",
+                        &impl.hsvRangeIndex,
+                        colorTargets,
+                        static_cast<int>(
+                            vanta::kHsvColorTargets.size()));
+
+                settingsChanged |= custom::SliderInt(
                     "Kill FOV",
                     &impl.killFov,
                     20, 350, "%d px");
-                ImGui::TextDisabled(
-                    "Only targets within this radius are considered");
+                settingsChanged |= custom::Checkbox(
+                    "Draw Kill FOV outline",
+                    &impl.drawFovOutline);
+                if (impl.drawFovOutline)
+                {
+                    settingsChanged |= custom::ColorEdit4(
+                        "Kill FOV color",
+                        impl.fovColor,
+                        ImGuiColorEditFlags_NoSidePreview |
+                            ImGuiColorEditFlags_AlphaBar |
+                            ImGuiColorEditFlags_NoInputs |
+                            ImGuiColorEditFlags_AlphaPreview);
+                }
+                drawCategory("MOVEMENT");
 
-                custom::Separator();
+                const char* movementMethods[]{
+                    "Direct",
+                    "WindMouse",
+                    "Axis control"};
+                int movementMethod =
+                    static_cast<int>(
+                        impl.movementMethod);
+                if (custom::Combo(
+                        "Movement method",
+                        &movementMethod,
+                        movementMethods,
+                        IM_ARRAYSIZE(movementMethods)))
+                {
+                    impl.movementMethod =
+                        static_cast<MovementMethod>(
+                            std::clamp(
+                                movementMethod,
+                                0,
+                                2));
+                    settingsChanged = true;
+                }
 
-                custom::SliderFloat(
-                    "Speed multiplier",
-                    &impl.speed,
-                    0.10F, 3.0F, "%.3f");
-                custom::SliderFloat(
-                    "Smoothing",
-                    &impl.smooth,
-                    0.10F, 1.0F, "%.3f");
-                custom::SliderInt(
+                if (impl.movementMethod ==
+                    MovementMethod::direct)
+                {
+                    settingsChanged |= custom::SliderFloat(
+                        "Speed multiplier",
+                        &impl.speed,
+                        0.10F, 3.0F, "%.3f");
+                    settingsChanged |= custom::SliderFloat(
+                        "Smoothing",
+                        &impl.smooth,
+                        0.10F, 1.0F, "%.3f");
+                }
+                else if (impl.movementMethod ==
+                    MovementMethod::windMouse)
+                {
+                    settingsChanged |= custom::SliderFloat(
+                        "Wind gravity",
+                        &impl.windGravity,
+                        1.0F, 20.0F, "%.2f");
+                    settingsChanged |= custom::SliderFloat(
+                        "Wind strength",
+                        &impl.windStrength,
+                        0.0F, 10.0F, "%.2f");
+                    settingsChanged |= custom::SliderFloat(
+                        "Maximum step",
+                        &impl.windMaximumStep,
+                        1.0F, 30.0F, "%.2f px");
+                    settingsChanged |= custom::SliderFloat(
+                        "Slowdown radius",
+                        &impl.windSlowdownRadius,
+                        1.0F, 50.0F, "%.2f px");
+                }
+                else
+                {
+                    settingsChanged |= custom::SliderFloat(
+                        "Horizontal multiplier",
+                        &impl.axisHorizontalMultiplier,
+                        0.10F, 3.0F, "%.3f");
+                    settingsChanged |= custom::SliderFloat(
+                        "Axis smoothing",
+                        &impl.axisSmoothing,
+                        0.10F, 1.0F, "%.3f");
+
+                    const char* axisModes[]{
+                        "X + Y",
+                        "Horizontal only",
+                        "Hybrid"};
+                    int axisMode =
+                        impl.axisMode ==
+                            AxisMovementMode::standard
+                        ? 0
+                        : impl.axisMode ==
+                                AxisMovementMode::horizontalOnly
+                            ? 1
+                            : 2;
+                    if (custom::Combo(
+                            "Axis mode",
+                            &axisMode,
+                            axisModes,
+                            IM_ARRAYSIZE(axisModes)))
+                    {
+                        impl.axisMode =
+                            axisMode == 0
+                            ? AxisMovementMode::standard
+                            : axisMode == 1
+                                ? AxisMovementMode::horizontalOnly
+                                : AxisMovementMode::hybrid;
+                        settingsChanged = true;
+                    }
+
+                    if (impl.axisMode !=
+                        AxisMovementMode::horizontalOnly)
+                    {
+                        settingsChanged |=
+                            custom::SliderFloat(
+                                "Vertical multiplier",
+                                &impl.axisVerticalMultiplier,
+                                0.10F, 3.0F, "%.3f");
+                        if (impl.axisMode ==
+                            AxisMovementMode::hybrid)
+                        {
+                            settingsChanged |=
+                                custom::SliderInt(
+                                    "Vertical active time",
+                                    &impl.hybridVerticalTimeMilliseconds,
+                                    100, 1000, "%d ms");
+                        }
+                    }
+                }
+                settingsChanged |= custom::SliderInt(
                     "Deadzone",
                     &impl.deadzone,
                     0, 20, "%d px");
-                ImGui::TextDisabled(
-                    "Movements below this threshold are suppressed");
 
-                custom::Separator();
+                drawCategory(
+                    ICON_CODE_LINE "  EXPERIMENTAL");
 
-                custom::SliderInt(
+                settingsChanged |= custom::Checkbox(
+                    "Anti Below Objects",
+                    &impl.antiBelowObjects);
+                settingsChanged |= custom::SliderInt(
                     "Merge proximity",
                     &impl.mergeProximity,
                     0, 50, "%d px");
-                ImGui::TextDisabled(
-                    "Max gap between boxes to merge them (Python default: 10)");
+
+                settingsChanged |= custom::Checkbox(
+                    "Enable short stop",
+                    &impl.shortStopEnabled);
+                if (impl.shortStopEnabled)
+                {
+                    const char* shortStopModes[]{
+                        "Full Stop",
+                        "Slow Move"};
+                    int shortStopMode =
+                        static_cast<int>(
+                            impl.shortStopMode);
+                    if (custom::Combo(
+                            "Short stop mode",
+                            &shortStopMode,
+                            shortStopModes,
+                            IM_ARRAYSIZE(shortStopModes)))
+                    {
+                        impl.shortStopMode =
+                            shortStopMode == 0
+                            ? ShortStopMode::fullStop
+                            : ShortStopMode::slowMove;
+                        settingsChanged = true;
+                    }
+                    settingsChanged |= custom::SliderInt(
+                        "Pause chance",
+                        &impl.shortStopChancePercent,
+                        1, 20, "%d%%");
+                    settingsChanged |= custom::SliderInt(
+                        "Pause minimum",
+                        &impl.shortStopMinimumPauseMilliseconds,
+                        10, 200, "%d ms");
+                    impl.shortStopMaximumPauseMilliseconds =
+                        std::max(
+                            impl.shortStopMaximumPauseMilliseconds,
+                            impl.shortStopMinimumPauseMilliseconds);
+                    settingsChanged |= custom::SliderInt(
+                        "Pause maximum",
+                        &impl.shortStopMaximumPauseMilliseconds,
+                        impl.shortStopMinimumPauseMilliseconds,
+                        500,
+                        "%d ms");
+                    if (impl.shortStopMode ==
+                        ShortStopMode::slowMove)
+                    {
+                        settingsChanged |= custom::SliderFloat(
+                            "Slow multiplier minimum",
+                            &impl.shortStopSlowMultiplierMinimum,
+                            1.0F, 10.0F, "%.2fx");
+                        impl.shortStopSlowMultiplierMaximum =
+                            std::max(
+                                impl.shortStopSlowMultiplierMaximum,
+                                impl.shortStopSlowMultiplierMinimum);
+                        settingsChanged |= custom::SliderFloat(
+                            "Slow multiplier maximum",
+                            &impl.shortStopSlowMultiplierMaximum,
+                            impl.shortStopSlowMultiplierMinimum,
+                            10.0F,
+                            "%.2fx");
+                    }
+                }
+
+                settingsChanged |= custom::SliderInt(
+                    "New target delay minimum",
+                    &impl.newTargetDelayMinimumMilliseconds,
+                    0, 1000, "%d ms");
+                impl.newTargetDelayMaximumMilliseconds =
+                    std::max(
+                        impl.newTargetDelayMaximumMilliseconds,
+                        impl.newTargetDelayMinimumMilliseconds);
+                settingsChanged |= custom::SliderInt(
+                    "New target delay maximum",
+                    &impl.newTargetDelayMaximumMilliseconds,
+                    impl.newTargetDelayMinimumMilliseconds,
+                    1000,
+                    "%d ms");
+            }
+            if (settingsChanged)
+            {
+                impl.settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
             }
         }
 
-        ImGui::Spacing();
-        ImGui::TextDisabled(
-            "Hold the aim key to activate. Targets the top 15%% of the bounding box.\n"
-            "Uses MAKCU hardware mouse movement. Color + merge logic mirrors the Python bot.");
-
         ImGui::PopStyleVar();
         custom::EndChild();
+    }
+
+    TestMoveConfig TestMoveController::GetConfig() const
+    {
+        auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.settingsMutex);
+        TestMoveConfig result;
+        result.enabled = impl.enabled;
+        result.hsvRangeIndex = impl.hsvRangeIndex;
+        result.aimKey = impl.aimKey;
+        result.killFov = impl.killFov;
+        result.drawFovOutline =
+            impl.drawFovOutline;
+        result.fovColor = {
+            impl.fovColor[0],
+            impl.fovColor[1],
+            impl.fovColor[2],
+            impl.fovColor[3]};
+        result.movementMethod =
+            impl.movementMethod;
+        result.speed = impl.speed;
+        result.smooth = impl.smooth;
+        result.deadzone = impl.deadzone;
+        result.mergeProximity =
+            impl.mergeProximity;
+        result.windGravity = impl.windGravity;
+        result.windStrength = impl.windStrength;
+        result.windMaximumStep =
+            impl.windMaximumStep;
+        result.windSlowdownRadius =
+            impl.windSlowdownRadius;
+        result.axisMode = impl.axisMode;
+        result.axisHorizontalMultiplier =
+            impl.axisHorizontalMultiplier;
+        result.axisVerticalMultiplier =
+            impl.axisVerticalMultiplier;
+        result.axisSmoothing =
+            impl.axisSmoothing;
+        result.hybridVerticalTimeMilliseconds =
+            impl.hybridVerticalTimeMilliseconds;
+        result.antiBelowObjects =
+            impl.antiBelowObjects;
+        result.shortStopEnabled =
+            impl.shortStopEnabled;
+        result.shortStopMode =
+            impl.shortStopMode;
+        result.shortStopChancePercent =
+            impl.shortStopChancePercent;
+        result.shortStopMinimumPauseMilliseconds =
+            impl.shortStopMinimumPauseMilliseconds;
+        result.shortStopMaximumPauseMilliseconds =
+            impl.shortStopMaximumPauseMilliseconds;
+        result.shortStopSlowMultiplierMinimum =
+            impl.shortStopSlowMultiplierMinimum;
+        result.shortStopSlowMultiplierMaximum =
+            impl.shortStopSlowMultiplierMaximum;
+        result.newTargetDelayMinimumMilliseconds =
+            impl.newTargetDelayMinimumMilliseconds;
+        result.newTargetDelayMaximumMilliseconds =
+            impl.newTargetDelayMaximumMilliseconds;
+        return result;
+    }
+
+    void TestMoveController::ApplyConfig(
+        const TestMoveConfig& config)
+    {
+        auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.settingsMutex);
+        impl.enabled = config.enabled;
+        impl.hsvRangeIndex = std::clamp(
+            config.hsvRangeIndex,
+            0,
+            static_cast<int>(
+                kHsvColorTargets.size()) - 1);
+        impl.aimKey =
+            config.aimKey != 0
+            ? config.aimKey
+            : VK_LBUTTON;
+        impl.killFov =
+            std::clamp(config.killFov, 20, 350);
+        impl.drawFovOutline =
+            config.drawFovOutline;
+        impl.fovColor[0] = std::clamp(
+            config.fovColor.red, 0.0F, 1.0F);
+        impl.fovColor[1] = std::clamp(
+            config.fovColor.green, 0.0F, 1.0F);
+        impl.fovColor[2] = std::clamp(
+            config.fovColor.blue, 0.0F, 1.0F);
+        impl.fovColor[3] = std::clamp(
+            config.fovColor.alpha, 0.0F, 1.0F);
+        switch (config.movementMethod)
+        {
+        case MovementMethod::windMouse:
+            impl.movementMethod =
+                MovementMethod::windMouse;
+            break;
+        case MovementMethod::axisControl:
+            impl.movementMethod =
+                MovementMethod::axisControl;
+            break;
+        default:
+            impl.movementMethod =
+                MovementMethod::direct;
+            break;
+        }
+        impl.speed =
+            std::clamp(config.speed, 0.10F, 3.0F);
+        impl.smooth =
+            std::clamp(config.smooth, 0.10F, 1.0F);
+        impl.deadzone =
+            std::clamp(config.deadzone, 0, 20);
+        impl.mergeProximity =
+            std::clamp(
+                config.mergeProximity,
+                0,
+                50);
+        impl.windGravity =
+            std::clamp(
+                config.windGravity,
+                1.0F,
+                20.0F);
+        impl.windStrength =
+            std::clamp(
+                config.windStrength,
+                0.0F,
+                10.0F);
+        impl.windMaximumStep =
+            std::clamp(
+                config.windMaximumStep,
+                1.0F,
+                30.0F);
+        impl.windSlowdownRadius =
+            std::clamp(
+                config.windSlowdownRadius,
+                1.0F,
+                50.0F);
+        switch (config.axisMode)
+        {
+        case AxisMovementMode::horizontalOnly:
+            impl.axisMode =
+                AxisMovementMode::horizontalOnly;
+            break;
+        case AxisMovementMode::hybrid:
+            impl.axisMode =
+                AxisMovementMode::hybrid;
+            break;
+        default:
+            impl.axisMode =
+                AxisMovementMode::standard;
+            break;
+        }
+        impl.axisHorizontalMultiplier =
+            std::clamp(
+                config.axisHorizontalMultiplier,
+                0.10F,
+                3.0F);
+        impl.axisVerticalMultiplier =
+            std::clamp(
+                config.axisVerticalMultiplier,
+                0.10F,
+                3.0F);
+        impl.axisSmoothing =
+            std::clamp(
+                config.axisSmoothing,
+                0.10F,
+                1.0F);
+        impl.hybridVerticalTimeMilliseconds =
+            std::clamp(
+                config.hybridVerticalTimeMilliseconds,
+                100,
+                1000);
+        impl.antiBelowObjects =
+            config.antiBelowObjects;
+        impl.shortStopEnabled =
+            config.shortStopEnabled;
+        impl.shortStopMode =
+            config.shortStopMode ==
+                ShortStopMode::fullStop
+            ? ShortStopMode::fullStop
+            : ShortStopMode::slowMove;
+        impl.shortStopChancePercent =
+            std::clamp(
+                config.shortStopChancePercent,
+                1,
+                20);
+        impl.shortStopMinimumPauseMilliseconds =
+            std::clamp(
+                config.shortStopMinimumPauseMilliseconds,
+                10,
+                200);
+        impl.shortStopMaximumPauseMilliseconds =
+            std::clamp(
+                config.shortStopMaximumPauseMilliseconds,
+                impl.shortStopMinimumPauseMilliseconds,
+                500);
+        impl.shortStopSlowMultiplierMinimum =
+            std::clamp(
+                config.shortStopSlowMultiplierMinimum,
+                1.0F,
+                10.0F);
+        impl.shortStopSlowMultiplierMaximum =
+            std::clamp(
+                config.shortStopSlowMultiplierMaximum,
+                impl.shortStopSlowMultiplierMinimum,
+                10.0F);
+        impl.newTargetDelayMinimumMilliseconds =
+            std::clamp(
+                config.newTargetDelayMinimumMilliseconds,
+                0,
+                1000);
+        impl.newTargetDelayMaximumMilliseconds =
+            std::clamp(
+                config.newTargetDelayMaximumMilliseconds,
+                impl.newTargetDelayMinimumMilliseconds,
+                1000);
+        impl.settingsRevision.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    std::uint64_t
+    TestMoveController::SettingsRevision() const noexcept
+    {
+        return implementation_->
+            settingsRevision.load(
+                std::memory_order_relaxed);
+    }
+
+    TestMoveFovOutline
+    TestMoveController::GetFovOutline() const
+    {
+        auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.settingsMutex);
+        TestMoveFovOutline result;
+        result.visible =
+            impl.enabled &&
+            impl.drawFovOutline;
+        result.radius = impl.killFov;
+        result.color = {
+            impl.fovColor[0],
+            impl.fovColor[1],
+            impl.fovColor[2],
+            impl.fovColor[3]};
+        return result;
     }
 }

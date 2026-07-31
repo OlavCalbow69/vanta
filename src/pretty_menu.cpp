@@ -3,6 +3,8 @@
 #include "pretty_menu.hpp"
 
 #include "capture_controller.hpp"
+#include "bomb_timer_controller.hpp"
+#include "config_manager.hpp"
 #include "logger.hpp"
 #include "makcu_controller.hpp"
 #include "testclick_controller.hpp"
@@ -17,6 +19,7 @@
 #include "font_defines.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace
 {
@@ -27,6 +30,9 @@ namespace
     int g_page = 1;
     ImVec2 g_menuPosition{};
     ImVec2 g_menuSize{};
+    bool g_applyConfiguredGeometry = false;
+    std::atomic<std::uint64_t>
+        g_settingsRevision{0};
 
     constexpr ImGuiColorEditFlags palettePickerFlags =
         ImGuiColorEditFlags_NoSidePreview |
@@ -34,17 +40,17 @@ namespace
         ImGuiColorEditFlags_NoInputs |
         ImGuiColorEditFlags_AlphaPreview;
 
-    void PaletteColor(const char* label, ImColor& colorValue)
+    bool PaletteColor(const char* label, ImColor& colorValue)
     {
-        custom::ColorEdit4(
+        return custom::ColorEdit4(
             label,
             &colorValue.Value.x,
             palettePickerFlags);
     }
 
-    void PaletteColor(const char* label, ImVec4& colorValue)
+    bool PaletteColor(const char* label, ImVec4& colorValue)
     {
-        custom::ColorEdit4(
+        return custom::ColorEdit4(
             label,
             &colorValue.x,
             palettePickerFlags);
@@ -325,6 +331,37 @@ namespace vanta::menu
         font::icomoon_page = primary;
         font::icomoon_logo = primary;
         font::icon_notify = primary;
+        ImFontConfig timerConfig{};
+        timerConfig.FontBuilderFlags = flags;
+        timerConfig.OversampleH = 2;
+        timerConfig.OversampleV = 2;
+        font::timer_segoe = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeuib.ttf",
+            22.0F,
+            &timerConfig,
+            io.Fonts->GetGlyphRangesCyrillic());
+        font::timer_bahnschrift = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\bahnschrift.ttf",
+            22.0F,
+            &timerConfig,
+            io.Fonts->GetGlyphRangesCyrillic());
+        font::timer_consolas = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\consolab.ttf",
+            22.0F,
+            &timerConfig,
+            io.Fonts->GetGlyphRangesCyrillic());
+        if (font::timer_segoe == nullptr)
+        {
+            font::timer_segoe = font::bold_font;
+        }
+        if (font::timer_bahnschrift == nullptr)
+        {
+            font::timer_bahnschrift = font::bold_font;
+        }
+        if (font::timer_consolas == nullptr)
+        {
+            font::timer_consolas = font::bold_font;
+        }
         io.FontDefault = primary;
 
         const bool built = primary != nullptr && io.Fonts->Build();
@@ -400,10 +437,241 @@ namespace vanta::menu
         SynchronizeImGuiPalette();
     }
 
+    MenuConfig GetConfig()
+    {
+        const auto rgba = [](const ImVec4& value)
+        {
+            return RgbaColor{
+                value.x,
+                value.y,
+                value.z,
+                value.w};
+        };
+        MenuConfig result;
+        result.notifications =
+            g_notifications;
+        result.compactMode =
+            g_compactMode;
+        result.activePage =
+            g_page;
+        result.hasGeometry =
+            g_menuSize.x > 0.0F &&
+            g_menuSize.y > 0.0F;
+        result.positionX =
+            g_menuPosition.x;
+        result.positionY =
+            g_menuPosition.y;
+        result.width =
+            result.hasGeometry
+            ? g_menuSize.x
+            : 850.0F;
+        result.height =
+            result.hasGeometry
+            ? g_menuSize.y
+            : 596.0F;
+
+        auto& palette = result.palette;
+        palette[static_cast<std::size_t>(
+            PaletteSlot::accent)] =
+            rgba(c::main_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::secondary)] =
+            rgba(c::second_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::windowBackground)] =
+            rgba(c::window_bg_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::widgetBackground)] =
+            rgba(c::background_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::stroke)] =
+            rgba(c::stroke_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::separator)] =
+            rgba(c::separator);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::animationActive)] =
+            rgba(c::anim::active.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::animationDefault)] =
+            rgba(c::anim::default_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::mainBackground)] =
+            rgba(c::bg::background);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::childBackground)] =
+            rgba(c::child::background);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::childStroke)] =
+            rgba(c::child::stroke);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::checkboxMark)] =
+            rgba(c::checkbox::mark);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::pageActive)] =
+            rgba(c::page::background_active);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::pageBackground)] =
+            rgba(c::page::background);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::pageHoverText)] =
+            rgba(c::page::text_hov);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::pageText)] =
+            rgba(c::page::text);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::elementHovered)] =
+            rgba(c::elements::background_hovered);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::elementBackground)] =
+            rgba(c::elements::background);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::labelActive)] =
+            rgba(c::text::label::active.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::labelHovered)] =
+            rgba(c::text::label::hovered.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::labelDefault)] =
+            rgba(c::text::label::default_color.Value);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::descriptionActive)] =
+            rgba(c::text::description::active);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::descriptionHovered)] =
+            rgba(c::text::description::hovered);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::descriptionDefault)] =
+            rgba(c::text::description::default_color);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::textActive)] =
+            rgba(c::text::text_active);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::textHovered)] =
+            rgba(c::text::text_hov);
+        palette[static_cast<std::size_t>(
+            PaletteSlot::textDefault)] =
+            rgba(c::text::text);
+        return result;
+    }
+
+    void ApplyConfig(const MenuConfig& config)
+    {
+        const auto vector = [](const RgbaColor& value)
+        {
+            return ImVec4(
+                std::clamp(value.red, 0.0F, 1.0F),
+                std::clamp(value.green, 0.0F, 1.0F),
+                std::clamp(value.blue, 0.0F, 1.0F),
+                std::clamp(value.alpha, 0.0F, 1.0F));
+        };
+        const auto paletteColor = [&](PaletteSlot slot)
+        {
+            return vector(
+                config.palette[
+                    static_cast<std::size_t>(slot)]);
+        };
+
+        g_notifications =
+            config.notifications;
+        g_compactMode =
+            config.compactMode;
+        g_lastCompactMode =
+            g_compactMode;
+        g_page =
+            std::clamp(
+                config.activePage,
+                0,
+                7);
+        if (config.hasGeometry)
+        {
+            g_menuPosition = ImVec2(
+                config.positionX,
+                config.positionY);
+            g_menuSize = ImVec2(
+                std::clamp(
+                    config.width,
+                    760.0F,
+                    4096.0F),
+                std::clamp(
+                    config.height,
+                    540.0F,
+                    2160.0F));
+            g_applyConfiguredGeometry = true;
+        }
+
+        c::main_color.Value =
+            paletteColor(PaletteSlot::accent);
+        c::second_color.Value =
+            paletteColor(PaletteSlot::secondary);
+        c::window_bg_color.Value =
+            paletteColor(PaletteSlot::windowBackground);
+        c::background_color.Value =
+            paletteColor(PaletteSlot::widgetBackground);
+        c::stroke_color.Value =
+            paletteColor(PaletteSlot::stroke);
+        c::separator =
+            paletteColor(PaletteSlot::separator);
+        c::anim::active.Value =
+            paletteColor(PaletteSlot::animationActive);
+        c::anim::default_color.Value =
+            paletteColor(PaletteSlot::animationDefault);
+        c::bg::background =
+            paletteColor(PaletteSlot::mainBackground);
+        c::child::background =
+            paletteColor(PaletteSlot::childBackground);
+        c::child::stroke =
+            paletteColor(PaletteSlot::childStroke);
+        c::checkbox::mark =
+            paletteColor(PaletteSlot::checkboxMark);
+        c::page::background_active =
+            paletteColor(PaletteSlot::pageActive);
+        c::page::background =
+            paletteColor(PaletteSlot::pageBackground);
+        c::page::text_hov =
+            paletteColor(PaletteSlot::pageHoverText);
+        c::page::text =
+            paletteColor(PaletteSlot::pageText);
+        c::elements::background_hovered =
+            paletteColor(PaletteSlot::elementHovered);
+        c::elements::background =
+            paletteColor(PaletteSlot::elementBackground);
+        c::text::label::active.Value =
+            paletteColor(PaletteSlot::labelActive);
+        c::text::label::hovered.Value =
+            paletteColor(PaletteSlot::labelHovered);
+        c::text::label::default_color.Value =
+            paletteColor(PaletteSlot::labelDefault);
+        c::text::description::active =
+            paletteColor(PaletteSlot::descriptionActive);
+        c::text::description::hovered =
+            paletteColor(PaletteSlot::descriptionHovered);
+        c::text::description::default_color =
+            paletteColor(PaletteSlot::descriptionDefault);
+        c::text::text_active =
+            paletteColor(PaletteSlot::textActive);
+        c::text::text_hov =
+            paletteColor(PaletteSlot::textHovered);
+        c::text::text =
+            paletteColor(PaletteSlot::textDefault);
+        SynchronizeImGuiPalette();
+        g_settingsRevision.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    std::uint64_t SettingsRevision() noexcept
+    {
+        return g_settingsRevision.load(
+            std::memory_order_relaxed);
+    }
+
     void Render(
         const char* surfaceDescription,
         HWND overlayWindow,
         CaptureController& capture,
+        BombTimerController& bombTimer,
+        ConfigManager& configManager,
         MakcuController& makcu,
         TestClickController& testClick,
         TestMoveController& testMove,
@@ -421,7 +689,19 @@ namespace vanta::menu
             g_compactMode
             ? ImVec2(760.0F, 540.0F)
             : ImVec2(850.0F, 596.0F);
-        if (g_compactMode != g_lastCompactMode)
+        if (g_applyConfiguredGeometry)
+        {
+            ImGui::SetNextWindowSize(
+                g_menuSize,
+                ImGuiCond_Always);
+            ImGui::SetNextWindowPos(
+                g_menuPosition,
+                ImGuiCond_Always);
+            g_applyConfiguredGeometry = false;
+            g_lastCompactMode =
+                g_compactMode;
+        }
+        else if (g_compactMode != g_lastCompactMode)
         {
             ImGui::SetNextWindowSize(
                 preferredSize,
@@ -439,9 +719,13 @@ namespace vanta::menu
         ImGui::SetNextWindowSizeConstraints(
             ImVec2(760.0F, 540.0F),
             maximumSize);
-        ImGui::SetNextWindowPos(
-            InitialMenuPosition(overlayWindow),
-            ImGuiCond_FirstUseEver);
+        if (g_menuSize.x <= 0.0F ||
+            g_menuSize.y <= 0.0F)
+        {
+            ImGui::SetNextWindowPos(
+                InitialMenuPosition(overlayWindow),
+                ImGuiCond_FirstUseEver);
+        }
 
         constexpr ImGuiWindowFlags flags =
             ImGuiWindowFlags_NoTitleBar |
@@ -449,6 +733,11 @@ namespace vanta::menu
             ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoScrollbar;
 
+        const int previousPage = g_page;
+        const ImVec2 previousMenuPosition =
+            g_menuPosition;
+        const ImVec2 previousMenuSize =
+            g_menuSize;
         if (!ImGui::Begin("##vanta-overlay-menu", &g_visible, flags))
         {
             ImGui::End();
@@ -559,6 +848,14 @@ namespace vanta::menu
                 page_is_changing = false;
             }
             if (custom::Tab(
+                    ICON_BOMB_LINE "  Bomb Timer",
+                    &g_page,
+                    7))
+            {
+                g_page = 7;
+                page_is_changing = false;
+            }
+            if (custom::Tab(
                     ICON_USB_LINE "  Mouse Output",
                     &g_page,
                     3))
@@ -602,6 +899,14 @@ namespace vanta::menu
                 g_page = 2;
                 page_is_changing = false;
             }
+            if (custom::Tab(
+                    ICON_FILE_LINE "  Configs",
+                    &g_page,
+                    6))
+            {
+                g_page = 6;
+                page_is_changing = false;
+            }
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -622,14 +927,25 @@ namespace vanta::menu
                 "Transparent DirectComposition overlay is active");
             ImGui::TextWrapped("%s", surfaceDescription);
             ImGui::Spacing();
-            custom::Checkbox("Enable notifications", &g_notifications);
-            custom::Checkbox("Compact menu", &g_compactMode);
-            custom::SliderFloat(
+            bool settingsChanged = false;
+            settingsChanged |= custom::Checkbox(
+                "Enable notifications",
+                &g_notifications);
+            settingsChanged |= custom::Checkbox(
+                "Compact menu",
+                &g_compactMode);
+            settingsChanged |= custom::SliderFloat(
                 "Window opacity",
                 &c::window_bg_color.Value.w,
                 0.10F,
                 1.0F,
                 "%.2f");
+            if (settingsChanged)
+            {
+                g_settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
             if (custom::Button("Write a console test event", ImVec2(240.0F, 38.0F)))
             {
                 vanta::log::Info(
@@ -665,32 +981,37 @@ namespace vanta::menu
             ImGui::PushStyleVar(
                 ImGuiStyleVar_ItemSpacing,
                 ImVec2(12.0F, 12.0F));
-            PaletteColor("Accent", c::main_color);
-            PaletteColor("Secondary", c::second_color);
-            PaletteColor(
+            bool paletteChanged = false;
+            paletteChanged |= PaletteColor(
+                "Accent", c::main_color);
+            paletteChanged |= PaletteColor(
+                "Secondary", c::second_color);
+            paletteChanged |= PaletteColor(
                 "Window background",
                 c::window_bg_color);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Widget background",
                 c::background_color);
-            PaletteColor("Stroke", c::stroke_color);
-            PaletteColor("Separator", c::separator);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
+                "Stroke", c::stroke_color);
+            paletteChanged |= PaletteColor(
+                "Separator", c::separator);
+            paletteChanged |= PaletteColor(
                 "Animation active",
                 c::anim::active);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Animation default",
                 c::anim::default_color);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Main background",
                 c::bg::background);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Child background",
                 c::child::background);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Child stroke",
                 c::child::stroke);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Checkbox mark",
                 c::checkbox::mark);
             ImGui::PopStyleVar();
@@ -705,49 +1026,57 @@ namespace vanta::menu
             ImGui::PushStyleVar(
                 ImGuiStyleVar_ItemSpacing,
                 ImVec2(12.0F, 12.0F));
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Page active",
                 c::page::background_active);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Page background",
                 c::page::background);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Page hover text",
                 c::page::text_hov);
-            PaletteColor("Page text", c::page::text);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
+                "Page text", c::page::text);
+            paletteChanged |= PaletteColor(
                 "Element hovered",
                 c::elements::background_hovered);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Element background",
                 c::elements::background);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Label active",
                 c::text::label::active);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Label hovered",
                 c::text::label::hovered);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Label default",
                 c::text::label::default_color);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Description active",
                 c::text::description::active);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Description hovered",
                 c::text::description::hovered);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Description default",
                 c::text::description::default_color);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Text active",
                 c::text::text_active);
-            PaletteColor(
+            paletteChanged |= PaletteColor(
                 "Text hovered",
                 c::text::text_hov);
-            PaletteColor("Text default", c::text::text);
+            paletteChanged |= PaletteColor(
+                "Text default", c::text::text);
             ImGui::PopStyleVar();
             custom::EndChild();
+            if (paletteChanged)
+            {
+                g_settingsRevision.fetch_add(
+                    1,
+                    std::memory_order_relaxed);
+            }
         }
         else if (g_page == 4)
         {
@@ -756,6 +1085,17 @@ namespace vanta::menu
         else if (g_page == 5)
         {
             testMove.RenderPanel();
+        }
+        else if (g_page == 6)
+        {
+            configManager.RenderPanel(
+                overlayWindow,
+                testClick,
+                testMove);
+        }
+        else if (g_page == 7)
+        {
+            bombTimer.RenderPanel();
         }
         else
         {
@@ -771,6 +1111,18 @@ namespace vanta::menu
 
         g_menuPosition = ImGui::GetWindowPos();
         g_menuSize = ImGui::GetWindowSize();
+        if (g_page != previousPage ||
+            g_menuPosition.x !=
+                previousMenuPosition.x ||
+            g_menuPosition.y !=
+                previousMenuPosition.y ||
+            g_menuSize.x != previousMenuSize.x ||
+            g_menuSize.y != previousMenuSize.y)
+        {
+            g_settingsRevision.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
         ImGui::End();
     }
 

@@ -62,6 +62,9 @@ namespace
     {
         HWND window{};
         std::string label;
+        std::string executable;
+        std::string className;
+        std::string title;
     };
 
     struct MonitorEntry
@@ -69,6 +72,7 @@ namespace
         HMONITOR monitor{};
         RECT rectangle{};
         std::string label;
+        std::string deviceName;
     };
 
     struct CaptureSettings
@@ -82,7 +86,9 @@ namespace
     struct CapturedFrame
     {
         cv::Mat bgra;
+        cv::Mat auxiliaryBgra;
         RECT screenRectangle{};
+        RECT auxiliaryScreenRectangle{};
         int sourceWidth{};
         int sourceHeight{};
         bool centeredRegionApplied{};
@@ -122,6 +128,17 @@ namespace
         return result;
     }
 
+    bool EqualsInsensitive(
+        const std::string& left,
+        const std::string& right)
+    {
+        return
+            left.size() == right.size() &&
+            _stricmp(
+                left.c_str(),
+                right.c_str()) == 0;
+    }
+
     std::wstring WindowTitle(HWND window)
     {
         const int length = GetWindowTextLengthW(window);
@@ -138,7 +155,7 @@ namespace
         return result;
     }
 
-    std::wstring ProcessImageName(DWORD processId)
+    std::wstring ProcessImagePath(DWORD processId)
     {
         HANDLE process = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION,
@@ -159,15 +176,31 @@ namespace
             return {};
         }
 
-        const wchar_t* filename = path;
-        for (DWORD index = 0; index < length; ++index)
-        {
-            if (path[index] == L'\\' || path[index] == L'/')
-            {
-                filename = path + index + 1;
-            }
-        }
-        return filename;
+        return std::wstring(path, length);
+    }
+
+    std::wstring FileNameFromPath(
+        const std::wstring& path)
+    {
+        const std::size_t lastSeparator =
+            path.find_last_of(L"\\/");
+        return lastSeparator == std::wstring::npos
+            ? path
+            : path.substr(lastSeparator + 1);
+    }
+
+    std::wstring WindowClassName(HWND window)
+    {
+        std::array<wchar_t, 256> name{};
+        const int length = GetClassNameW(
+            window,
+            name.data(),
+            static_cast<int>(name.size()));
+        return length > 0
+            ? std::wstring(
+                name.data(),
+                static_cast<std::size_t>(length))
+            : std::wstring{};
     }
 
     bool IsCapturableWindow(HWND window, DWORD ownProcessId)
@@ -224,11 +257,18 @@ namespace
         DWORD processId = 0;
         GetWindowThreadProcessId(window, &processId);
         const std::wstring title = WindowTitle(window);
-        const std::wstring process = ProcessImageName(processId);
+        const std::wstring executable =
+            ProcessImagePath(processId);
+        const std::wstring process =
+            FileNameFromPath(executable);
 
         WindowEntry entry;
         entry.window = window;
-        entry.label = WideToUtf8(title);
+        entry.title = WideToUtf8(title);
+        entry.executable = WideToUtf8(executable);
+        entry.className =
+            WideToUtf8(WindowClassName(window));
+        entry.label = entry.title;
         if (!process.empty())
         {
             entry.label += "  [" + WideToUtf8(process) + "]";
@@ -277,8 +317,10 @@ namespace
         MonitorEntry entry;
         entry.monitor = monitor;
         entry.rectangle = information.rcMonitor;
+        entry.deviceName =
+            WideToUtf8(information.szDevice);
         entry.label =
-            WideToUtf8(information.szDevice) +
+            entry.deviceName +
             "  (" +
             std::to_string(
                 information.rcMonitor.right -
@@ -387,6 +429,165 @@ namespace
                     box.bottom * scaleY))};
     }
 
+    vanta::NormalizedCaptureRegion ClampNormalizedRegion(
+        const vanta::NormalizedCaptureRegion& input)
+    {
+        vanta::NormalizedCaptureRegion result = input;
+        result.left =
+            std::clamp(result.left, 0.0F, 0.9999F);
+        result.top =
+            std::clamp(result.top, 0.0F, 0.9999F);
+        result.width =
+            std::clamp(
+                result.width,
+                0.0001F,
+                1.0F - result.left);
+        result.height =
+            std::clamp(
+                result.height,
+                0.0001F,
+                1.0F - result.top);
+        return result;
+    }
+
+    std::optional<D3D11_BOX> NormalizedTextureBox(
+        const D3D11_TEXTURE2D_DESC& description,
+        const vanta::NormalizedCaptureRegion* region)
+    {
+        if (region == nullptr ||
+            !region->enabled ||
+            description.Width == 0 ||
+            description.Height == 0)
+        {
+            return std::nullopt;
+        }
+
+        const auto normalized =
+            ClampNormalizedRegion(*region);
+        const UINT left = std::min(
+            description.Width - 1,
+            static_cast<UINT>(std::lround(
+                normalized.left *
+                description.Width)));
+        const UINT top = std::min(
+            description.Height - 1,
+            static_cast<UINT>(std::lround(
+                normalized.top *
+                description.Height)));
+        const UINT right = std::clamp(
+            static_cast<UINT>(std::lround(
+                (normalized.left +
+                 normalized.width) *
+                description.Width)),
+            left + 1,
+            description.Width);
+        const UINT bottom = std::clamp(
+            static_cast<UINT>(std::lround(
+                (normalized.top +
+                 normalized.height) *
+                description.Height)),
+            top + 1,
+            description.Height);
+        return D3D11_BOX{
+            left,
+            top,
+            0,
+            right,
+            bottom,
+            1};
+    }
+
+    RECT NormalizedScreenRectangle(
+        const RECT& source,
+        const vanta::NormalizedCaptureRegion& input)
+    {
+        const auto region =
+            ClampNormalizedRegion(input);
+        const double width =
+            static_cast<double>(
+                source.right - source.left);
+        const double height =
+            static_cast<double>(
+                source.bottom - source.top);
+        return {
+            source.left +
+                static_cast<LONG>(std::lround(
+                    region.left * width)),
+            source.top +
+                static_cast<LONG>(std::lround(
+                    region.top * height)),
+            source.left +
+                static_cast<LONG>(std::lround(
+                    (region.left + region.width) *
+                    width)),
+            source.top +
+                static_cast<LONG>(std::lround(
+                    (region.top + region.height) *
+                    height))};
+    }
+
+    std::optional<D3D11_BOX> ScreenRectangleTextureBox(
+        const RECT& textureScreenRectangle,
+        UINT textureWidth,
+        UINT textureHeight,
+        const RECT& requestedScreenRectangle)
+    {
+        const RECT clipped =
+            IntersectRectangles(
+                textureScreenRectangle,
+                requestedScreenRectangle);
+        if (!IsValidRectangle(clipped) ||
+            textureWidth == 0 ||
+            textureHeight == 0)
+        {
+            return std::nullopt;
+        }
+
+        const double xScale =
+            static_cast<double>(textureWidth) /
+            static_cast<double>(
+                textureScreenRectangle.right -
+                textureScreenRectangle.left);
+        const double yScale =
+            static_cast<double>(textureHeight) /
+            static_cast<double>(
+                textureScreenRectangle.bottom -
+                textureScreenRectangle.top);
+        const UINT left = std::min(
+            textureWidth - 1,
+            static_cast<UINT>(std::lround(
+                (clipped.left -
+                 textureScreenRectangle.left) *
+                xScale)));
+        const UINT top = std::min(
+            textureHeight - 1,
+            static_cast<UINT>(std::lround(
+                (clipped.top -
+                 textureScreenRectangle.top) *
+                yScale)));
+        const UINT right = std::clamp(
+            static_cast<UINT>(std::lround(
+                (clipped.right -
+                 textureScreenRectangle.left) *
+                xScale)),
+            left + 1,
+            textureWidth);
+        const UINT bottom = std::clamp(
+            static_cast<UINT>(std::lround(
+                (clipped.bottom -
+                 textureScreenRectangle.top) *
+                yScale)),
+            top + 1,
+            textureHeight);
+        return D3D11_BOX{
+            left,
+            top,
+            0,
+            right,
+            bottom,
+            1};
+    }
+
     bool CopyTextureToMat(
         ID3D11Device* device,
         ID3D11DeviceContext* context,
@@ -483,7 +684,9 @@ namespace
             CapturedFrame& frame,
             std::string& status,
             bool centeredRegion,
-            int regionSize) = 0;
+            int regionSize,
+            const vanta::NormalizedCaptureRegion*
+                auxiliaryRegion) = 0;
     };
 
     class WindowsGraphicsCaptureBackend final
@@ -606,7 +809,9 @@ namespace
             CapturedFrame& frame,
             std::string& status,
             bool centeredRegion,
-            int regionSize) override
+            int regionSize,
+            const vanta::NormalizedCaptureRegion*
+                auxiliaryRegion) override
         {
             try
             {
@@ -666,6 +871,8 @@ namespace
                     }
                 }
 
+                const RECT fullScreenRectangle =
+                    frame.screenRectangle;
                 const auto sourceBox =
                     CenteredTextureBox(
                         textureDescription,
@@ -693,6 +900,35 @@ namespace
                 {
                     status = "Could not read the WinRT capture texture";
                     return false;
+                }
+
+                const auto auxiliaryBox =
+                    NormalizedTextureBox(
+                        textureDescription,
+                        auxiliaryRegion);
+                if (auxiliaryBox.has_value())
+                {
+                    if (!CopyTextureToMat(
+                            sharedDevice_.Get(),
+                            context_.Get(),
+                            texture.Get(),
+                            auxiliaryStaging_,
+                            frame.auxiliaryBgra,
+                            &*auxiliaryBox))
+                    {
+                        status =
+                            "Could not read the WinRT auxiliary region";
+                        frame.auxiliaryBgra.release();
+                    }
+                    else
+                    {
+                        frame.auxiliaryScreenRectangle =
+                            TextureBoxToScreenRectangle(
+                                fullScreenRectangle,
+                                textureDescription.Width,
+                                textureDescription.Height,
+                                *auxiliaryBox);
+                    }
                 }
 
                 if (contentSize.Width != frameSize_.Width ||
@@ -736,6 +972,7 @@ namespace
         ComPtr<ID3D11Device> sharedDevice_;
         ComPtr<ID3D11DeviceContext> context_;
         ComPtr<ID3D11Texture2D> staging_;
+        ComPtr<ID3D11Texture2D> auxiliaryStaging_;
         winrt::Windows::Graphics::DirectX::Direct3D11::
             IDirect3DDevice direct3DDevice_{nullptr};
         winrt::Windows::Graphics::Capture::
@@ -884,7 +1121,9 @@ namespace
             CapturedFrame& frame,
             std::string& status,
             bool centeredRegion,
-            int regionSize) override
+            int regionSize,
+            const vanta::NormalizedCaptureRegion*
+                auxiliaryRegion) override
         {
             if (duplication_ == nullptr)
             {
@@ -939,6 +1178,35 @@ namespace
                 static_cast<int>(textureDescription.Height);
             frame.screenRectangle =
                 outputDescription_.DesktopCoordinates;
+            const RECT fullOutputRectangle =
+                frame.screenRectangle;
+
+            RECT auxiliaryReferenceRectangle =
+                fullOutputRectangle;
+            if (settings_.source ==
+                    CaptureSourceKind::window &&
+                settings_.window != nullptr)
+            {
+                RECT windowRectangle{};
+                if (GetWindowRect(
+                        settings_.window,
+                        &windowRectangle))
+                {
+                    auxiliaryReferenceRectangle =
+                        windowRectangle;
+                }
+            }
+            RECT requestedAuxiliaryRectangle{};
+            const bool auxiliaryRequested =
+                auxiliaryRegion != nullptr &&
+                auxiliaryRegion->enabled;
+            if (auxiliaryRequested)
+            {
+                requestedAuxiliaryRectangle =
+                    NormalizedScreenRectangle(
+                        auxiliaryReferenceRectangle,
+                        *auxiliaryRegion);
+            }
 
             std::optional<D3D11_BOX> sourceBox;
             if (settings_.source == CaptureSourceKind::monitor &&
@@ -979,6 +1247,46 @@ namespace
                 return false;
             }
 
+            const bool rotatedOutput =
+                outputDescription_.Rotation ==
+                    DXGI_MODE_ROTATION_ROTATE90 ||
+                outputDescription_.Rotation ==
+                    DXGI_MODE_ROTATION_ROTATE180 ||
+                outputDescription_.Rotation ==
+                    DXGI_MODE_ROTATION_ROTATE270;
+            if (auxiliaryRequested &&
+                !rotatedOutput)
+            {
+                const auto auxiliaryBox =
+                    ScreenRectangleTextureBox(
+                        fullOutputRectangle,
+                        textureDescription.Width,
+                        textureDescription.Height,
+                        requestedAuxiliaryRectangle);
+                if (auxiliaryBox.has_value())
+                {
+                    if (!CopyTextureToMat(
+                            device_.Get(),
+                            context_.Get(),
+                            texture.Get(),
+                            auxiliaryStaging_,
+                            frame.auxiliaryBgra,
+                            &*auxiliaryBox))
+                    {
+                        status =
+                            "Could not read the duplicated auxiliary region";
+                        frame.auxiliaryBgra.release();
+                    }
+                    else
+                    {
+                        frame.auxiliaryScreenRectangle =
+                            IntersectRectangles(
+                                fullOutputRectangle,
+                                requestedAuxiliaryRectangle);
+                    }
+                }
+            }
+
             duplication_->ReleaseFrame();
             frameAcquired_ = false;
 
@@ -1013,6 +1321,38 @@ namespace
                 frame.sourceWidth = frame.bgra.cols;
                 frame.sourceHeight = frame.bgra.rows;
             }
+            if (auxiliaryRequested &&
+                rotatedOutput)
+            {
+                const auto auxiliaryBox =
+                    ScreenRectangleTextureBox(
+                        fullOutputRectangle,
+                        static_cast<UINT>(
+                            frame.bgra.cols),
+                        static_cast<UINT>(
+                            frame.bgra.rows),
+                        requestedAuxiliaryRectangle);
+                if (auxiliaryBox.has_value())
+                {
+                    const cv::Rect region(
+                        static_cast<int>(
+                            auxiliaryBox->left),
+                        static_cast<int>(
+                            auxiliaryBox->top),
+                        static_cast<int>(
+                            auxiliaryBox->right -
+                            auxiliaryBox->left),
+                        static_cast<int>(
+                            auxiliaryBox->bottom -
+                            auxiliaryBox->top));
+                    frame.auxiliaryBgra =
+                        frame.bgra(region).clone();
+                    frame.auxiliaryScreenRectangle =
+                        IntersectRectangles(
+                            fullOutputRectangle,
+                            requestedAuxiliaryRectangle);
+                }
+            }
             return true;
         }
 
@@ -1035,6 +1375,7 @@ namespace
         ComPtr<ID3D11DeviceContext> context_;
         ComPtr<IDXGIOutputDuplication> duplication_;
         ComPtr<ID3D11Texture2D> staging_;
+        ComPtr<ID3D11Texture2D> auxiliaryStaging_;
     };
 
     std::uint32_t ColorKey(
@@ -1142,7 +1483,8 @@ struct vanta::CaptureController::Implementation
     bool Initialize(
         ID3D11Device* device,
         ID3D11DeviceContext* context,
-        DWORD processId)
+        DWORD processId,
+        const vanta::CaptureConfig* initialConfig)
     {
         previewDevice = device;
         previewContext = context;
@@ -1164,7 +1506,14 @@ struct vanta::CaptureController::Implementation
         }
 
         RefreshSources();
-        sourceIndex = 1;
+        if (initialConfig != nullptr)
+        {
+            ApplyConfigValues(*initialConfig);
+        }
+        else
+        {
+            sourceIndex = 1;
+        }
         captureEnabled = true;
         if (!StartCapture())
         {
@@ -1242,6 +1591,92 @@ struct vanta::CaptureController::Implementation
                 selectedMonitor = static_cast<int>(index);
                 break;
             }
+        }
+    }
+
+    void ApplyConfigValues(
+        const vanta::CaptureConfig& config)
+    {
+        backendIndex =
+            std::clamp(config.backendIndex, 0, 1);
+        sourceIndex =
+            std::clamp(config.sourceIndex, 0, 1);
+        regionIndex =
+            std::clamp(config.regionIndex, 0, 1);
+        regionSize =
+            std::clamp(config.regionSize, 128, 1280);
+        drawOutline = config.drawOutline;
+        outlineColor[0] = std::clamp(
+            config.outlineColor.red, 0.0F, 1.0F);
+        outlineColor[1] = std::clamp(
+            config.outlineColor.green, 0.0F, 1.0F);
+        outlineColor[2] = std::clamp(
+            config.outlineColor.blue, 0.0F, 1.0F);
+        outlineColor[3] = std::clamp(
+            config.outlineColor.alpha, 0.0F, 1.0F);
+        applyFilter = config.applyFilter;
+        binaryMask = config.binaryMask;
+        colorTargetIndex = std::clamp(
+            config.colorTargetIndex,
+            0,
+            static_cast<int>(
+                vanta::kHsvColorTargets.size()) - 1);
+
+        if (!config.monitorDevice.empty())
+        {
+            for (std::size_t index = 0;
+                 index < monitors.size();
+                 ++index)
+            {
+                if (EqualsInsensitive(
+                        monitors[index].deviceName,
+                        config.monitorDevice))
+                {
+                    selectedMonitor =
+                        static_cast<int>(index);
+                    break;
+                }
+            }
+        }
+
+        int fallbackWindow = -1;
+        for (std::size_t index = 0;
+             index < windows.size();
+             ++index)
+        {
+            const auto& entry = windows[index];
+            const bool executableMatches =
+                !config.windowExecutable.empty() &&
+                EqualsInsensitive(
+                    entry.executable,
+                    config.windowExecutable);
+            const bool classMatches =
+                config.windowClass.empty() ||
+                EqualsInsensitive(
+                    entry.className,
+                    config.windowClass);
+            if (executableMatches &&
+                classMatches &&
+                fallbackWindow < 0)
+            {
+                fallbackWindow =
+                    static_cast<int>(index);
+            }
+            if (executableMatches &&
+                classMatches &&
+                (config.windowTitle.empty() ||
+                 entry.title ==
+                    config.windowTitle))
+            {
+                selectedWindow =
+                    static_cast<int>(index);
+                fallbackWindow = -1;
+                break;
+            }
+        }
+        if (fallbackWindow >= 0)
+        {
+            selectedWindow = fallbackWindow;
         }
     }
 
@@ -1355,6 +1790,13 @@ struct vanta::CaptureController::Implementation
             latestFrameTimestampNanoseconds = 0;
         }
         latestFrameCondition.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(auxiliaryFrameMutex);
+            latestAuxiliaryFrame.release();
+            latestAuxiliaryScreenRectangle = {};
+            latestAuxiliaryTimestampNanoseconds = 0;
+        }
+        auxiliaryFrameCondition.notify_all();
     }
 
     void Tick()
@@ -1365,12 +1807,22 @@ struct vanta::CaptureController::Implementation
         }
 
         CapturedFrame frame;
+        vanta::NormalizedCaptureRegion auxiliaryRequest;
+        {
+            std::lock_guard<std::mutex> lock(
+                auxiliaryFrameMutex);
+            auxiliaryRequest =
+                auxiliaryNormalizedRegion;
+        }
         const std::string previousStatus = status;
         if (!captureBackend->TryGetFrame(
                 frame,
                 status,
                 regionIndex == 1,
-                regionSize))
+                regionSize,
+                auxiliaryRequest.enabled
+                    ? &auxiliaryRequest
+                    : nullptr))
         {
             if (status != previousStatus &&
                 status.find("error") != std::string::npos)
@@ -1580,6 +2032,10 @@ struct vanta::CaptureController::Implementation
             source(captureRectangle);
         captureWidth = capture.cols;
         captureHeight = capture.rows;
+        const std::int64_t frameTimestampNanoseconds =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
 
         // Publish the immutable BGRA capture region. cv::Mat reference
         // counting keeps its storage alive after this lock is released.
@@ -1589,11 +2045,27 @@ struct vanta::CaptureController::Implementation
             ++latestFrameSequence;
             ++sessionPublishedFrames;
             latestFrameTimestampNanoseconds =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count();
+                frameTimestampNanoseconds;
         }
         latestFrameCondition.notify_all();
+
+        if (!captured.auxiliaryBgra.empty() &&
+            IsValidRectangle(
+                captured.auxiliaryScreenRectangle))
+        {
+            {
+                std::lock_guard<std::mutex> lock(
+                    auxiliaryFrameMutex);
+                latestAuxiliaryFrame =
+                    captured.auxiliaryBgra;
+                latestAuxiliaryScreenRectangle =
+                    captured.auxiliaryScreenRectangle;
+                ++latestAuxiliarySequence;
+                latestAuxiliaryTimestampNanoseconds =
+                    frameTimestampNanoseconds;
+            }
+            auxiliaryFrameCondition.notify_all();
+        }
 
         cv::Mat processed;
         if (applyFilter || binaryMask)
@@ -1858,6 +2330,7 @@ struct vanta::CaptureController::Implementation
             available.y - 40.0F);
 
         bool selectionChanged = false;
+        bool settingsChanged = false;
         if (custom::Child(
                 ICON_SETTINGS_3_LINE
                     "  Capture settings##capture-settings",
@@ -1875,25 +2348,31 @@ struct vanta::CaptureController::Implementation
                 "Full source",
                 "Centered square"};
 
-            selectionChanged |= custom::Combo(
+            bool changed = custom::Combo(
                 "Backend",
                 &backendIndex,
                 backends,
                 IM_ARRAYSIZE(backends));
-            selectionChanged |= custom::Combo(
+            selectionChanged |= changed;
+            settingsChanged |= changed;
+            changed = custom::Combo(
                 "Source",
                 &sourceIndex,
                 sources,
                 IM_ARRAYSIZE(sources));
+            selectionChanged |= changed;
+            settingsChanged |= changed;
 
             if (sourceIndex == 0)
             {
-                selectionChanged |= RenderWindowSelector();
+                changed = RenderWindowSelector();
             }
             else
             {
-                selectionChanged |= RenderMonitorSelector();
+                changed = RenderMonitorSelector();
             }
+            selectionChanged |= changed;
+            settingsChanged |= changed;
 
             if (custom::Button(
                     "Refresh sources",
@@ -1903,17 +2382,18 @@ struct vanta::CaptureController::Implementation
             {
                 RefreshSources();
                 selectionChanged = true;
+                settingsChanged = true;
             }
 
             custom::Separator();
-            custom::Combo(
+            settingsChanged |= custom::Combo(
                 "Capture area",
                 &regionIndex,
                 regions,
                 IM_ARRAYSIZE(regions));
             if (regionIndex == 1)
             {
-                custom::SliderInt(
+                settingsChanged |= custom::SliderInt(
                     "Square size",
                     &regionSize,
                     128,
@@ -1921,12 +2401,12 @@ struct vanta::CaptureController::Implementation
                     "%d px");
             }
 
-            custom::Checkbox(
+            settingsChanged |= custom::Checkbox(
                 "Draw capture outline",
                 &drawOutline);
             if (drawOutline)
             {
-                custom::ColorEdit4(
+                settingsChanged |= custom::ColorEdit4(
                     "Outline color",
                     outlineColor,
                     ImGuiColorEditFlags_NoSidePreview |
@@ -1935,12 +2415,28 @@ struct vanta::CaptureController::Implementation
                         ImGuiColorEditFlags_AlphaPreview);
             }
 
-            custom::Checkbox(
+            settingsChanged |= custom::Checkbox(
                 "Apply HSV + blacklist filter",
                 &applyFilter);
-            custom::Checkbox(
+            settingsChanged |= custom::Checkbox(
                 "Black/white mask",
                 &binaryMask);
+            const char* colorTargets[
+                vanta::kHsvColorTargets.size()]{};
+            for (std::size_t index = 0;
+                 index <
+                    vanta::kHsvColorTargets.size();
+                 ++index)
+            {
+                colorTargets[index] =
+                    vanta::kHsvColorTargets[index].label;
+            }
+            settingsChanged |= custom::Combo(
+                "Preview color target",
+                &colorTargetIndex,
+                colorTargets,
+                static_cast<int>(
+                    vanta::kHsvColorTargets.size()));
             const auto& colorTarget =
                 vanta::kHsvColorTargets[
                     static_cast<std::size_t>(
@@ -1968,6 +2464,13 @@ struct vanta::CaptureController::Implementation
             ImGui::PopStyleVar();
         }
         custom::EndChild();
+
+        if (settingsChanged)
+        {
+            settingsRevision.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
 
         if (selectionChanged)
         {
@@ -2142,6 +2645,7 @@ struct vanta::CaptureController::Implementation
     bool applyFilter = false;
     bool binaryMask = false;
     int colorTargetIndex = 0;
+    std::atomic<std::uint64_t> settingsRevision{0};
     bool firstFrameLogged = false;
     float outlineColor[4]{
         0.68F,
@@ -2178,6 +2682,17 @@ struct vanta::CaptureController::Implementation
     std::uint64_t latestFrameSequence{};
     std::uint64_t sessionPublishedFrames{};
     std::int64_t latestFrameTimestampNanoseconds{};
+
+    mutable std::mutex auxiliaryFrameMutex;
+    mutable std::condition_variable
+        auxiliaryFrameCondition;
+    vanta::NormalizedCaptureRegion
+        auxiliaryNormalizedRegion;
+    cv::Mat latestAuxiliaryFrame;
+    RECT latestAuxiliaryScreenRectangle{};
+    std::uint64_t latestAuxiliarySequence{};
+    std::int64_t
+        latestAuxiliaryTimestampNanoseconds{};
 };
 
 namespace vanta
@@ -2195,12 +2710,14 @@ namespace vanta
     bool CaptureController::Initialize(
         ID3D11Device* previewDevice,
         ID3D11DeviceContext* previewContext,
-        DWORD ownProcessId)
+        DWORD ownProcessId,
+        const CaptureConfig* initialConfig)
     {
         return implementation_->Initialize(
             previewDevice,
             previewContext,
-            ownProcessId);
+            ownProcessId,
+            initialConfig);
     }
 
     void CaptureController::Shutdown()
@@ -2240,6 +2757,87 @@ namespace vanta
                     kHsvColorTargets.size()) - 1);
     }
 
+    CaptureConfig CaptureController::GetConfig() const
+    {
+        const auto& impl = *implementation_;
+        CaptureConfig result;
+        result.backendIndex =
+            impl.backendIndex;
+        result.sourceIndex =
+            impl.sourceIndex;
+        result.regionIndex =
+            impl.regionIndex;
+        result.regionSize =
+            impl.regionSize;
+        result.drawOutline =
+            impl.drawOutline;
+        result.outlineColor = {
+            impl.outlineColor[0],
+            impl.outlineColor[1],
+            impl.outlineColor[2],
+            impl.outlineColor[3]};
+        result.applyFilter =
+            impl.applyFilter;
+        result.binaryMask =
+            impl.binaryMask;
+        result.colorTargetIndex =
+            impl.colorTargetIndex;
+        if (impl.selectedMonitor >= 0 &&
+            impl.selectedMonitor <
+                static_cast<int>(
+                    impl.monitors.size()))
+        {
+            result.monitorDevice =
+                impl.monitors[
+                    static_cast<std::size_t>(
+                        impl.selectedMonitor)]
+                    .deviceName;
+        }
+        if (impl.selectedWindow >= 0 &&
+            impl.selectedWindow <
+                static_cast<int>(
+                    impl.windows.size()))
+        {
+            const auto& entry =
+                impl.windows[
+                    static_cast<std::size_t>(
+                        impl.selectedWindow)];
+            result.windowExecutable =
+                entry.executable;
+            result.windowClass =
+                entry.className;
+            result.windowTitle =
+                entry.title;
+        }
+        return result;
+    }
+
+    void CaptureController::ApplyConfig(
+        const CaptureConfig& config)
+    {
+        auto& impl = *implementation_;
+        impl.RefreshSources();
+        impl.ApplyConfigValues(config);
+        impl.captureEnabled = true;
+        if (!impl.StartCapture())
+        {
+            vanta::log::Warning(
+                "capture config apply could not start source: %s",
+                impl.status.c_str());
+        }
+        impl.settingsRevision.fetch_add(
+            1,
+            std::memory_order_relaxed);
+    }
+
+    std::uint64_t
+    CaptureController::SettingsRevision() const noexcept
+    {
+        return implementation_->
+            settingsRevision.load(
+                std::memory_order_relaxed);
+    }
+
     CaptureOutline CaptureController::GetOutline() const noexcept
     {
         CaptureOutline result =
@@ -2254,6 +2852,16 @@ namespace vanta
             std::begin(result.color));
         result.thickness = 1;
         return result;
+    }
+
+    bool CaptureController::GetCaptureScreenRectangle(
+        RECT& rectangle) const noexcept
+    {
+        rectangle =
+            implementation_->outline.screenRectangle;
+        return
+            implementation_->running &&
+            IsValidRectangle(rectangle);
     }
 
     bool CaptureController::GetLatestCenteredFrame(cv::Mat& out) const
@@ -2297,5 +2905,88 @@ namespace vanta
         captureTimestampNanoseconds =
             implementation_->latestFrameTimestampNanoseconds;
         return true;
+    }
+
+    void CaptureController::SetAuxiliaryNormalizedRegion(
+        const NormalizedCaptureRegion& region)
+    {
+        auto& impl = *implementation_;
+        const auto clamped =
+            ClampNormalizedRegion(region);
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(
+                impl.auxiliaryFrameMutex);
+            const auto& previous =
+                impl.auxiliaryNormalizedRegion;
+            changed =
+                previous.enabled != clamped.enabled ||
+                previous.left != clamped.left ||
+                previous.top != clamped.top ||
+                previous.width != clamped.width ||
+                previous.height != clamped.height;
+            if (changed)
+            {
+                impl.auxiliaryNormalizedRegion =
+                    clamped;
+                impl.latestAuxiliaryFrame.release();
+                impl.latestAuxiliaryScreenRectangle = {};
+                impl.latestAuxiliaryTimestampNanoseconds = 0;
+            }
+        }
+        if (changed)
+        {
+            impl.auxiliaryFrameCondition.notify_all();
+        }
+    }
+
+    bool CaptureController::WaitForAuxiliaryFrame(
+        std::uint64_t afterSequence,
+        cv::Mat& out,
+        std::uint64_t& sequence,
+        std::int64_t& captureTimestampNanoseconds,
+        RECT& screenRectangle,
+        std::uint32_t timeoutMilliseconds) const
+    {
+        auto& impl = *implementation_;
+        std::unique_lock<std::mutex> lock(
+            impl.auxiliaryFrameMutex);
+        const bool available =
+            impl.auxiliaryFrameCondition.wait_for(
+                lock,
+                std::chrono::milliseconds(
+                    timeoutMilliseconds),
+                [&]()
+                {
+                    return
+                        impl.latestAuxiliarySequence >
+                            afterSequence &&
+                        !impl.latestAuxiliaryFrame.empty();
+                });
+        if (!available)
+        {
+            return false;
+        }
+        out = impl.latestAuxiliaryFrame;
+        sequence = impl.latestAuxiliarySequence;
+        captureTimestampNanoseconds =
+            impl.latestAuxiliaryTimestampNanoseconds;
+        screenRectangle =
+            impl.latestAuxiliaryScreenRectangle;
+        return true;
+    }
+
+    bool CaptureController::GetAuxiliaryScreenRectangle(
+        RECT& rectangle) const noexcept
+    {
+        const auto& impl = *implementation_;
+        std::lock_guard<std::mutex> lock(
+            impl.auxiliaryFrameMutex);
+        rectangle =
+            impl.latestAuxiliaryScreenRectangle;
+        return
+            impl.running &&
+            !impl.latestAuxiliaryFrame.empty() &&
+            IsValidRectangle(rectangle);
     }
 }

@@ -24,6 +24,9 @@ namespace font
 	inline ImFont* s_inter_semibold = nullptr;
 	inline ImFont* inter_medium = nullptr;
 	inline ImFont* icon_notify = nullptr;
+	inline ImFont* timer_segoe = nullptr;
+	inline ImFont* timer_bahnschrift = nullptr;
+	inline ImFont* timer_consolas = nullptr;
 }
 
 namespace utils
