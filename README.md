@@ -32,6 +32,24 @@ build\Release\opencv_world500.dll
 build\Release\makcu-cpp.dll
 ```
 
+## Automated builds and releases
+
+GitHub Actions builds Debug and Release x64 on the Visual Studio 2026 runner
+for pushes to `main`, pull requests, and manual workflow runs. Successful CI
+builds provide a Release ZIP for three days.
+
+Stable releases use semantic version tags that must match
+`VANTA_VERSION_STRING` in `src\version.hpp`. For example:
+
+```powershell
+git tag -a v1.0.0 -m "Vanta v1.0.0"
+git push origin v1.0.0
+```
+
+The tag workflow publishes `vanta-v1.0.0-win64.zip` and its SHA-256 checksum
+as permanent GitHub Release assets. The ZIP contains `vanta.exe`, OpenCV and
+MAKCU runtime DLLs, and this README.
+
 ## Run
 
 Start the always-on-top overlay:

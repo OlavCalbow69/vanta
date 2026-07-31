@@ -1,5 +1,6 @@
 #include "logger.hpp"
 #include "overlay_app.hpp"
+#include "version.hpp"
 
 #include <Windows.h>
 
@@ -36,7 +37,9 @@ int wmain(int argumentCount, wchar_t** arguments)
 {
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     vanta::log::Initialize(instance);
-    vanta::log::Info("vanta external overlay starting");
+    vanta::log::Info(
+        "vanta external overlay %s starting",
+        VANTA_VERSION_STRING);
 
     g_cleanupCompletedEvent =
         CreateEventW(nullptr, TRUE, FALSE, nullptr);

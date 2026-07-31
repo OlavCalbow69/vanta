@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish Windows x64 release
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and canonical version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+            throw "Release tag must use vMAJOR.MINOR.PATCH: $tag"
+          }
+
+          $header = Get-Content -LiteralPath 'src\version.hpp' -Raw
+          $versionMatch = [regex]::Match(
+            $header,
+            '(?m)^#define\s+VANTA_VERSION_STRING\s+"([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
+          if (-not $versionMatch.Success) {
+            throw 'Could not read VANTA_VERSION_STRING from src/version.hpp.'
+          }
+          $version = $versionMatch.Groups[1].Value
+          if ($tag -ne "v$version") {
+            throw "Tag $tag does not match canonical version v$version."
+          }
+
+          "VANTA_RELEASE_TAG=$tag" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_ZIP=vanta-$tag-win64.zip" >> $env:GITHUB_ENV
+
+      - name: Refuse to overwrite an existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $response = gh api `
+            "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:VANTA_RELEASE_TAG" `
+            2>&1
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:VANTA_RELEASE_TAG already exists."
+          }
+          if (($response | Out-String) -notmatch 'HTTP 404') {
+            throw "Could not verify release absence: $response"
+          }
+
+      - name: Locate Visual Studio 2026 MSBuild
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            'Microsoft Visual Studio\Installer\vswhere.exe'
+          $msbuild = & $vswhere -latest -products * `
+            -requires Microsoft.Component.MSBuild `
+            -find 'MSBuild\**\Bin\MSBuild.exe' |
+            Select-Object -First 1
+          if (-not $msbuild) {
+            throw 'Visual Studio 2026 MSBuild was not found.'
+          }
+          "MSBUILD_PATH=$msbuild" >> $env:GITHUB_ENV
+
+      - name: Build Release x64
+        shell: pwsh
+        run: |
+          & $env:MSBUILD_PATH .\vanta.sln /m /t:Build `
+            /p:Configuration=Release /p:Platform=x64 /nologo
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Package release and checksum
+        shell: pwsh
+        run: |
+          $runtimeFiles = @(
+            'build\Release\vanta.exe',
+            'build\Release\opencv_world500.dll',
+            'build\Release\makcu-cpp.dll',
+            'README.md'
+          )
+          foreach ($file in $runtimeFiles) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+              throw "Expected release file is missing: $file"
+            }
+          }
+
+          $stage = "artifacts\vanta-$env:VANTA_RELEASE_TAG-win64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($file in $runtimeFiles) {
+            Copy-Item -LiteralPath $file -Destination $stage
+          }
+
+          $zip = Join-Path 'artifacts' $env:VANTA_RELEASE_ZIP
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumPath = "$zip.sha256"
+          [System.IO.File]::WriteAllText(
+            $checksumPath,
+            "$hash  $env:VANTA_RELEASE_ZIP`n",
+            [System.Text.UTF8Encoding]::new($false))
+
+      - name: Publish stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "artifacts\$env:VANTA_RELEASE_ZIP"
+          $checksum = "$zip.sha256"
+          gh release create $env:VANTA_RELEASE_TAG `
+            $zip $checksum `
+            --repo $env:GITHUB_REPOSITORY `
+            --verify-tag `
+            --title "Vanta $env:VANTA_RELEASE_TAG" `
+            --generate-notes

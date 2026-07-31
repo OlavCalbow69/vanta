@@ -42,6 +42,7 @@
     <ClInclude Include="src\rp2040_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testclick_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testmove_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\version.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="vendor\imgui\imconfig.h"><Filter>Vendor\ImGui</Filter></ClInclude>
     <ClInclude Include="vendor\imgui\imgui.h"><Filter>Vendor\ImGui</Filter></ClInclude>
     <ClInclude Include="vendor\imgui\imgui_freetype.h"><Filter>Vendor\ImGui</Filter></ClInclude>
