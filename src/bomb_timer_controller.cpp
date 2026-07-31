@@ -1738,11 +1738,6 @@ namespace vanta
                     " | %.1f s",
                     Remaining());
             }
-            ImGui::SameLine();
-            ImGui::TextDisabled(
-                " | Matches %d",
-                matchingPixels.load(
-                    std::memory_order_relaxed));
 
             bool settingsChanged = false;
             bool enabledChanged = false;
@@ -1760,79 +1755,6 @@ namespace vanta
                 settingsChanged |= enabledChanged;
                 if (config.enabled)
                 {
-                    drawCategory("DETECTION");
-
-                    float target[4]{
-                        config.targetColor.red,
-                        config.targetColor.green,
-                        config.targetColor.blue,
-                        1.0F};
-                    if (custom::ColorEdit4(
-                            "Target RGB",
-                            target,
-                            ImGuiColorEditFlags_NoSidePreview |
-                                ImGuiColorEditFlags_NoInputs))
-                    {
-                        config.targetColor = {
-                            target[0],
-                            target[1],
-                            target[2],
-                            1.0F};
-                        settingsChanged = true;
-                    }
-                    settingsChanged |= custom::SliderInt(
-                        "RGB tolerance",
-                        &config.colorTolerance,
-                        0,
-                        255,
-                        "%d");
-                    settingsChanged |= custom::SliderInt(
-                        "Required pixels",
-                        &config.requiredMatchingPixels,
-                        1,
-                        1000,
-                        "%d");
-                    settingsChanged |= custom::SliderInt(
-                        "Confirm frames",
-                        &config.requiredConsecutiveFrames,
-                        1,
-                        10,
-                        "%d");
-                    settingsChanged |= custom::SliderFloat(
-                        "Region left",
-                        &config.regionLeft,
-                        0.0F,
-                        0.999F,
-                        "%.4f");
-                    settingsChanged |= custom::SliderFloat(
-                        "Region top",
-                        &config.regionTop,
-                        0.0F,
-                        0.999F,
-                        "%.4f");
-                    config.regionWidth = std::min(
-                        config.regionWidth,
-                        1.0F - config.regionLeft);
-                    config.regionHeight = std::min(
-                        config.regionHeight,
-                        1.0F - config.regionTop);
-                    settingsChanged |= custom::SliderFloat(
-                        "Region width",
-                        &config.regionWidth,
-                        0.001F,
-                        std::max(
-                            0.001F,
-                            1.0F - config.regionLeft),
-                        "%.4f");
-                    settingsChanged |= custom::SliderFloat(
-                        "Region height",
-                        &config.regionHeight,
-                        0.001F,
-                        std::max(
-                            0.001F,
-                            1.0F - config.regionTop),
-                        "%.4f");
-
                     drawCategory("TIMER");
                     if (custom::Button(
                             ICON_PLAY_LINE
@@ -2044,51 +1966,6 @@ namespace vanta
             }
 
             DrawWidgetPreview(snapshot);
-
-            if (snapshot.enabled)
-            {
-                UpdatePreviewTexture();
-                drawCategory("LIVE ROI");
-                if (previewShaderResource != nullptr &&
-                    previewWidth > 0 &&
-                    previewHeight > 0)
-                {
-                    const float available =
-                        std::min(
-                            360.0F,
-                            ImGui::GetContentRegionAvail().x);
-                    const float scale = std::min(
-                        1.0F,
-                        std::min(
-                            available /
-                                previewWidth,
-                            140.0F /
-                                previewHeight));
-                    const ImVec2 size(
-                        previewWidth * scale,
-                        previewHeight * scale);
-                    ImGui::Image(
-                        reinterpret_cast<ImTextureID>(
-                            previewShaderResource.Get()),
-                        size);
-                    ImGui::SameLine();
-                    ImGui::TextDisabled(
-                        "%dx%d\n%d / %d frames",
-                        previewWidth,
-                        previewHeight,
-                        confirmationFrames.load(
-                            std::memory_order_relaxed),
-                        snapshot.
-                            requiredConsecutiveFrames);
-                }
-                else
-                {
-                    ImGui::TextDisabled(
-                        "Waiting for the selected capture source...");
-                }
-                DrawCalibrationRectangle(
-                    snapshot.targetColor);
-            }
 
             ImGui::PopStyleVar();
             custom::EndChild();
@@ -2353,57 +2230,23 @@ namespace vanta
             bool updateRevision = true)
         {
             BombTimerConfig validated = input;
-            validated.targetColor.red =
-                std::clamp(
-                    validated.targetColor.red,
-                    0.0F,
-                    1.0F);
-            validated.targetColor.green =
-                std::clamp(
-                    validated.targetColor.green,
-                    0.0F,
-                    1.0F);
-            validated.targetColor.blue =
-                std::clamp(
-                    validated.targetColor.blue,
-                    0.0F,
-                    1.0F);
-            validated.targetColor.alpha = 1.0F;
+            const BombTimerConfig detectionDefaults;
+            validated.targetColor =
+                detectionDefaults.targetColor;
             validated.colorTolerance =
-                std::clamp(
-                    validated.colorTolerance,
-                    0,
-                    255);
+                detectionDefaults.colorTolerance;
             validated.regionLeft =
-                std::clamp(
-                    validated.regionLeft,
-                    0.0F,
-                    0.999F);
+                detectionDefaults.regionLeft;
             validated.regionTop =
-                std::clamp(
-                    validated.regionTop,
-                    0.0F,
-                    0.999F);
+                detectionDefaults.regionTop;
             validated.regionWidth =
-                std::clamp(
-                    validated.regionWidth,
-                    0.001F,
-                    1.0F - validated.regionLeft);
+                detectionDefaults.regionWidth;
             validated.regionHeight =
-                std::clamp(
-                    validated.regionHeight,
-                    0.001F,
-                    1.0F - validated.regionTop);
+                detectionDefaults.regionHeight;
             validated.requiredMatchingPixels =
-                std::clamp(
-                    validated.requiredMatchingPixels,
-                    1,
-                    1000);
+                detectionDefaults.requiredMatchingPixels;
             validated.requiredConsecutiveFrames =
-                std::clamp(
-                    validated.requiredConsecutiveFrames,
-                    1,
-                    10);
+                detectionDefaults.requiredConsecutiveFrames;
             validated.widgetOpacity =
                 std::clamp(
                     validated.widgetOpacity,

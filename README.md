@@ -183,9 +183,11 @@ tolerance of 30. Three matching pixels across three fresh frames start one
 45-second countdown; three clear frames are required before detection can
 re-arm.
 
-The page provides live ROI preview/calibration, detector tuning, manual start
-and reset controls, a working 10-second widget test, and a configurable reset
-hotkey (Home by default). The countdown is rendered in its own topmost,
+The detector region, target color, tolerance, pixel threshold, and confirmation
+frames are fixed to those built-in defaults and are intentionally hidden from
+the GUI. The page provides manual start and reset controls, a working 10-second
+widget test, and a configurable reset hotkey (Home by default). The countdown
+is rendered in its own topmost,
 capture-excluded native overlay that is permanently click-through and
 non-activating. It uses a semi-transparent dark panel, a 1 px
 black-accent-black frame, and safe/warning text colors at the fixed 6.9-second
