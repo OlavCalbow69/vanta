@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,22 @@ namespace
     constexpr USAGE kVendorUsage = 0x0001;
     constexpr std::uint8_t kOutputReportId = 2;
     constexpr std::size_t kFirmwarePayloadSize = 64;
+    constexpr int kQuickClickHoldMinimumMilliseconds = 14;
+    constexpr int kQuickClickHoldMaximumMilliseconds = 34;
+
+    int HumanizedQuickClickHoldMilliseconds()
+    {
+        thread_local std::mt19937 generator{
+            std::random_device{}()};
+        std::uniform_int_distribution<int> distribution(
+            kQuickClickHoldMinimumMilliseconds,
+            kQuickClickHoldMaximumMilliseconds);
+        return (
+            distribution(generator) +
+            distribution(generator) +
+            1) /
+            2;
+    }
 
     std::string WideToUtf8(const wchar_t* text)
     {
@@ -375,7 +392,9 @@ namespace vanta
                 return false;
             }
             releasePending = true;
-            Sleep(1);
+            Sleep(
+                static_cast<DWORD>(
+                    HumanizedQuickClickHoldMilliseconds()));
             return ForceReleaseLocked();
         }
 

@@ -20,12 +20,32 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace
 {
+    constexpr int kQuickClickHoldMinimumMilliseconds = 14;
+    constexpr int kQuickClickHoldMaximumMilliseconds = 34;
+
+    int HumanizedQuickClickHoldMilliseconds()
+    {
+        thread_local std::mt19937 generator{
+            std::random_device{}()};
+        std::uniform_int_distribution<int> distribution(
+            kQuickClickHoldMinimumMilliseconds,
+            kQuickClickHoldMaximumMilliseconds);
+        // Averaging two samples produces natural center-weighted variation
+        // while retaining short bounded click times.
+        return (
+            distribution(generator) +
+            distribution(generator) +
+            1) /
+            2;
+    }
+
     std::string MakcuErrorMessage(makcu_error_t error)
     {
         const char* message = makcu_error_string(error);
@@ -584,7 +604,9 @@ namespace vanta
             releasePending.store(
                 true,
                 std::memory_order_release);
-            Sleep(1);
+            Sleep(
+                static_cast<DWORD>(
+                    HumanizedQuickClickHoldMilliseconds()));
             return ForceReleaseLocked();
         }
 
