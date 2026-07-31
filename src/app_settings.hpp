@@ -60,6 +60,13 @@ namespace vanta
         bool autoDetectAndConnect{true};
     };
 
+    struct UpdateConfig
+    {
+        bool automaticChecks{true};
+        bool automaticDownloads{true};
+        bool silentAutomaticInstallation{true};
+    };
+
     struct BombTimerConfig
     {
         bool enabled{};
@@ -116,6 +123,7 @@ namespace vanta
         int hsvRangeIndex{};
         int aimKey{};
         int killFov{100};
+        int targetHeightPercent{15};
         bool drawFovOutline{true};
         RgbaColor fovColor{
             0.68F, 0.56F, 0.91F, 1.0F};
@@ -198,16 +206,17 @@ namespace vanta
 
     struct LocalConfig
     {
-        static constexpr int schemaVersion = 4;
+        static constexpr int schemaVersion = 5;
         CaptureConfig capture;
         MouseOutputConfig mouseOutput;
+        UpdateConfig updates;
         BombTimerConfig bombTimer;
         MenuConfig menu;
     };
 
     struct SharedProfile
     {
-        static constexpr int schemaVersion = 5;
+        static constexpr int schemaVersion = 6;
         std::string name;
         TestClickConfig testClick;
         TestMoveConfig testMove;

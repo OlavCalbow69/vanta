@@ -13,6 +13,7 @@
 #include "pretty_menu.hpp"
 #include "testclick_controller.hpp"
 #include "testmove_controller.hpp"
+#include "update_controller.hpp"
 
 #include "custom_widgets.hpp"
 #include "font_defines.h"
@@ -387,6 +388,45 @@ namespace
         return result;
     }
 
+    JsonObject UpdateToJson(
+        const vanta::UpdateConfig& config)
+    {
+        JsonObject result;
+        PutBoolean(
+            result,
+            L"automatic_checks",
+            config.automaticChecks);
+        PutBoolean(
+            result,
+            L"automatic_downloads",
+            config.automaticDownloads);
+        PutBoolean(
+            result,
+            L"silent_automatic_installation",
+            config.silentAutomaticInstallation);
+        return result;
+    }
+
+    vanta::UpdateConfig UpdateFromJson(
+        const JsonObject& object,
+        const vanta::UpdateConfig& defaults)
+    {
+        vanta::UpdateConfig result = defaults;
+        result.automaticChecks = Boolean(
+            object,
+            L"automatic_checks",
+            result.automaticChecks);
+        result.automaticDownloads = Boolean(
+            object,
+            L"automatic_downloads",
+            result.automaticDownloads);
+        result.silentAutomaticInstallation = Boolean(
+            object,
+            L"silent_automatic_installation",
+            result.silentAutomaticInstallation);
+        return result;
+    }
+
     JsonObject BombTimerToJson(
         const vanta::BombTimerConfig& config)
     {
@@ -740,6 +780,10 @@ namespace
         PutNumber(result, L"color_target", config.hsvRangeIndex);
         PutNumber(result, L"aim_key", config.aimKey);
         PutNumber(result, L"kill_fov", config.killFov);
+        PutNumber(
+            result,
+            L"target_height_percent",
+            config.targetHeightPercent);
         PutBoolean(
             result,
             L"draw_fov_outline",
@@ -853,6 +897,12 @@ namespace
         result.killFov =
             static_cast<int>(
                 Number(object, L"kill_fov", result.killFov));
+        result.targetHeightPercent =
+            static_cast<int>(
+                Number(
+                    object,
+                    L"target_height_percent",
+                    result.targetHeightPercent));
         result.drawFovOutline =
             Boolean(
                 object,
@@ -1023,6 +1073,9 @@ namespace
             L"mouse_output",
             MouseOutputToJson(config.mouseOutput));
         root.Insert(
+            L"updates",
+            UpdateToJson(config.updates));
+        root.Insert(
             L"bomb_timer",
             BombTimerToJson(config.bombTimer));
         root.Insert(
@@ -1074,6 +1127,10 @@ namespace
                 MouseOutputFromJson(
                     Child(root, L"mouse_output"),
                     defaults.mouseOutput);
+            result.updates =
+                UpdateFromJson(
+                    Child(root, L"updates"),
+                    defaults.updates);
             result.bombTimer =
                 BombTimerFromJson(
                     Child(root, L"bomb_timer"),
@@ -1466,6 +1523,9 @@ namespace vanta
         local.mouseOutput.backendIndex = 1;
         local.mouseOutput.makcuPort = "COM42";
         local.mouseOutput.autoDetectAndConnect = false;
+        local.updates.automaticChecks = false;
+        local.updates.automaticDownloads = false;
+        local.updates.silentAutomaticInstallation = false;
         local.bombTimer.enabled = true;
         local.bombTimer.colorTolerance = 24;
         local.bombTimer.regionLeft = 0.42F;
@@ -1534,6 +1594,7 @@ namespace vanta
         profile.testMove.aimKey = VK_LBUTTON;
         profile.testMove.enabled = true;
         profile.testMove.killFov = 155;
+        profile.testMove.targetHeightPercent = 42;
         profile.testMove.movementMethod =
             MovementMethod::axisControl;
         profile.testMove.axisMode =
@@ -1657,6 +1718,7 @@ namespace vanta
         std::uint64_t captureRevision{};
         std::uint64_t mouseRevision{};
         std::uint64_t bombTimerRevision{};
+        std::uint64_t updateRevision{};
         std::uint64_t menuRevision{};
 
         bool SaveLocalConfig(
@@ -1863,7 +1925,7 @@ namespace vanta
                 localPath.c_str());
             ImGui::TextWrapped(
                 "Machine-local capture, input, Bomb Timer, menu and "
-                "style settings "
+                "style/update settings "
                 "save automatically. Test profiles include both Test "
                 "enable states.");
             custom::Separator();
@@ -2218,7 +2280,8 @@ namespace vanta
     void ConfigManager::PrimeRevisions(
         const CaptureController& capture,
         const MakcuController& mouseOutput,
-        const BombTimerController& bombTimer)
+        const BombTimerController& bombTimer,
+        const UpdateController& updates)
     {
         auto& impl = *implementation_;
         impl.captureRevision =
@@ -2227,6 +2290,8 @@ namespace vanta
             mouseOutput.SettingsRevision();
         impl.bombTimerRevision =
             bombTimer.SettingsRevision();
+        impl.updateRevision =
+            updates.SettingsRevision();
         impl.menuRevision =
             menu::SettingsRevision();
     }
@@ -2234,7 +2299,8 @@ namespace vanta
     void ConfigManager::AutoSaveLocal(
         const CaptureController& capture,
         const MakcuController& mouseOutput,
-        const BombTimerController& bombTimer)
+        const BombTimerController& bombTimer,
+        const UpdateController& updates)
     {
         auto& impl = *implementation_;
         if (!impl.enabled)
@@ -2247,6 +2313,8 @@ namespace vanta
             mouseOutput.SettingsRevision();
         const std::uint64_t bombTimerRevision =
             bombTimer.SettingsRevision();
+        const std::uint64_t updateRevision =
+            updates.SettingsRevision();
         const std::uint64_t menuRevision =
             menu::SettingsRevision();
         if (captureRevision ==
@@ -2255,6 +2323,8 @@ namespace vanta
                 impl.mouseRevision &&
             bombTimerRevision ==
                 impl.bombTimerRevision &&
+            updateRevision ==
+                impl.updateRevision &&
             menuRevision ==
                 impl.menuRevision)
         {
@@ -2268,6 +2338,8 @@ namespace vanta
             mouseOutput.GetConfig();
         current.bombTimer =
             bombTimer.GetConfig();
+        current.updates =
+            updates.GetConfig();
         current.menu =
             menu::GetConfig();
         if (impl.SaveLocalConfig(current))
@@ -2278,6 +2350,8 @@ namespace vanta
                 mouseRevision;
             impl.bombTimerRevision =
                 bombTimerRevision;
+            impl.updateRevision =
+                updateRevision;
             impl.menuRevision =
                 menuRevision;
         }

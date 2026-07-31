@@ -1,5 +1,6 @@
 #include "logger.hpp"
 #include "overlay_app.hpp"
+#include "update_controller.hpp"
 #include "version.hpp"
 
 #include <Windows.h>
@@ -40,6 +41,17 @@ int wmain(int argumentCount, wchar_t** arguments)
     vanta::log::Info(
         "vanta external overlay %s starting",
         VANTA_VERSION_STRING);
+
+    bool updaterLaunched = false;
+    vanta::LaunchUpdateBootstrapIfNeeded(
+        argumentCount,
+        arguments,
+        updaterLaunched);
+    if (updaterLaunched)
+    {
+        vanta::log::Shutdown();
+        return 0;
+    }
 
     g_cleanupCompletedEvent =
         CreateEventW(nullptr, TRUE, FALSE, nullptr);

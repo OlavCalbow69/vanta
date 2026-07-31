@@ -28,6 +28,7 @@ The output is:
 
 ```text
 build\Release\vanta.exe
+build\Release\vanta-updater.exe
 build\Release\opencv_world500.dll
 build\Release\makcu-cpp.dll
 ```
@@ -35,20 +36,15 @@ build\Release\makcu-cpp.dll
 ## Automated builds and releases
 
 GitHub Actions builds Debug and Release x64 on the Visual Studio 2026 runner
-for pushes to `main`, pull requests, and manual workflow runs. Successful CI
-builds provide a Release ZIP for three days.
+for pull requests and manual workflow runs. Every push to `main` additionally
+publishes a permanent stable GitHub Release automatically. CI derives a
+monotonically increasing `vMAJOR.MINOR.RUN_NUMBER` version, compiles that exact
+version into both executables, and publishes `vanta-v<version>-win64.zip` plus
+its SHA-256 checksum. No manual tag or repository secret is required.
 
-Stable releases use semantic version tags that must match
-`VANTA_VERSION_STRING` in `src\version.hpp`. For example:
-
-```powershell
-git tag -a vX.Y.Z -m "Vanta vX.Y.Z"
-git push origin vX.Y.Z
-```
-
-The tag workflow publishes `vanta-vX.Y.Z-win64.zip` and its SHA-256 checksum
-as permanent GitHub Release assets. The ZIP contains `vanta.exe`, OpenCV and
-MAKCU runtime DLLs, and this README.
+The ZIP contains `vanta.exe`, `vanta-updater.exe`, OpenCV and MAKCU runtime
+DLLs, and this README. All builds also remain available as three-day Actions
+artifacts.
 
 ## Run
 
@@ -57,6 +53,13 @@ Start the always-on-top overlay:
 ```powershell
 .\build\Release\vanta.exe
 ```
+
+Normal startup first hands control to the styled `vanta-updater.exe` gateway.
+It uses the once-daily cached GitHub `releases/latest` result, installs a newer
+verified build when available, and then launches Vanta. Diagnostic/self-test
+arguments bypass this bootstrap. The gateway is enabled in official CI release
+builds; locally compiled development binaries do not replace their own build
+folder.
 
 The transparent DirectComposition surface covers the complete virtual desktop
 and remains available while switching between applications. The menu is
@@ -158,6 +161,10 @@ both axes move during that window, then vertical movement remains disabled
 until the hold key is released and held again or TestMove is disabled and
 re-enabled.
 
+The Target section exposes `Target height` from 0% at the top to 100% at the
+bottom of each merged target rectangle. Its default is 15%, and it is included
+in shareable TestMove profiles.
+
 Optional target behavior includes `Anti Below Objects`, which rejects aim
 points below the capture center; randomized short stops with Full Stop or
 Slow Move behavior, chance, duration, and slowdown ranges; and a randomized
@@ -207,9 +214,26 @@ atomically at the end of the UI frame in:
 ```
 
 This includes capture/source identity, mouse backend and selected MAKCU port,
-auto-connect preference, Bomb Timer settings/widget position, menu
+auto-connect preference, update preferences, Bomb Timer settings/widget position, menu
 geometry/options, opacity, and the complete style palette. Missing saved
 monitors or windows fall back to an available source.
+
+## Updates
+
+The `Updates` page checks GitHub asynchronously and shows the installed
+version, `Up to date` or `Update vX.Y.Z available`, a 0–100% progress bar,
+the current operation, and scrollable release notes. It provides manual
+`Check for updates`, `Download`, and `Install on exit` actions. Automatic
+checks, automatic downloads, and silent automatic installation are enabled by
+default and can be changed independently.
+
+Release metadata is checked at most once per 24 hours unless the manual button
+is used. Downloads are stored under `%LocalAppData%\Vanta\updates`; the ZIP
+must match both the published checksum asset and GitHub's SHA-256 digest.
+Installation happens out of process after Vanta's clean shutdown. The updater
+waits for Vanta to terminate, extracts into staging, backs up every runtime
+file, replaces the bundle, rolls the backup back on any failure, and relaunches
+Vanta.
 
 The `Configs` page manages named, shareable TestClick/TestMove profiles under
 `%LocalAppData%\Vanta\profiles`. It supports create/overwrite, load, delete,
@@ -241,6 +265,14 @@ Configuration serialization diagnostics use a temporary directory:
 
 ```powershell
 .\build\Release\vanta.exe --config-self-test
+```
+
+The updater's version comparison, daily-cache boundary, SHA-256 success/failure,
+replacement, and forced rollback paths can be checked without networking or
+touching the installed bundle:
+
+```powershell
+.\build\Release\vanta-updater.exe --self-test
 ```
 
 Capture diagnostics:

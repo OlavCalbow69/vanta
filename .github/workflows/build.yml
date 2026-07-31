@@ -1,4 +1,4 @@
-name: Build
+name: Build and Release
 
 on:
   push:
@@ -10,11 +10,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-concurrency:
-  group: build-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
   build:
@@ -24,6 +20,69 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate per-push semantic version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $path = 'src\version.hpp'
+          $header = Get-Content -LiteralPath $path -Raw
+          $majorMatch = [regex]::Match(
+            $header,
+            '(?m)^#define\s+VANTA_VERSION_MAJOR\s+([0-9]+)\s*$')
+          $minorMatch = [regex]::Match(
+            $header,
+            '(?m)^#define\s+VANTA_VERSION_MINOR\s+([0-9]+)\s*$')
+          if (-not $majorMatch.Success -or -not $minorMatch.Success) {
+            throw 'Could not read the canonical major/minor version.'
+          }
+          $major = [int]$majorMatch.Groups[1].Value
+          $minor = [int]$minorMatch.Groups[1].Value
+          $patch = [int]'${{ github.run_number }}'
+          if ($patch -gt 65535) {
+            throw 'The workflow run number exceeds the Windows version limit.'
+          }
+          $version = "$major.$minor.$patch"
+          $header = $header -replace `
+            '(?m)^#define\s+VANTA_VERSION_PATCH\s+[0-9]+\s*$', `
+            "#define VANTA_VERSION_PATCH $patch"
+          $header = $header -replace `
+            '(?m)^#define\s+VANTA_VERSION_STRING\s+"[^"]+"\s*$', `
+            "#define VANTA_VERSION_STRING `"$version`""
+          $header = $header -replace `
+            '(?m)^#define\s+VANTA_VERSION_WSTRING\s+L"[^"]+"\s*$', `
+            "#define VANTA_VERSION_WSTRING L`"$version`""
+          $header = $header -replace `
+            '(?m)^#define\s+VANTA_VERSION_FILE_STRING\s+"[^"]+"\s*$', `
+            "#define VANTA_VERSION_FILE_STRING `"$version.0`""
+          $header = $header -replace `
+            '(?m)^#define\s+VANTA_AUTOMATED_RELEASE_BUILD\s+[01]\s*$', `
+            '#define VANTA_AUTOMATED_RELEASE_BUILD 1'
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $path),
+            $header,
+            [System.Text.UTF8Encoding]::new($false))
+          "VANTA_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_TAG=v$version" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_ZIP=vanta-v$version-win64.zip" >> $env:GITHUB_ENV
+
+      - name: Use canonical version for non-release builds
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        shell: pwsh
+        run: |
+          $header = Get-Content -LiteralPath 'src\version.hpp' -Raw
+          $versionMatch = [regex]::Match(
+            $header,
+            '(?m)^#define\s+VANTA_VERSION_STRING\s+"([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
+          if (-not $versionMatch.Success) {
+            throw 'Could not read VANTA_VERSION_STRING.'
+          }
+          $version = $versionMatch.Groups[1].Value
+          "VANTA_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_TAG=v$version" >> $env:GITHUB_ENV
+          "VANTA_RELEASE_ZIP=vanta-v$version-win64.zip" >> $env:GITHUB_ENV
 
       - name: Locate Visual Studio 2026 MSBuild
         shell: pwsh
@@ -62,8 +121,10 @@ jobs:
         run: |
           $runtimeFiles = @(
             'build\Release\vanta.exe',
+            'build\Release\vanta-updater.exe',
             'build\Release\opencv_world500.dll',
-            'build\Release\makcu-cpp.dll'
+            'build\Release\makcu-cpp.dll',
+            'README.md'
           )
           foreach ($file in $runtimeFiles) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
@@ -71,19 +132,37 @@ jobs:
             }
           }
 
-          $stage = 'artifacts\vanta-ci-win64'
+          $stage = "artifacts\vanta-$env:VANTA_RELEASE_TAG-win64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           foreach ($file in $runtimeFiles) {
             Copy-Item -LiteralPath $file -Destination $stage
           }
-          Copy-Item -LiteralPath 'README.md' -Destination $stage
-          Compress-Archive -Path "$stage\*" `
-            -DestinationPath 'artifacts\vanta-ci-win64.zip' -Force
+          $zip = Join-Path 'artifacts' $env:VANTA_RELEASE_ZIP
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            "$zip.sha256",
+            "$hash  $env:VANTA_RELEASE_ZIP`n",
+            [System.Text.UTF8Encoding]::new($false))
 
-      - name: Upload temporary Release bundle
+      - name: Upload temporary build artifact
         uses: actions/upload-artifact@v4
         with:
           name: vanta-${{ github.sha }}-win64
-          path: artifacts/vanta-ci-win64.zip
+          path: artifacts/vanta-v*-win64.zip*
           if-no-files-found: error
           retention-days: 3
+
+      - name: Publish permanent release for this push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "artifacts\$env:VANTA_RELEASE_ZIP"
+          gh release create $env:VANTA_RELEASE_TAG `
+            $zip "$zip.sha256" `
+            --repo $env:GITHUB_REPOSITORY `
+            --target '${{ github.sha }}' `
+            --title "Vanta $env:VANTA_RELEASE_TAG" `
+            --generate-notes

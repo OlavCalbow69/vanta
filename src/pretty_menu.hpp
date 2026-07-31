@@ -15,6 +15,7 @@ namespace vanta
     class MakcuController;
     class TestClickController;
     class TestMoveController;
+    class UpdateController;
 }
 
 namespace vanta::menu
@@ -33,6 +34,7 @@ namespace vanta::menu
         MakcuController& makcu,
         TestClickController& testClick,
         TestMoveController& testMove,
+        UpdateController& updates,
         ID3D11ShaderResourceView* logoTexture);
     void Toggle();
     bool IsVisible() noexcept;

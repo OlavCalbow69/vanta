@@ -4,6 +4,8 @@ VisualStudioVersion = 18.0.0.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "vanta", "vanta.vcxproj", "{2DAB9299-517D-49C9-BF87-74118344F232}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "vanta-updater", "vanta-updater.vcxproj", "{6E09B797-8928-4C61-AC7F-C8E7B94A347A}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,6 +16,10 @@ Global
 		{2DAB9299-517D-49C9-BF87-74118344F232}.Debug|x64.Build.0 = Debug|x64
 		{2DAB9299-517D-49C9-BF87-74118344F232}.Release|x64.ActiveCfg = Release|x64
 		{2DAB9299-517D-49C9-BF87-74118344F232}.Release|x64.Build.0 = Release|x64
+		{6E09B797-8928-4C61-AC7F-C8E7B94A347A}.Debug|x64.ActiveCfg = Debug|x64
+		{6E09B797-8928-4C61-AC7F-C8E7B94A347A}.Debug|x64.Build.0 = Debug|x64
+		{6E09B797-8928-4C61-AC7F-C8E7B94A347A}.Release|x64.ActiveCfg = Release|x64
+		{6E09B797-8928-4C61-AC7F-C8E7B94A347A}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

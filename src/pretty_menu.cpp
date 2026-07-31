@@ -9,6 +9,7 @@
 #include "makcu_controller.hpp"
 #include "testclick_controller.hpp"
 #include "testmove_controller.hpp"
+#include "update_controller.hpp"
 
 #include "imgui.h"
 #include "imgui_freetype.h"
@@ -582,7 +583,7 @@ namespace vanta::menu
             std::clamp(
                 config.activePage,
                 0,
-                7);
+                8);
         if (config.hasGeometry)
         {
             g_menuPosition = ImVec2(
@@ -675,6 +676,7 @@ namespace vanta::menu
         MakcuController& makcu,
         TestClickController& testClick,
         TestMoveController& testMove,
+        UpdateController& updates,
         ID3D11ShaderResourceView* logoTexture)
     {
         if (!g_visible)
@@ -907,6 +909,14 @@ namespace vanta::menu
                 g_page = 6;
                 page_is_changing = false;
             }
+            if (custom::Tab(
+                    ICON_DOWNLOAD_2_LINE "  Updates",
+                    &g_page,
+                    8))
+            {
+                g_page = 8;
+                page_is_changing = false;
+            }
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -1096,6 +1106,10 @@ namespace vanta::menu
         else if (g_page == 7)
         {
             bombTimer.RenderPanel();
+        }
+        else if (g_page == 8)
+        {
+            updates.RenderPanel();
         }
         else
         {

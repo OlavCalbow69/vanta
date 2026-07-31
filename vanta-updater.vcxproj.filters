@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source"><UniqueIdentifier>{31895870-24F3-454A-A49F-AE3270C98FCB}</UniqueIdentifier></Filter>
+    <Filter Include="Resources"><UniqueIdentifier>{265907E6-039F-45E8-A514-5C7D49DB2B43}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\updater_main.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\update_shared.cpp"><Filter>Source</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\update_shared.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\version.hpp"><Filter>Source</Filter></ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="resources\vanta_updater.rc"><Filter>Resources</Filter></ResourceCompile>
+    <Image Include="assets\favicon.ico"><Filter>Resources</Filter></Image>
+  </ItemGroup>
+</Project>

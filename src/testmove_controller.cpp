@@ -247,6 +247,7 @@ namespace vanta
         // FOV: only targets within this radius from screen centre are considered.
         // Python used kill_fov = 100.
         int killFov{100};
+        int targetHeightPercent{15};
         bool drawFovOutline{true};
         float fovColor[4]{
             0.68F, 0.56F, 0.91F, 1.0F};
@@ -378,6 +379,7 @@ namespace vanta
                 bool  snapAntiBelowObjects,
                       snapShortStopEnabled;
                 int   snapHsvRange, snapAimKey, snapKillFov,
+                      snapTargetHeightPercent,
                       snapDeadzone, snapMergeProx,
                       snapHybridVerticalTimeMilliseconds,
                       snapShortStopChancePercent,
@@ -402,6 +404,8 @@ namespace vanta
                     snapHsvRange   = hsvRangeIndex;
                     snapAimKey     = aimKey;
                     snapKillFov    = killFov;
+                    snapTargetHeightPercent =
+                        targetHeightPercent;
                     snapMovementMethod = movementMethod;
                     snapSpeed      = speed;
                     snapSmooth     = smooth;
@@ -621,7 +625,7 @@ namespace vanta
                     UnifyRectangles(std::move(rawRects), snapMergeProx);
 
                 // ── Find best target ─────────────────────────────────────────
-                // Python: hx = x + w//2,  hy = y + int(h * 0.15)
+                // Aim height is measured down from the target's top edge.
                 //         dist = np.hypot(hx - cf, hy - cf)
                 //         if dist < self.kill_fov  →  candidate
                 const auto& bl = Blacklist();
@@ -637,7 +641,10 @@ namespace vanta
                         r.x + r.width / 2;
                     const int hy =
                         r.y + static_cast<int>(
-                            static_cast<float>(r.height) * 0.15F);
+                            static_cast<float>(r.height) *
+                            static_cast<float>(
+                                snapTargetHeightPercent) /
+                            100.0F);
                     if (ShouldIgnoreTargetBelowCrosshair(
                             hy,
                             fcy,
@@ -1215,6 +1222,10 @@ namespace vanta
                     "Kill FOV",
                     &impl.killFov,
                     20, 350, "%d px");
+                settingsChanged |= custom::SliderInt(
+                    "Target height",
+                    &impl.targetHeightPercent,
+                    0, 100, "%d%% from top");
                 settingsChanged |= custom::Checkbox(
                     "Draw Kill FOV outline",
                     &impl.drawFovOutline);
@@ -1455,6 +1466,8 @@ namespace vanta
         result.hsvRangeIndex = impl.hsvRangeIndex;
         result.aimKey = impl.aimKey;
         result.killFov = impl.killFov;
+        result.targetHeightPercent =
+            impl.targetHeightPercent;
         result.drawFovOutline =
             impl.drawFovOutline;
         result.fovColor = {
@@ -1525,6 +1538,11 @@ namespace vanta
             : VK_LBUTTON;
         impl.killFov =
             std::clamp(config.killFov, 20, 350);
+        impl.targetHeightPercent =
+            std::clamp(
+                config.targetHeightPercent,
+                0,
+                100);
         impl.drawFovOutline =
             config.drawFovOutline;
         impl.fovColor[0] = std::clamp(

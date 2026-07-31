@@ -20,6 +20,8 @@
     <ClCompile Include="src\rp2040_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\testclick_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\testmove_controller.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\update_controller.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\update_shared.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="vendor\imgui\imgui.cpp"><Filter>Vendor\ImGui</Filter></ClCompile>
     <ClCompile Include="vendor\imgui\imgui_draw.cpp"><Filter>Vendor\ImGui</Filter></ClCompile>
     <ClCompile Include="vendor\imgui\imgui_freetype.cpp"><Filter>Vendor\ImGui</Filter></ClCompile>
@@ -42,6 +44,8 @@
     <ClInclude Include="src\rp2040_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testclick_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testmove_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\update_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\update_shared.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\version.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="vendor\imgui\imconfig.h"><Filter>Vendor\ImGui</Filter></ClInclude>
     <ClInclude Include="vendor\imgui\imgui.h"><Filter>Vendor\ImGui</Filter></ClInclude>

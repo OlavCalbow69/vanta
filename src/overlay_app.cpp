@@ -8,6 +8,8 @@
 #include "pretty_menu.hpp"
 #include "testclick_controller.hpp"
 #include "testmove_controller.hpp"
+#include "update_controller.hpp"
+#include "version.hpp"
 
 #include <Windows.h>
 #include <Windowsx.h>
@@ -50,6 +52,7 @@ namespace
     {
         std::uint64_t selfTestFrames{};
         int captureTestBackend{};
+        bool updatePageTest{};
     };
 
     bool SameRectangle(const RECT& left, const RECT& right)
@@ -127,6 +130,10 @@ namespace
         {
             options.captureTestBackend = 4;
         }
+        options.updatePageTest = HasArgument(
+            argumentCount,
+            arguments,
+            L"--update-page-test");
         return options;
     }
 
@@ -160,7 +167,8 @@ namespace
                 vanta::menu::GetConfig();
             if (options_.selfTestFrames != 0)
             {
-                defaultConfig.menu.activePage = 7;
+                defaultConfig.menu.activePage =
+                    options_.updatePageTest ? 8 : 7;
                 defaultConfig.bombTimer.enabled = true;
             }
             if (!configManager_.Initialize(
@@ -174,6 +182,11 @@ namespace
                 configManager_.InitialLocalConfig();
             vanta::menu::ApplyConfig(
                 initialConfig.menu);
+            updates_.Initialize(
+                initialConfig.updates,
+                options_.selfTestFrames == 0 &&
+                    options_.captureTestBackend == 0 &&
+                    VANTA_AUTOMATED_RELEASE_BUILD != 0);
 
             if (
                 !capture_.Initialize(
@@ -205,7 +218,8 @@ namespace
             configManager_.PrimeRevisions(
                 capture_,
                 makcu_,
-                bombTimer_);
+                bombTimer_,
+                updates_);
 
             vanta::log::Info(
                 "overlay ready; Insert toggles the menu, End closes vanta");
@@ -270,7 +284,8 @@ namespace
                 configManager_.AutoSaveLocal(
                     capture_,
                     makcu_,
-                    bombTimer_);
+                    bombTimer_,
+                    updates_);
 
                 if (options_.selfTestFrames != 0 &&
                     renderedFrames_ >= options_.selfTestFrames)
@@ -1685,6 +1700,7 @@ namespace
                 makcu_,
                 testClick_,
                 testMove_,
+                updates_,
                 logoShaderResource_.Get());
             UpdateMenuRegion();
 
@@ -1845,6 +1861,7 @@ namespace
                 }
                 classRegistered_ = false;
             }
+            updates_.Shutdown(true);
             vanta::log::Info(
                 "graceful shutdown completed");
         }
@@ -1967,6 +1984,7 @@ namespace
         vanta::MakcuController makcu_;
         vanta::TestClickController testClick_;
         vanta::TestMoveController testMove_;
+        vanta::UpdateController updates_;
         HWND window_{};
         HWND outlineWindow_{};
         HWND fovWindow_{};
@@ -2042,6 +2060,7 @@ namespace vanta
                 "  vanta.exe                 always-on-top desktop overlay\n"
                 "  vanta.exe --self-test N   render N frames and exit\n"
                 "  vanta.exe --config-self-test validate JSON in a temporary folder\n"
+                "  --update-page-test       render Updates during --self-test\n"
                 "  --capture-test-winrt      test WinRT monitor capture\n"
                 "  --capture-test-duplication test DXGI monitor capture\n"
                 "  --capture-test-winrt-window test WinRT window capture\n"

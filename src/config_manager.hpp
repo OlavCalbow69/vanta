@@ -16,6 +16,7 @@ namespace vanta
     class MakcuController;
     class TestClickController;
     class TestMoveController;
+    class UpdateController;
 
     class ConfigManager
     {
@@ -33,11 +34,13 @@ namespace vanta
         void PrimeRevisions(
             const CaptureController& capture,
             const MakcuController& mouseOutput,
-            const BombTimerController& bombTimer);
+            const BombTimerController& bombTimer,
+            const UpdateController& updates);
         void AutoSaveLocal(
             const CaptureController& capture,
             const MakcuController& mouseOutput,
-            const BombTimerController& bombTimer);
+            const BombTimerController& bombTimer,
+            const UpdateController& updates);
         void RenderPanel(
             HWND owner,
             TestClickController& testClick,
