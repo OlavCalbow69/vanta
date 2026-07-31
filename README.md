@@ -15,7 +15,9 @@ the ABI-safe opaque C API and copies `makcu-cpp.dll` beside the executable.
 
 ## Build
 
-Open `vanta.sln` in Visual Studio Community 2026 or run:
+Install Visual Studio Community 2026 with **Desktop development with C++**,
+the MSVC `v145` x64 toolset, and Windows SDK `10.0.26100.0`. Open
+`vanta.sln` or run:
 
 ```powershell
 & 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe' `
