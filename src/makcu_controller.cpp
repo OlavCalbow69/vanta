@@ -84,12 +84,241 @@ namespace vanta
         bool autoDetectAndConnect{true};
         ULONGLONG nextAutoDetectTick{};
         std::atomic_bool connected{false};
+        // Register this before connecting.  This matches the MAKCU C++ demo:
+        // its serial listener is already armed when km.buttons(1) is sent as
+        // part of Device::connect().
+        std::atomic_bool buttonCallbackRegistered{false};
+        std::atomic_bool buttonMonitoringReady{false};
+        std::atomic<std::uint8_t> monitoredButtonMask{0};
+        std::atomic<std::uint64_t> buttonEventCount{0};
         std::atomic_bool releasePending{false};
         std::atomic<std::uint64_t> settingsRevision{0};
         std::string status{
             "Scanning for MAKCU devices..."};
         std::string firmwareVersion;
         makcu_device_info_t connectedDevice{};
+
+        static std::uint8_t ButtonMask(
+            makcu_mouse_button_t button) noexcept
+        {
+            switch (button)
+            {
+            case MAKCU_MOUSE_LEFT:
+                return 1U << 0;
+            case MAKCU_MOUSE_RIGHT:
+                return 1U << 1;
+            case MAKCU_MOUSE_SIDE1:
+                return 1U << 3;
+            case MAKCU_MOUSE_SIDE2:
+                return 1U << 4;
+            default:
+                return 0;
+            }
+        }
+
+        static std::uint8_t ButtonMask(
+            MouseButtonBinding button) noexcept
+        {
+            switch (button)
+            {
+            case MouseButtonBinding::left:
+                return ButtonMask(MAKCU_MOUSE_LEFT);
+            case MouseButtonBinding::right:
+                return ButtonMask(MAKCU_MOUSE_RIGHT);
+            case MouseButtonBinding::x1:
+                return ButtonMask(MAKCU_MOUSE_SIDE1);
+            case MouseButtonBinding::x2:
+                return ButtonMask(MAKCU_MOUSE_SIDE2);
+            default:
+                return 0;
+            }
+        }
+
+        static void ButtonCallback(
+            makcu_mouse_button_t button,
+            bool pressed,
+            void* userData) noexcept
+        {
+            auto* implementation =
+                static_cast<Implementation*>(userData);
+            if (implementation == nullptr)
+            {
+                return;
+            }
+
+            const std::uint8_t mask = ButtonMask(button);
+            if (mask == 0)
+            {
+                return;
+            }
+
+            if (pressed)
+            {
+                implementation->monitoredButtonMask.fetch_or(
+                    mask,
+                    std::memory_order_acq_rel);
+            }
+            else
+            {
+                implementation->monitoredButtonMask.fetch_and(
+                    static_cast<std::uint8_t>(~mask),
+                    std::memory_order_acq_rel);
+            }
+            implementation->buttonEventCount.fetch_add(
+                1,
+                std::memory_order_relaxed);
+        }
+
+        makcu_error_t RegisterButtonCallbackLocked()
+        {
+            if (device == nullptr)
+            {
+                return MAKCU_ERROR_INVALID_DEVICE;
+            }
+            if (buttonCallbackRegistered.load(
+                    std::memory_order_acquire))
+            {
+                return MAKCU_SUCCESS;
+            }
+
+            const makcu_error_t callbackError =
+                makcu_set_mouse_button_callback(
+                    device,
+                    &ButtonCallback,
+                    this);
+            if (callbackError == MAKCU_SUCCESS)
+            {
+                buttonCallbackRegistered.store(
+                    true,
+                    std::memory_order_release);
+            }
+            return callbackError;
+        }
+
+        makcu_error_t EnableButtonMonitoringLocked()
+        {
+            if (device == nullptr ||
+                !makcu_is_connected(device))
+            {
+                return MAKCU_ERROR_INVALID_DEVICE;
+            }
+
+            const makcu_error_t callbackError =
+                RegisterButtonCallbackLocked();
+            if (callbackError != MAKCU_SUCCESS)
+            {
+                return callbackError;
+            }
+
+            // Device::connect() already enables km.buttons(1), exactly as the
+            // supplied MAKCU demo relies on.  Only send an explicit enable if
+            // a device reports that the connection did not leave it enabled.
+            bool monitoringEnabled = false;
+            const makcu_error_t monitoringStateError =
+                makcu_is_button_monitoring_enabled(
+                    device,
+                    &monitoringEnabled);
+            if (monitoringStateError != MAKCU_SUCCESS)
+            {
+                return monitoringStateError;
+            }
+            if (!monitoringEnabled)
+            {
+                const makcu_error_t monitorError =
+                    makcu_enable_button_monitoring(
+                        device,
+                        true);
+                if (monitorError != MAKCU_SUCCESS)
+                {
+                    return monitorError;
+                }
+            }
+
+            std::uint8_t initialMask = 0;
+            // This is a direct read of makcu::Device::getButtonMask() through
+            // the C facade.  It also covers an event that arrived while the
+            // application was completing its connection setup.
+            if (makcu_get_button_mask(
+                    device,
+                    &initialMask) != MAKCU_SUCCESS)
+            {
+                initialMask = 0;
+            }
+            monitoredButtonMask.store(
+                initialMask,
+                std::memory_order_release);
+            buttonMonitoringReady.store(
+                true,
+                std::memory_order_release);
+            return MAKCU_SUCCESS;
+        }
+
+        void DisableButtonMonitoringLocked()
+        {
+            buttonMonitoringReady.store(
+                false,
+                std::memory_order_release);
+            monitoredButtonMask.store(
+                0,
+                std::memory_order_release);
+            if (device == nullptr ||
+                !makcu_is_connected(device))
+            {
+                return;
+            }
+
+            makcu_enable_button_monitoring(device, false);
+        }
+
+        void RefreshButtonMaskFromMakcu() noexcept
+        {
+            if (!IsMouseButtonInputAvailable())
+            {
+                return;
+            }
+
+            // The callback is the lowest-latency path.  This non-blocking
+            // cached-mask read is a MAKCU-only fallback if a callback event is
+            // missed, and never stalls mouse output while it is in use.
+            std::unique_lock<std::mutex> lock(
+                deviceMutex,
+                std::try_to_lock);
+            if (!lock.owns_lock() ||
+                device == nullptr ||
+                !makcu_is_connected(device))
+            {
+                return;
+            }
+
+            std::uint8_t mask = 0;
+            if (makcu_get_button_mask(device, &mask) == MAKCU_SUCCESS)
+            {
+                monitoredButtonMask.store(
+                    mask,
+                    std::memory_order_release);
+            }
+        }
+
+        bool IsMouseButtonInputAvailable() const noexcept
+        {
+            return
+                connected.load(std::memory_order_acquire) &&
+                buttonMonitoringReady.load(
+                    std::memory_order_acquire);
+        }
+
+        bool IsMouseButtonPressed(
+            MouseButtonBinding button) noexcept
+        {
+            const std::uint8_t mask = ButtonMask(button);
+            RefreshButtonMaskFromMakcu();
+            return
+                mask != 0 &&
+                IsMouseButtonInputAvailable() &&
+                (monitoredButtonMask.load(
+                    std::memory_order_acquire) &
+                 mask) != 0;
+        }
 
         bool ForceReleaseLocked(bool reportFailure = true)
         {
@@ -166,6 +395,20 @@ namespace vanta
             {
                 std::lock_guard<std::mutex> lock(deviceMutex);
                 device = makcu_device_create();
+                if (device != nullptr)
+                {
+                    const makcu_error_t callbackError =
+                        RegisterButtonCallbackLocked();
+                    if (callbackError != MAKCU_SUCCESS)
+                    {
+                        status =
+                            "Could not register the MAKCU button callback: " +
+                            MakcuErrorMessage(callbackError);
+                        makcu_device_destroy(device);
+                        device = nullptr;
+                        return false;
+                    }
+                }
             }
             if (device == nullptr)
             {
@@ -303,6 +546,15 @@ namespace vanta
                     selectedDevice)].port;
             const bool enableHighPerformance =
                 highPerformanceMode;
+            buttonMonitoringReady.store(
+                false,
+                std::memory_order_release);
+            monitoredButtonMask.store(
+                0,
+                std::memory_order_release);
+            buttonEventCount.store(
+                0,
+                std::memory_order_release);
             connectionPending = true;
             status = "Connecting to " + port + "...";
             vanta::log::Info(
@@ -346,6 +598,20 @@ namespace vanta
                             "MAKCU high-performance mode setup failed: %s",
                             MakcuErrorMessage(
                                 performanceError).c_str());
+                    }
+
+                    const makcu_error_t buttonMonitorError =
+                        EnableButtonMonitoringLocked();
+                    if (buttonMonitorError != MAKCU_SUCCESS)
+                    {
+                        vanta::log::Warning(
+                            "MAKCU button monitoring setup failed: %s",
+                            MakcuErrorMessage(
+                                buttonMonitorError).c_str());
+                        result.error = buttonMonitorError;
+                        DisableButtonMonitoringLocked();
+                        makcu_disconnect(device);
+                        return result;
                     }
 
                     const makcu_error_t informationError =
@@ -473,6 +739,7 @@ namespace vanta
                     std::lock_guard<std::mutex> lock(deviceMutex);
                     if (device != nullptr)
                     {
+                        DisableButtonMonitoringLocked();
                         makcu_disconnect(device);
                     }
                 }
@@ -506,12 +773,19 @@ namespace vanta
                 if (device != nullptr &&
                     makcu_is_connected(device))
                 {
+                    DisableButtonMonitoringLocked();
                     ForceReleaseLocked();
                     makcu_disconnect(device);
                     vanta::log::Info("MAKCU disconnected");
                 }
             }
             connected.store(false, std::memory_order_release);
+            buttonMonitoringReady.store(
+                false,
+                std::memory_order_release);
+            monitoredButtonMask.store(
+                0,
+                std::memory_order_release);
             connectedDevice = {};
             firmwareVersion.clear();
             status = devices.empty()
@@ -709,6 +983,15 @@ namespace vanta
                     device = nullptr;
                 }
             }
+            buttonCallbackRegistered.store(
+                false,
+                std::memory_order_release);
+            buttonMonitoringReady.store(
+                false,
+                std::memory_order_release);
+            monitoredButtonMask.store(
+                0,
+                std::memory_order_release);
             devices.clear();
             deviceLabels.clear();
             autoDetectAndConnect = false;
@@ -749,6 +1032,7 @@ namespace vanta
         auto& implementation = *implementation_;
         implementation.rp2040.Tick();
         implementation.CompleteConnectionIfReady();
+        implementation.RefreshButtonMaskFromMakcu();
         implementation.RecoverReleaseIfNeeded();
         if (implementation.connected.load(
                 std::memory_order_acquire) &&
@@ -756,6 +1040,12 @@ namespace vanta
         {
             implementation.connected.store(
                 false,
+                std::memory_order_release);
+            implementation.buttonMonitoringReady.store(
+                false,
+                std::memory_order_release);
+            implementation.monitoredButtonMask.store(
+                0,
                 std::memory_order_release);
             implementation.connectedDevice = {};
             implementation.firmwareVersion.clear();
@@ -925,6 +1215,38 @@ namespace vanta
                     ? "unknown"
                     : implementation.firmwareVersion.c_str());
 
+            const bool inputMonitorReady =
+                implementation.buttonMonitoringReady.load(
+                    std::memory_order_acquire);
+            const std::uint8_t physicalButtonMask =
+                implementation.monitoredButtonMask.load(
+                    std::memory_order_acquire);
+            const auto isPhysicalButtonHeld =
+                [&](MouseButtonBinding button)
+                {
+                    return
+                        (physicalButtonMask &
+                         implementation.ButtonMask(button)) != 0;
+                };
+            const unsigned long long buttonEvents =
+                static_cast<unsigned long long>(
+                    implementation.buttonEventCount.load(
+                        std::memory_order_relaxed));
+            ImGui::TextDisabled(
+                "Input monitor (MAKCU): %s | Events: %llu",
+                inputMonitorReady ? "ready" : "starting",
+                buttonEvents);
+            ImGui::TextDisabled(
+                "Physical buttons: L %s | R %s | X1 %s | X2 %s",
+                isPhysicalButtonHeld(MouseButtonBinding::left)
+                    ? "DOWN" : "up",
+                isPhysicalButtonHeld(MouseButtonBinding::right)
+                    ? "DOWN" : "up",
+                isPhysicalButtonHeld(MouseButtonBinding::x1)
+                    ? "DOWN" : "up",
+                isPhysicalButtonHeld(MouseButtonBinding::x2)
+                    ? "DOWN" : "up");
+
             bool highPerformance =
                 implementation.highPerformanceMode;
             if (custom::Checkbox(
@@ -1055,6 +1377,18 @@ namespace vanta
         }
         return implementation_->connected.load(
             std::memory_order_acquire);
+    }
+
+    bool MakcuController::IsMouseButtonInputAvailable() const noexcept
+    {
+        return implementation_->
+            IsMouseButtonInputAvailable();
+    }
+
+    bool MakcuController::IsMouseButtonPressed(
+        MouseButtonBinding button) const noexcept
+    {
+        return implementation_->IsMouseButtonPressed(button);
     }
 
     bool MakcuController::TryMove(int x, int y)

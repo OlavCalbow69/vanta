@@ -3,20 +3,29 @@
 #include "capture_controller.hpp"
 #include "bomb_timer_controller.hpp"
 #include "config_manager.hpp"
+#include "hardware_video_decoder.hpp"
 #include "logger.hpp"
 #include "makcu_controller.hpp"
 #include "pretty_menu.hpp"
+#include "sunshine_pairing.hpp"
 #include "testclick_controller.hpp"
 #include "testmove_controller.hpp"
 #include "update_controller.hpp"
+#include "stream_receiver_controller.hpp"
 #include "version.hpp"
 
 #include <Windows.h>
 #include <Windowsx.h>
+#include <codecapi.h>
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dxgi1_3.h>
 #include <gdiplus.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <wmcodecdsp.h>
 #include <wrl/client.h>
 
 #include "imgui.h"
@@ -24,15 +33,20 @@
 #include "imgui_impl_win32.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cwchar>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "resource.h"
 
@@ -47,6 +61,11 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 namespace
 {
     std::atomic_bool g_externalExitRequested{false};
+
+    constexpr int kMenuToggleHotkeyId = 0x5601;
+    constexpr int kExitEndHotkeyId = 0x5602;
+    constexpr int kExitDeleteHotkeyId = 0x5603;
+    constexpr int kBombTimerResetHotkeyId = 0x5604;
 
     struct Options
     {
@@ -137,6 +156,957 @@ namespace
         return options;
     }
 
+    constexpr UINT32 kReceiverSelfTestWidth = 640;
+    constexpr UINT32 kReceiverSelfTestHeight = 480;
+    constexpr UINT32 kReceiverSelfTestFps = 30;
+    constexpr DWORD kReceiverSelfTestBitrate = 800000;
+    constexpr std::size_t kEncoderOutputBufferBytes = 1024U * 1024U;
+    constexpr std::size_t kReceiverSelfTestAccessUnitCount = 8;
+
+    class ComApartmentScope
+    {
+    public:
+        ComApartmentScope() noexcept : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+        ~ComApartmentScope()
+        {
+            if (SUCCEEDED(result_))
+            {
+                CoUninitialize();
+            }
+        }
+
+        [[nodiscard]] bool IsUsable() const noexcept
+        {
+            // RPC_E_CHANGED_MODE means the caller has an existing apartment.
+            // COM objects are still usable on that already-initialized thread.
+            return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+        }
+
+        [[nodiscard]] HRESULT Result() const noexcept { return result_; }
+
+    private:
+        HRESULT result_{};
+    };
+
+    [[nodiscard]] std::string HResultText(const HRESULT result)
+    {
+        char text[32]{};
+        std::snprintf(text, sizeof(text), "0x%08lX", static_cast<unsigned long>(result));
+        return text;
+    }
+
+    [[nodiscard]] bool StartsWithAnnexB(const BYTE* data, const std::size_t length)
+    {
+        return data != nullptr &&
+            ((length >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) ||
+             (length >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1));
+    }
+
+    [[nodiscard]] std::uint32_t ReadBigEndianUint32(const BYTE* data) noexcept
+    {
+        return
+            (static_cast<std::uint32_t>(data[0]) << 24U) |
+            (static_cast<std::uint32_t>(data[1]) << 16U) |
+            (static_cast<std::uint32_t>(data[2]) << 8U) |
+            static_cast<std::uint32_t>(data[3]);
+    }
+
+    void AppendAnnexBStartCode(std::vector<unsigned char>& output)
+    {
+        output.push_back(0);
+        output.push_back(0);
+        output.push_back(0);
+        output.push_back(1);
+    }
+
+    [[nodiscard]] bool AppendNalUnitsAsAnnexB(
+        const BYTE* data,
+        const std::size_t length,
+        const DWORD* naluLengths,
+        const std::size_t naluCount,
+        std::vector<unsigned char>& output)
+    {
+        if (data == nullptr || naluLengths == nullptr || naluCount == 0)
+        {
+            return false;
+        }
+
+        std::size_t payloadLength{};
+        for (std::size_t index = 0; index < naluCount; ++index)
+        {
+            if (naluLengths[index] == 0 ||
+                payloadLength > std::numeric_limits<std::size_t>::max() - naluLengths[index])
+            {
+                return false;
+            }
+            payloadLength += naluLengths[index];
+        }
+
+        std::size_t prefixLength{};
+        if (payloadLength == length)
+        {
+            prefixLength = 0;
+        }
+        else if (naluCount <= (std::numeric_limits<std::size_t>::max() - payloadLength) / 4U &&
+                 payloadLength + naluCount * 4U == length)
+        {
+            prefixLength = 4;
+        }
+        else
+        {
+            return false;
+        }
+
+        std::size_t position{};
+        for (std::size_t index = 0; index < naluCount; ++index)
+        {
+            const std::size_t naluLength = naluLengths[index];
+            if (position > length || prefixLength > length - position || naluLength > length - position - prefixLength)
+            {
+                return false;
+            }
+            if (prefixLength != 0 && ReadBigEndianUint32(data + position) != naluLength)
+            {
+                return false;
+            }
+            position += prefixLength;
+            AppendAnnexBStartCode(output);
+            output.insert(output.end(), data + position, data + position + naluLength);
+            position += naluLength;
+        }
+        return position == length;
+    }
+
+    [[nodiscard]] bool ConvertLengthPrefixedH264ToAnnexB(
+        const BYTE* data,
+        const std::size_t length,
+        std::vector<unsigned char>& output)
+    {
+        if (data == nullptr || length < 5)
+        {
+            return false;
+        }
+
+        std::size_t position{};
+        while (position < length)
+        {
+            if (length - position < 4)
+            {
+                return false;
+            }
+            const std::size_t naluLength = ReadBigEndianUint32(data + position);
+            position += 4;
+            if (naluLength == 0 || naluLength > length - position)
+            {
+                return false;
+            }
+            AppendAnnexBStartCode(output);
+            output.insert(output.end(), data + position, data + position + naluLength);
+            position += naluLength;
+        }
+        return !output.empty();
+    }
+
+    [[nodiscard]] bool ConvertEncodedH264SampleToAnnexB(
+        IMFSample* sample,
+        std::vector<unsigned char>& output,
+        std::string& error)
+    {
+        if (sample == nullptr)
+        {
+            error = "The H.264 test encoder produced an empty sample";
+            return false;
+        }
+
+        ComPtr<IMFMediaBuffer> buffer;
+        if (FAILED(sample->ConvertToContiguousBuffer(&buffer)) || buffer == nullptr)
+        {
+            error = "The H.264 test encoder did not expose its output bytes";
+            return false;
+        }
+
+        BYTE* data{};
+        DWORD maximumLength{};
+        DWORD currentLength{};
+        if (FAILED(buffer->Lock(&data, &maximumLength, &currentLength)) || data == nullptr || currentLength == 0)
+        {
+            error = "The H.264 test encoder output could not be read";
+            return false;
+        }
+
+        bool converted{};
+        if (StartsWithAnnexB(data, currentLength))
+        {
+            output.assign(data, data + currentLength);
+            converted = true;
+        }
+        else
+        {
+            UINT32 naluInfoSize{};
+            const HRESULT naluInfoResult = sample->GetBlobSize(MF_NALU_LENGTH_INFORMATION, &naluInfoSize);
+            if (SUCCEEDED(naluInfoResult) &&
+                naluInfoSize >= sizeof(DWORD) &&
+                naluInfoSize % sizeof(DWORD) == 0)
+            {
+                std::vector<DWORD> naluLengths(naluInfoSize / sizeof(DWORD));
+                converted = SUCCEEDED(sample->GetBlob(
+                    MF_NALU_LENGTH_INFORMATION,
+                    reinterpret_cast<BYTE*>(naluLengths.data()),
+                    naluInfoSize,
+                    nullptr)) &&
+                    AppendNalUnitsAsAnnexB(
+                        data,
+                        currentLength,
+                        naluLengths.data(),
+                        naluLengths.size(),
+                        output);
+            }
+            else
+            {
+                converted = ConvertLengthPrefixedH264ToAnnexB(data, currentLength, output);
+            }
+        }
+        buffer->Unlock();
+
+        if (!converted || output.empty())
+        {
+            error = "The H.264 test encoder did not return a complete Annex-B access unit";
+            return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ContainsH264NaluType(
+        const std::vector<unsigned char>& accessUnit,
+        const unsigned char naluType)
+    {
+        for (std::size_t index = 0; index + 3 < accessUnit.size(); ++index)
+        {
+            std::size_t startCodeLength{};
+            if (accessUnit[index] == 0 && accessUnit[index + 1] == 0 && accessUnit[index + 2] == 1)
+            {
+                startCodeLength = 3;
+            }
+            else if (index + 4 < accessUnit.size() &&
+                     accessUnit[index] == 0 && accessUnit[index + 1] == 0 &&
+                     accessUnit[index + 2] == 0 && accessUnit[index + 3] == 1)
+            {
+                startCodeLength = 4;
+            }
+            if (startCodeLength != 0)
+            {
+                const std::size_t naluStart = index + startCodeLength;
+                if (naluStart < accessUnit.size() && (accessUnit[naluStart] & 0x1FU) == naluType)
+                {
+                    return true;
+                }
+                index = naluStart;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::string H264NaluTypeSummary(const std::vector<unsigned char>& accessUnit)
+    {
+        std::string result;
+        for (std::size_t index = 0; index + 3 < accessUnit.size(); ++index)
+        {
+            std::size_t startCodeLength{};
+            if (accessUnit[index] == 0 && accessUnit[index + 1] == 0 && accessUnit[index + 2] == 1)
+            {
+                startCodeLength = 3;
+            }
+            else if (index + 4 < accessUnit.size() &&
+                     accessUnit[index] == 0 && accessUnit[index + 1] == 0 &&
+                     accessUnit[index + 2] == 0 && accessUnit[index + 3] == 1)
+            {
+                startCodeLength = 4;
+            }
+            if (startCodeLength != 0)
+            {
+                const std::size_t naluStart = index + startCodeLength;
+                if (naluStart < accessUnit.size())
+                {
+                    if (!result.empty()) result += ',';
+                    result += std::to_string(accessUnit[naluStart] & 0x1FU);
+                }
+                index = naluStart;
+            }
+        }
+        return result.empty() ? "none" : result;
+    }
+
+    [[nodiscard]] bool AppendSequenceHeaderAsAnnexB(
+        IMFMediaType* outputType,
+        std::vector<unsigned char>& accessUnit,
+        std::string& error)
+    {
+        if (outputType == nullptr)
+        {
+            error = "The H.264 test encoder did not expose its output type";
+            return false;
+        }
+
+        UINT32 sequenceHeaderSize{};
+        const HRESULT sizeResult = outputType->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &sequenceHeaderSize);
+        if (FAILED(sizeResult) || sequenceHeaderSize == 0)
+        {
+            error = "The H.264 test encoder did not provide SPS/PPS data";
+            return false;
+        }
+
+        std::vector<BYTE> sequenceHeader(sequenceHeaderSize);
+        if (FAILED(outputType->GetBlob(
+                MF_MT_MPEG_SEQUENCE_HEADER,
+                sequenceHeader.data(),
+                sequenceHeaderSize,
+                nullptr)))
+        {
+            error = "The H.264 test encoder sequence header could not be read";
+            return false;
+        }
+        if (StartsWithAnnexB(sequenceHeader.data(), sequenceHeader.size()))
+        {
+            accessUnit.insert(accessUnit.begin(), sequenceHeader.begin(), sequenceHeader.end());
+            return true;
+        }
+
+        // H.264 encoder media types commonly store the configuration record
+        // in AVCDecoderConfigurationRecord form. Convert its SPS and PPS
+        // payloads to the Annex-B form Sunshine/Moonlight delivers.
+        if (sequenceHeader.size() < 7 || sequenceHeader[0] != 1)
+        {
+            error = "The H.264 test encoder returned an unknown SPS/PPS format";
+            return false;
+        }
+        std::vector<unsigned char> converted;
+        std::size_t position = 5;
+        const std::size_t spsCount = sequenceHeader[position++] & 0x1FU;
+        if (spsCount == 0)
+        {
+            error = "The H.264 test encoder did not return an SPS";
+            return false;
+        }
+        for (std::size_t index = 0; index < spsCount; ++index)
+        {
+            if (position + 2 > sequenceHeader.size())
+            {
+                error = "The H.264 test encoder returned a truncated SPS";
+                return false;
+            }
+            const std::size_t naluLength =
+                (static_cast<std::size_t>(sequenceHeader[position]) << 8U) |
+                sequenceHeader[position + 1];
+            position += 2;
+            if (naluLength == 0 || naluLength > sequenceHeader.size() - position)
+            {
+                error = "The H.264 test encoder returned an invalid SPS";
+                return false;
+            }
+            AppendAnnexBStartCode(converted);
+            converted.insert(converted.end(), sequenceHeader.begin() + static_cast<std::ptrdiff_t>(position), sequenceHeader.begin() + static_cast<std::ptrdiff_t>(position + naluLength));
+            position += naluLength;
+        }
+        if (position >= sequenceHeader.size())
+        {
+            error = "The H.264 test encoder did not return a PPS";
+            return false;
+        }
+        const std::size_t ppsCount = sequenceHeader[position++];
+        if (ppsCount == 0)
+        {
+            error = "The H.264 test encoder did not return a PPS";
+            return false;
+        }
+        for (std::size_t index = 0; index < ppsCount; ++index)
+        {
+            if (position + 2 > sequenceHeader.size())
+            {
+                error = "The H.264 test encoder returned a truncated PPS";
+                return false;
+            }
+            const std::size_t naluLength =
+                (static_cast<std::size_t>(sequenceHeader[position]) << 8U) |
+                sequenceHeader[position + 1];
+            position += 2;
+            if (naluLength == 0 || naluLength > sequenceHeader.size() - position)
+            {
+                error = "The H.264 test encoder returned an invalid PPS";
+                return false;
+            }
+            AppendAnnexBStartCode(converted);
+            converted.insert(converted.end(), sequenceHeader.begin() + static_cast<std::ptrdiff_t>(position), sequenceHeader.begin() + static_cast<std::ptrdiff_t>(position + naluLength));
+            position += naluLength;
+        }
+        accessUnit.insert(accessUnit.begin(), converted.begin(), converted.end());
+        return true;
+    }
+
+    [[nodiscard]] bool BuildH264DecoderTestAccessUnits(
+        std::vector<std::vector<unsigned char>>& accessUnits,
+        std::string& error)
+    {
+        ComPtr<IMFTransform> encoder;
+        HRESULT result = CoCreateInstance(
+            CLSID_CMSH264EncoderMFT,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&encoder));
+        if (FAILED(result) || encoder == nullptr)
+        {
+            error = "Windows' inbox H.264 encoder is unavailable: " + HResultText(result);
+            return false;
+        }
+
+        ComPtr<IMFMediaType> outputType;
+        ComPtr<IMFMediaType> inputType;
+        result = MFCreateMediaType(&outputType);
+        if (FAILED(result) ||
+            FAILED(outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) ||
+            FAILED(outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264)) ||
+            FAILED(outputType->SetUINT32(MF_MT_AVG_BITRATE, kReceiverSelfTestBitrate)) ||
+            FAILED(MFSetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, kReceiverSelfTestWidth, kReceiverSelfTestHeight)) ||
+            FAILED(MFSetAttributeRatio(outputType.Get(), MF_MT_FRAME_RATE, kReceiverSelfTestFps, 1)) ||
+            FAILED(outputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)) ||
+            FAILED(outputType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base)) ||
+            FAILED(outputType->SetUINT32(MF_NALU_LENGTH_SET, TRUE)) ||
+            FAILED(encoder->SetOutputType(0, outputType.Get(), 0)))
+        {
+            error = "Windows' H.264 test encoder rejected its output type";
+            return false;
+        }
+
+        result = MFCreateMediaType(&inputType);
+        if (FAILED(result) ||
+            FAILED(inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) ||
+            FAILED(inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12)) ||
+            FAILED(MFSetAttributeSize(inputType.Get(), MF_MT_FRAME_SIZE, kReceiverSelfTestWidth, kReceiverSelfTestHeight)) ||
+            FAILED(MFSetAttributeRatio(inputType.Get(), MF_MT_FRAME_RATE, kReceiverSelfTestFps, 1)) ||
+            FAILED(MFSetAttributeRatio(inputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1)) ||
+            FAILED(inputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)) ||
+            FAILED(inputType->SetUINT32(MF_MT_DEFAULT_STRIDE, kReceiverSelfTestWidth)) ||
+            FAILED(encoder->SetInputType(0, inputType.Get(), 0)))
+        {
+            error = "Windows' H.264 test encoder rejected its NV12 input type";
+            return false;
+        }
+
+        ComPtr<IMFMediaType> negotiatedOutputType;
+        if (FAILED(encoder->GetOutputCurrentType(0, &negotiatedOutputType)) || negotiatedOutputType == nullptr ||
+            FAILED(encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)) ||
+            FAILED(encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)))
+        {
+            error = "Windows' H.264 test encoder could not begin encoding";
+            return false;
+        }
+
+        MFT_OUTPUT_STREAM_INFO outputInfo{};
+        if (FAILED(encoder->GetOutputStreamInfo(0, &outputInfo)))
+        {
+            error = "Windows' H.264 test encoder did not expose output allocation information";
+            return false;
+        }
+
+        const auto processOutput = [&]() -> bool
+        {
+            for (;;)
+            {
+                MFT_OUTPUT_DATA_BUFFER output{};
+                ComPtr<IMFSample> suppliedSample;
+                if ((outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0)
+                {
+                    ComPtr<IMFMediaBuffer> outputBuffer;
+                    if (FAILED(MFCreateSample(&suppliedSample)) ||
+                        FAILED(MFCreateMemoryBuffer(std::max<DWORD>(outputInfo.cbSize, static_cast<DWORD>(kEncoderOutputBufferBytes)), &outputBuffer)) ||
+                        FAILED(suppliedSample->AddBuffer(outputBuffer.Get())))
+                    {
+                        error = "Windows' H.264 test encoder could not allocate output memory";
+                        return false;
+                    }
+                    output.pSample = suppliedSample.Get();
+                }
+
+                DWORD outputStatus{};
+                const HRESULT outputResult = encoder->ProcessOutput(0, 1, &output, &outputStatus);
+                if (output.pEvents != nullptr)
+                {
+                    output.pEvents->Release();
+                }
+                if (outputResult == MF_E_TRANSFORM_NEED_MORE_INPUT)
+                {
+                    return true;
+                }
+                if (outputResult == MF_E_TRANSFORM_STREAM_CHANGE)
+                {
+                    if (FAILED(encoder->GetOutputCurrentType(0, &negotiatedOutputType)) ||
+                        FAILED(encoder->GetOutputStreamInfo(0, &outputInfo)))
+                    {
+                        error = "Windows' H.264 test encoder could not renegotiate its output";
+                        return false;
+                    }
+                    continue;
+                }
+                if (FAILED(outputResult) || output.pSample == nullptr)
+                {
+                    error = "Windows' H.264 test encoder could not produce a frame: " + HResultText(outputResult);
+                    return false;
+                }
+
+                ComPtr<IMFSample> encodedSample;
+                if (output.pSample == suppliedSample.Get())
+                {
+                    encodedSample = suppliedSample;
+                }
+                else
+                {
+                    encodedSample.Attach(output.pSample);
+                }
+                std::vector<unsigned char> encodedAccessUnit;
+                if (!ConvertEncodedH264SampleToAnnexB(encodedSample.Get(), encodedAccessUnit, error))
+                {
+                    return false;
+                }
+                if (ContainsH264NaluType(encodedAccessUnit, 5))
+                {
+                    if (!ContainsH264NaluType(encodedAccessUnit, 7) ||
+                        !ContainsH264NaluType(encodedAccessUnit, 8))
+                    {
+                        if (!AppendSequenceHeaderAsAnnexB(negotiatedOutputType.Get(), encodedAccessUnit, error))
+                        {
+                            return false;
+                        }
+                    }
+                    if (ContainsH264NaluType(encodedAccessUnit, 7) &&
+                        ContainsH264NaluType(encodedAccessUnit, 8))
+                    {
+                        // Start at the next independently decodable frame so
+                        // the decoder sees the same IDR + follow-up access
+                        // units it receives from Sunshine.
+                        if (accessUnits.empty())
+                        {
+                            accessUnits.push_back(std::move(encodedAccessUnit));
+                        }
+                        else if (accessUnits.size() < kReceiverSelfTestAccessUnitCount)
+                        {
+                            accessUnits.push_back(std::move(encodedAccessUnit));
+                        }
+                    }
+                }
+                else if (!accessUnits.empty() && accessUnits.size() < kReceiverSelfTestAccessUnitCount)
+                {
+                    accessUnits.push_back(std::move(encodedAccessUnit));
+                }
+                if (accessUnits.size() >= kReceiverSelfTestAccessUnitCount)
+                {
+                    return true;
+                }
+            }
+        };
+
+        const std::size_t inputBytes =
+            static_cast<std::size_t>(kReceiverSelfTestWidth) *
+            static_cast<std::size_t>(kReceiverSelfTestHeight) * 3U / 2U;
+        for (int frameIndex = 0; frameIndex < 16 && accessUnits.size() < kReceiverSelfTestAccessUnitCount; ++frameIndex)
+        {
+            ComPtr<IMFSample> inputSample;
+            ComPtr<IMFMediaBuffer> inputBuffer;
+            if (FAILED(MFCreateSample(&inputSample)) ||
+                FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(inputBytes), &inputBuffer)))
+            {
+                error = "Windows' H.264 test encoder could not allocate an NV12 test frame";
+                return false;
+            }
+            BYTE* input{};
+            DWORD maximumLength{};
+            if (FAILED(inputBuffer->Lock(&input, &maximumLength, nullptr)) || maximumLength < inputBytes)
+            {
+                error = "Windows' H.264 test encoder could not fill an NV12 test frame";
+                return false;
+            }
+            const BYTE luminance = static_cast<BYTE>(48 + frameIndex * 12);
+            std::memset(input, luminance, static_cast<std::size_t>(kReceiverSelfTestWidth) * kReceiverSelfTestHeight);
+            std::memset(
+                input + static_cast<std::size_t>(kReceiverSelfTestWidth) * kReceiverSelfTestHeight,
+                128,
+                inputBytes - static_cast<std::size_t>(kReceiverSelfTestWidth) * kReceiverSelfTestHeight);
+            inputBuffer->Unlock();
+            if (FAILED(inputBuffer->SetCurrentLength(static_cast<DWORD>(inputBytes))) ||
+                FAILED(inputSample->AddBuffer(inputBuffer.Get())) ||
+                FAILED(inputSample->SetSampleTime(static_cast<LONGLONG>(frameIndex) * 10000000LL / kReceiverSelfTestFps)) ||
+                FAILED(inputSample->SetSampleDuration(10000000LL / kReceiverSelfTestFps)))
+            {
+                error = "Windows' H.264 test encoder could not prepare an NV12 test frame";
+                return false;
+            }
+            if (frameIndex == 0)
+            {
+                inputSample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
+            }
+            result = encoder->ProcessInput(0, inputSample.Get(), 0);
+            if (result == MF_E_NOTACCEPTING)
+            {
+                if (!processOutput())
+                {
+                    return false;
+                }
+                result = encoder->ProcessInput(0, inputSample.Get(), 0);
+            }
+            if (FAILED(result) || !processOutput())
+            {
+                if (error.empty()) error = "Windows' H.264 test encoder rejected an NV12 test frame: " + HResultText(result);
+                return false;
+            }
+        }
+
+        if (accessUnits.size() < kReceiverSelfTestAccessUnitCount)
+        {
+            result = encoder->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            if (FAILED(result) || !processOutput())
+            {
+                if (error.empty()) error = "Windows' H.264 test encoder could not drain: " + HResultText(result);
+                return false;
+            }
+        }
+        encoder->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+
+        if (accessUnits.empty())
+        {
+            error = "Windows' H.264 test encoder did not produce an SPS/PPS IDR frame";
+            return false;
+        }
+        return true;
+    }
+
+    bool RunReceiverDecoderSelfTest()
+    {
+        const ComApartmentScope apartment;
+        if (!apartment.IsUsable())
+        {
+            vanta::log::Error(
+                "receiver self-test could not initialize COM: %s",
+                HResultText(apartment.Result()).c_str());
+            return false;
+        }
+        constexpr D3D_FEATURE_LEVEL levels[]{
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0};
+        ComPtr<ID3D11Device> device;
+        ComPtr<ID3D11DeviceContext> context;
+        D3D_FEATURE_LEVEL selected{};
+        const HRESULT result = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            levels,
+            static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION,
+            &device,
+            &selected,
+            &context);
+        if (FAILED(result))
+        {
+            vanta::log::Error(
+                "receiver self-test could not create a hardware D3D11 video device: 0x%08lX",
+                static_cast<unsigned long>(result));
+            return false;
+        }
+
+        vanta::HardwareVideoDecoder decoder;
+        std::string error;
+        if (!decoder.Initialize(device.Get(), error) ||
+            decoder.Configure(
+                VIDEO_FORMAT_H264,
+                static_cast<int>(kReceiverSelfTestWidth),
+                static_cast<int>(kReceiverSelfTestHeight),
+                static_cast<int>(kReceiverSelfTestFps),
+                error) != 0)
+        {
+            vanta::log::Error(
+                "receiver self-test failed: %s",
+                error.c_str());
+            decoder.Shutdown();
+            return false;
+        }
+
+        std::vector<std::vector<unsigned char>> accessUnits;
+        if (!BuildH264DecoderTestAccessUnits(accessUnits, error))
+        {
+            vanta::log::Error("receiver self-test could not create an H.264 test frame: %s", error.c_str());
+            decoder.Shutdown();
+            return false;
+        }
+        for (std::size_t index = 0; index < accessUnits.size(); ++index)
+        {
+            vanta::log::Info(
+                "receiver self-test H.264 access unit %llu: %llu bytes; NAL types %s",
+                static_cast<unsigned long long>(index),
+                static_cast<unsigned long long>(accessUnits[index].size()),
+                H264NaluTypeSummary(accessUnits[index]).c_str());
+        }
+        decoder.Start();
+        for (std::size_t index = 0; index < accessUnits.size(); ++index)
+        {
+            // common-c delivers each completed picture as an LENTRY chain.
+            // Split this known-good Annex-B access unit across several
+            // entries (including mid-NAL boundaries) to exercise Vanta's
+            // callback copy path, rather than only testing a contiguous
+            // synthetic buffer.
+            constexpr std::size_t fragmentCount = 3;
+            std::array<LENTRY, fragmentCount> entries{};
+            const std::size_t firstBoundary = accessUnits[index].size() / fragmentCount;
+            const std::size_t secondBoundary = firstBoundary * 2;
+            const std::array<std::size_t, fragmentCount + 1> boundaries{
+                0,
+                firstBoundary,
+                secondBoundary,
+                accessUnits[index].size()};
+            for (std::size_t fragment = 0; fragment < fragmentCount; ++fragment)
+            {
+                entries[fragment].data = reinterpret_cast<char*>(
+                    accessUnits[index].data() + boundaries[fragment]);
+                entries[fragment].length = static_cast<int>(
+                    boundaries[fragment + 1] - boundaries[fragment]);
+                entries[fragment].bufferType = BUFFER_TYPE_PICDATA;
+                entries[fragment].next =
+                    fragment + 1 < fragmentCount
+                    ? &entries[fragment + 1]
+                    : nullptr;
+            }
+            DECODE_UNIT decodeUnit{};
+            decodeUnit.frameType = index == 0 ? FRAME_TYPE_IDR : FRAME_TYPE_PFRAME;
+            decodeUnit.presentationTimeUs = static_cast<std::uint64_t>(index) * 1000000ULL / kReceiverSelfTestFps;
+            decodeUnit.fullLength = static_cast<int>(accessUnits[index].size());
+            decodeUnit.bufferList = entries.data();
+            bool submitted{};
+            for (int attempt = 0; attempt < 50 && !submitted; ++attempt)
+            {
+                submitted = decoder.Submit(&decodeUnit) == DR_OK;
+                if (!submitted)
+                {
+                    Sleep(10);
+                }
+            }
+            if (!submitted)
+            {
+                vanta::log::Error("receiver self-test could not submit its H.264 access unit");
+                decoder.Shutdown();
+                return false;
+            }
+        }
+
+        bool decoded{};
+        for (int attempt = 0; attempt < 500; ++attempt)
+        {
+            const vanta::DecodedVideoStats stats = decoder.GetStats();
+            if (stats.decodedFrames != 0)
+            {
+                ID3D11ShaderResourceView* frameView = decoder.AcquireFrameView();
+                decoded =
+                    frameView != nullptr &&
+                    stats.width == static_cast<int>(kReceiverSelfTestWidth) &&
+                    stats.height == static_cast<int>(kReceiverSelfTestHeight);
+                if (frameView != nullptr)
+                {
+                    frameView->Release();
+                }
+                if (!decoded)
+                {
+                    error = "The H.264 decoder did not publish a GPU presentation frame";
+                }
+                break;
+            }
+            Sleep(10);
+        }
+        const vanta::DecodedVideoStats finalStats = decoder.GetStats();
+        decoder.Shutdown();
+        if (!decoded)
+        {
+            if (error.empty())
+            {
+                error =
+                    "Timed out waiting for a GPU-decoded H.264 frame (submitted=" +
+                    std::to_string(finalStats.submittedFrames) +
+                    ", decoded=" + std::to_string(finalStats.decodedFrames) +
+                    ", dropped=" + std::to_string(finalStats.droppedFrames) +
+                    ", status=" + finalStats.status + ")";
+            }
+            vanta::log::Error(
+                "receiver self-test failed: %s",
+                error.c_str());
+            return false;
+        }
+        vanta::log::Info("receiver self-test passed: a real H.264 IDR frame decoded into Vanta's D3D11 GPU output");
+        return true;
+    }
+
+    std::string Utf8FromWide(const std::wstring& value)
+    {
+        if (value.empty())
+        {
+            return {};
+        }
+        const int length = WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            nullptr,
+            0,
+            nullptr,
+            nullptr);
+        if (length <= 0)
+        {
+            return {};
+        }
+        std::string result(static_cast<std::size_t>(length), '\0');
+        WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            value.data(),
+            static_cast<int>(value.size()),
+            result.data(),
+            length,
+            nullptr,
+            nullptr);
+        return result;
+    }
+
+    bool RunReceiverDiscoveryTest(const std::wstring& requestedHost)
+    {
+        const std::string host = Utf8FromWide(requestedHost);
+        if (host.empty())
+        {
+            std::fprintf(stderr, "receiver discovery failed: the host argument is not valid UTF-8\n");
+            return false;
+        }
+
+        vanta::sunshine::PairingService pairing;
+        std::string error;
+        const auto discovered = pairing.Discover(host, error);
+        if (!discovered)
+        {
+            vanta::log::Error("receiver discovery failed: %s", error.c_str());
+            std::fprintf(stderr, "receiver discovery failed: %s\n", error.c_str());
+            return false;
+        }
+        vanta::log::Info(
+            "Sunshine receiver discovery succeeded: %s | GameStream %s | HTTPS %u | codec flags 0x%X",
+            discovered->name.empty() ? discovered->address.c_str() : discovered->name.c_str(),
+            discovered->appVersion.c_str(),
+            discovered->httpsPort,
+            static_cast<unsigned int>(discovered->codecSupport));
+        std::printf(
+            "Sunshine host found: %s | GameStream %s | HTTPS %u | codec flags 0x%X\n",
+            discovered->name.empty() ? discovered->address.c_str() : discovered->name.c_str(),
+            discovered->appVersion.c_str(),
+            discovered->httpsPort,
+            static_cast<unsigned int>(discovered->codecSupport));
+        return true;
+    }
+
+    bool RunReceiverLanDiscoveryTest()
+    {
+        vanta::sunshine::PairingService pairing;
+        std::string error;
+        const std::vector<vanta::sunshine::HostInfo> discovered = pairing.DiscoverLan(error);
+        if (discovered.empty())
+        {
+            vanta::log::Error("LAN Sunshine discovery failed: %s", error.c_str());
+            std::fprintf(stderr, "LAN Sunshine discovery failed: %s\n", error.c_str());
+            return false;
+        }
+
+        for (const vanta::sunshine::HostInfo& host : discovered)
+        {
+            vanta::log::Info(
+                "LAN Sunshine host found: %s | address %s | GameStream %s | HTTPS %u | codec flags 0x%X",
+                host.name.empty() ? host.address.c_str() : host.name.c_str(),
+                host.address.c_str(),
+                host.appVersion.c_str(),
+                host.httpsPort,
+                static_cast<unsigned int>(host.codecSupport));
+            std::printf(
+                "Sunshine host found: %s | address %s | GameStream %s | HTTPS %u | codec flags 0x%X\n",
+                host.name.empty() ? host.address.c_str() : host.name.c_str(),
+                host.address.c_str(),
+                host.appVersion.c_str(),
+                host.httpsPort,
+                static_cast<unsigned int>(host.codecSupport));
+        }
+        return true;
+    }
+
+    bool RunReceiverLiveStreamSmokeTest(const std::wstring& requestedHost)
+    {
+        const std::string host = Utf8FromWide(requestedHost);
+        if (host.empty())
+        {
+            std::fprintf(stderr, "receiver live smoke test failed: the host argument is not valid UTF-8\n");
+            return false;
+        }
+
+        const ComApartmentScope apartment;
+        if (!apartment.IsUsable())
+        {
+            vanta::log::Error(
+                "receiver live smoke test could not initialize COM: %s",
+                HResultText(apartment.Result()).c_str());
+            return false;
+        }
+
+        constexpr D3D_FEATURE_LEVEL levels[]{
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0};
+        ComPtr<ID3D11Device> device;
+        ComPtr<ID3D11DeviceContext> context;
+        D3D_FEATURE_LEVEL selected{};
+        const HRESULT createResult = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            levels,
+            static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION,
+            &device,
+            &selected,
+            &context);
+        if (FAILED(createResult))
+        {
+            vanta::log::Error(
+                "receiver live smoke test could not create a hardware D3D11 video device: 0x%08lX",
+                static_cast<unsigned long>(createResult));
+            return false;
+        }
+
+        vanta::StreamReceiverController receiver;
+        receiver.Initialize(device.Get());
+        vanta::SunshineStreamSmokeTestResult testResult;
+        const bool passed = receiver.RunLiveStreamSmokeTest(
+            host,
+            60000,
+            testResult);
+        receiver.Shutdown();
+
+        std::printf(
+            "%s: %s | frame=%dx%d | submitted=%llu decoded=%llu dropped=%llu\n",
+            passed ? "Sunshine live smoke test passed" : "Sunshine live smoke test failed",
+            testResult.message.c_str(),
+            testResult.width,
+            testResult.height,
+            static_cast<unsigned long long>(testResult.submittedFrames),
+            static_cast<unsigned long long>(testResult.decodedFrames),
+            static_cast<unsigned long long>(testResult.droppedFrames));
+        return passed;
+    }
+
     class OverlayApplication
     {
     public:
@@ -187,6 +1157,18 @@ namespace
                 options_.selfTestFrames == 0 &&
                     options_.captureTestBackend == 0 &&
                     VANTA_AUTOMATED_RELEASE_BUILD != 0);
+            streamReceiver_.Initialize(device_.Get());
+            capture_.SetSunshineVideoFrameProvider(
+                [this](
+                    const std::uint64_t afterSequence,
+                    cv::Mat& frame,
+                    std::uint64_t& sequence)
+                {
+                    return streamReceiver_.CopyLatestFrameToBgra(
+                        afterSequence,
+                        frame,
+                        sequence);
+                });
 
             if (
                 !capture_.Initialize(
@@ -220,9 +1202,13 @@ namespace
                 makcu_,
                 bombTimer_,
                 updates_);
+            if (options_.selfTestFrames == 0)
+            {
+                RegisterHotkeys();
+            }
 
             vanta::log::Info(
-                "overlay ready; Insert toggles the menu, End closes vanta");
+                "overlay ready; Insert toggles the menu, Home resets the Bomb Timer, End/Delete close Vanta");
             vanta::log::Info(
                 "mode: always-on-top virtual desktop (all applications)");
             if (options_.captureTestBackend != 0 &&
@@ -266,9 +1252,9 @@ namespace
                     break;
                 }
 
-                HandleHotkeys();
                 UpdateDesktopBounds();
                 ResizeIfNeeded();
+                streamReceiver_.Tick();
                 capture_.Tick();
                 makcu_.Tick();
                 testClick_.Tick();
@@ -318,6 +1304,11 @@ namespace
             WPARAM wParam,
             LPARAM lParam)
         {
+            if (message == WM_HOTKEY)
+            {
+                HandleHotkey(static_cast<int>(wParam));
+                return 0;
+            }
             if (imguiReady_ &&
                 vanta::menu::IsVisible() &&
                 ImGui_ImplWin32_WndProcHandler(
@@ -454,7 +1445,8 @@ namespace
                 nullptr,
                 D3D_DRIVER_TYPE_HARDWARE,
                 nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 levels,
                 static_cast<UINT>(std::size(levels)),
                 D3D11_SDK_VERSION,
@@ -950,23 +1942,105 @@ namespace
                 reason);
         }
 
-        void HandleHotkeys()
+        void RegisterHotkeys()
         {
-            const bool insertDown =
-                (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-            if (insertDown && !insertWasDown_)
+            const auto registerHotkey = [this](
+                const int identifier,
+                const UINT virtualKey,
+                const char* label,
+                bool& registered)
             {
-                vanta::menu::Toggle();
-            }
-            insertWasDown_ = insertDown;
+                if (RegisterHotKey(
+                        window_,
+                        identifier,
+                        MOD_NOREPEAT,
+                        virtualKey))
+                {
+                    registered = true;
+                    vanta::log::Info(
+                        "%s hotkey registered",
+                        label);
+                    return;
+                }
+                vanta::log::Warning(
+                    "could not register %s hotkey: %lu",
+                    label,
+                    GetLastError());
+            };
 
-            const bool endDown =
-                (GetAsyncKeyState(VK_END) & 0x8000) != 0;
-            if (endDown && !endWasDown_)
+            // This uses Windows' registered-hotkey event delivery rather than
+            // polling any Windows key state. MAKCU remains the exclusive
+            // source for Vanta's mouse hold/aim buttons.
+            registerHotkey(
+                kMenuToggleHotkeyId,
+                VK_INSERT,
+                "Insert",
+                menuToggleHotkeyRegistered_);
+            registerHotkey(
+                kExitEndHotkeyId,
+                VK_END,
+                "End",
+                endExitHotkeyRegistered_);
+            registerHotkey(
+                kExitDeleteHotkeyId,
+                VK_DELETE,
+                "Delete",
+                deleteExitHotkeyRegistered_);
+            registerHotkey(
+                kBombTimerResetHotkeyId,
+                VK_HOME,
+                "Home",
+                bombTimerResetHotkeyRegistered_);
+        }
+
+        void UnregisterHotkeys()
+        {
+            const auto unregisterHotkey = [this](
+                const int identifier,
+                bool& registered)
             {
+                if (!registered)
+                {
+                    return;
+                }
+                UnregisterHotKey(window_, identifier);
+                registered = false;
+            };
+
+            unregisterHotkey(
+                kMenuToggleHotkeyId,
+                menuToggleHotkeyRegistered_);
+            unregisterHotkey(
+                kExitEndHotkeyId,
+                endExitHotkeyRegistered_);
+            unregisterHotkey(
+                kExitDeleteHotkeyId,
+                deleteExitHotkeyRegistered_);
+            unregisterHotkey(
+                kBombTimerResetHotkeyId,
+                bombTimerResetHotkeyRegistered_);
+        }
+
+        void HandleHotkey(const int identifier)
+        {
+            switch (identifier)
+            {
+            case kMenuToggleHotkeyId:
+                vanta::menu::Toggle();
+                break;
+            case kExitEndHotkeyId:
                 RequestExit("End hotkey pressed");
+                break;
+            case kExitDeleteHotkeyId:
+                RequestExit("Delete hotkey pressed");
+                break;
+            case kBombTimerResetHotkeyId:
+                bombTimer_.ResetCountdown();
+                vanta::log::Info("Bomb Timer reset with Home hotkey");
+                break;
+            default:
+                break;
             }
-            endWasDown_ = endDown;
         }
 
         void UpdateDesktopBounds()
@@ -1701,6 +2775,7 @@ namespace
                 testClick_,
                 testMove_,
                 updates_,
+                streamReceiver_,
                 logoShaderResource_.Get());
             UpdateMenuRegion();
 
@@ -1735,6 +2810,8 @@ namespace
             vanta::log::Info(
                 "graceful shutdown started");
 
+            UnregisterHotkeys();
+
             if (window_ != nullptr &&
                 IsWindow(window_))
             {
@@ -1755,6 +2832,7 @@ namespace
             testMove_.Shutdown();
             bombTimer_.Shutdown();
             capture_.Shutdown();
+            streamReceiver_.Shutdown();
             makcu_.Shutdown();
             configManager_.Shutdown();
 
@@ -1985,6 +3063,7 @@ namespace
         vanta::TestClickController testClick_;
         vanta::TestMoveController testMove_;
         vanta::UpdateController updates_;
+        vanta::StreamReceiverController streamReceiver_;
         HWND window_{};
         HWND outlineWindow_{};
         HWND fovWindow_{};
@@ -1997,14 +3076,16 @@ namespace
         bool imguiWin32Ready_ = false;
         bool imguiDx11Ready_ = false;
         bool imguiReady_ = false;
+        bool menuToggleHotkeyRegistered_ = false;
+        bool endExitHotkeyRegistered_ = false;
+        bool deleteExitHotkeyRegistered_ = false;
+        bool bombTimerResetHotkeyRegistered_ = false;
         bool overlayVisible_ = false;
         bool clickThrough_ = false;
         bool menuRegionApplied_ = false;
         bool outlineVisible_ = false;
         bool fovVisible_ = false;
         bool fovSurfaceDirty_ = true;
-        bool insertWasDown_ = false;
-        bool endWasDown_ = false;
         UINT pendingWidth_ = 1280;
         UINT pendingHeight_ = 720;
         UINT swapChainWidth_ = 1280;
@@ -2060,6 +3141,11 @@ namespace vanta
                 "  vanta.exe                 always-on-top desktop overlay\n"
                 "  vanta.exe --self-test N   render N frames and exit\n"
                 "  vanta.exe --config-self-test validate JSON in a temporary folder\n"
+                "  vanta.exe --receiver-self-test validate H.264 D3D11 hardware decoding\n"
+                "  vanta.exe --receiver-capture-self-test validate Sunshine-to-capture frame delivery\n"
+                "  vanta.exe --receiver-discover-lan auto-discover Sunshine hosts on this LAN\n"
+                "  vanta.exe --receiver-discover HOST verify a Sunshine host without pairing\n"
+                "  vanta.exe --receiver-stream-smoke HOST verify a pre-paired host sends a live H.264 frame\n"
                 "  --update-page-test       render Updates during --self-test\n"
                 "  --capture-test-winrt      test WinRT monitor capture\n"
                 "  --capture-test-duplication test DXGI monitor capture\n"
@@ -2073,6 +3159,51 @@ namespace vanta
                 L"--config-self-test"))
         {
             return RunConfigurationSelfTest()
+                ? 0
+                : 1;
+        }
+        if (HasArgument(
+                argumentCount,
+                arguments,
+                L"--receiver-self-test"))
+        {
+            return RunReceiverDecoderSelfTest()
+                ? 0
+                : 1;
+        }
+        if (HasArgument(
+                argumentCount,
+                arguments,
+                L"--receiver-capture-self-test"))
+        {
+            return RunSunshineCaptureSourceSelfTest()
+                ? 0
+                : 1;
+        }
+        if (HasArgument(
+                argumentCount,
+                arguments,
+                L"--receiver-discover-lan"))
+        {
+            return RunReceiverLanDiscoveryTest()
+                ? 0
+                : 1;
+        }
+        if (const auto host = ArgumentValue(
+                argumentCount,
+                arguments,
+                L"--receiver-discover"))
+        {
+            return RunReceiverDiscoveryTest(*host)
+                ? 0
+                : 1;
+        }
+        if (const auto host = ArgumentValue(
+                argumentCount,
+                arguments,
+                L"--receiver-stream-smoke"))
+        {
+            return RunReceiverLiveStreamSmokeTest(*host)
                 ? 0
                 : 1;
         }

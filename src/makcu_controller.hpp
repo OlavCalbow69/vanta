@@ -30,6 +30,10 @@ namespace vanta
         // Best-effort neutralization used by click recovery and shutdown.
         bool ForceReleaseLeftButton();
         bool IsConnected() const noexcept;
+        // Physical mouse-button state is supplied by MAKCU's button monitor.
+        bool IsMouseButtonInputAvailable() const noexcept;
+        bool IsMouseButtonPressed(
+            MouseButtonBinding button) const noexcept;
         MouseOutputConfig GetConfig() const;
         void ApplyConfig(const MouseOutputConfig& config);
         std::uint64_t SettingsRevision() const noexcept;

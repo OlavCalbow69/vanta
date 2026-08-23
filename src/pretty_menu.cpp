@@ -10,6 +10,7 @@
 #include "testclick_controller.hpp"
 #include "testmove_controller.hpp"
 #include "update_controller.hpp"
+#include "stream_receiver_controller.hpp"
 
 #include "imgui.h"
 #include "imgui_freetype.h"
@@ -677,6 +678,7 @@ namespace vanta::menu
         TestClickController& testClick,
         TestMoveController& testMove,
         UpdateController& updates,
+        StreamReceiverController& streamReceiver,
         ID3D11ShaderResourceView* logoTexture)
     {
         if (!g_visible)
@@ -847,6 +849,14 @@ namespace vanta::menu
                     1))
             {
                 g_page = 1;
+                page_is_changing = false;
+            }
+            if (custom::Tab(
+                    ICON_RADIO_LINE "  Stream Receiver",
+                    &g_page,
+                    9))
+            {
+                g_page = 9;
                 page_is_changing = false;
             }
             if (custom::Tab(
@@ -1111,6 +1121,10 @@ namespace vanta::menu
         {
             updates.RenderPanel();
         }
+        else if (g_page == 9)
+        {
+            streamReceiver.RenderPanel();
+        }
         else
         {
             makcu.RenderPanel();
@@ -1121,7 +1135,7 @@ namespace vanta::menu
                 ImVec2(15.0F, windowSize.y - 30.0F),
             ImGui::GetColorU32(
                 c::text::label::default_color.Value),
-            "Insert: hide | End: exit");
+            "Insert: show / hide | Home: reset timer | End / Del: close Vanta");
 
         g_menuPosition = ImGui::GetWindowPos();
         g_menuSize = ImGui::GetWindowSize();
@@ -1143,7 +1157,9 @@ namespace vanta::menu
     void Toggle()
     {
         g_visible = !g_visible;
-        vanta::log::Info("menu visibility: %s", g_visible ? "shown" : "hidden");
+        vanta::log::Info(
+            "menu visibility: %s",
+            g_visible ? "shown" : "hidden");
     }
 
     bool IsVisible() noexcept

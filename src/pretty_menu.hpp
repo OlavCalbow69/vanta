@@ -16,6 +16,7 @@ namespace vanta
     class TestClickController;
     class TestMoveController;
     class UpdateController;
+    class StreamReceiverController;
 }
 
 namespace vanta::menu
@@ -35,6 +36,7 @@ namespace vanta::menu
         TestClickController& testClick,
         TestMoveController& testMove,
         UpdateController& updates,
+        StreamReceiverController& streamReceiver,
         ID3D11ShaderResourceView* logoTexture);
     void Toggle();
     bool IsVisible() noexcept;

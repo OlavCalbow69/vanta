@@ -55,7 +55,8 @@ namespace
     enum class CaptureSourceKind
     {
         window,
-        monitor
+        monitor,
+        sunshineStream
     };
 
     struct WindowEntry
@@ -1527,6 +1528,7 @@ struct vanta::CaptureController::Implementation
     void Shutdown()
     {
         StopCapture();
+        sunshineVideoFrameProvider = {};
         previewShaderResource.Reset();
         previewTexture.Reset();
         previewContext.Reset();
@@ -1600,7 +1602,7 @@ struct vanta::CaptureController::Implementation
         backendIndex =
             std::clamp(config.backendIndex, 0, 1);
         sourceIndex =
-            std::clamp(config.sourceIndex, 0, 1);
+            std::clamp(config.sourceIndex, 0, 2);
         regionIndex =
             std::clamp(config.regionIndex, 0, 1);
         regionSize =
@@ -1690,7 +1692,9 @@ struct vanta::CaptureController::Implementation
         settings.source =
             sourceIndex == 0
             ? CaptureSourceKind::window
-            : CaptureSourceKind::monitor;
+            : sourceIndex == 1
+                ? CaptureSourceKind::monitor
+                : CaptureSourceKind::sunshineStream;
         if (selectedWindow >= 0 &&
             selectedWindow < static_cast<int>(windows.size()))
         {
@@ -1730,29 +1734,40 @@ struct vanta::CaptureController::Implementation
             status = "No monitor is selected";
             return false;
         }
-
-        if (activeSettings.backend ==
-            CaptureBackendKind::windowsGraphicsCapture)
+        if (activeSettings.source == CaptureSourceKind::sunshineStream)
         {
-            captureBackend =
-                std::make_unique<
-                    WindowsGraphicsCaptureBackend>();
+            if (!sunshineVideoFrameProvider)
+            {
+                status = "Sunshine stream source is not available";
+                return false;
+            }
+            status = "Waiting for the first decoded Sunshine video frame";
         }
         else
         {
-            captureBackend =
-                std::make_unique<
-                    DesktopDuplicationCaptureBackend>();
-        }
+            if (activeSettings.backend ==
+                CaptureBackendKind::windowsGraphicsCapture)
+            {
+                captureBackend =
+                    std::make_unique<
+                        WindowsGraphicsCaptureBackend>();
+            }
+            else
+            {
+                captureBackend =
+                    std::make_unique<
+                        DesktopDuplicationCaptureBackend>();
+            }
 
-        if (!captureBackend->Start(
-                activeSettings,
-                previewDevice.Get(),
-                status))
-        {
-            captureBackend.reset();
-            running = false;
-            return false;
+            if (!captureBackend->Start(
+                    activeSettings,
+                    previewDevice.Get(),
+                    status))
+            {
+                captureBackend.reset();
+                running = false;
+                return false;
+            }
         }
 
         running = true;
@@ -1782,6 +1797,7 @@ struct vanta::CaptureController::Implementation
                     latestFrameSequence));
         }
         captureBackend.reset();
+        sunshineFrameSequence = 0;
         running = false;
         outline.visible = false;
         {
@@ -1799,9 +1815,81 @@ struct vanta::CaptureController::Implementation
         auxiliaryFrameCondition.notify_all();
     }
 
+    bool TryGetSunshineFrame(
+        CapturedFrame& frame,
+        const vanta::NormalizedCaptureRegion& auxiliaryRequest)
+    {
+        if (!sunshineVideoFrameProvider)
+        {
+            status = "Sunshine stream source is not available";
+            return false;
+        }
+
+        std::uint64_t sequence{};
+        cv::Mat bgra;
+        if (!sunshineVideoFrameProvider(
+                sunshineFrameSequence,
+                bgra,
+                sequence))
+        {
+            return false;
+        }
+        if (bgra.empty() || bgra.type() != CV_8UC4 ||
+            sequence <= sunshineFrameSequence)
+        {
+            status = "Sunshine stream returned an invalid decoded frame";
+            return false;
+        }
+
+        sunshineFrameSequence = sequence;
+        frame.bgra = std::move(bgra);
+        frame.sourceWidth = frame.bgra.cols;
+        frame.sourceHeight = frame.bgra.rows;
+        frame.screenRectangle = {
+            0,
+            0,
+            frame.bgra.cols,
+            frame.bgra.rows};
+
+        if (auxiliaryRequest.enabled)
+        {
+            const auto normalized = ClampNormalizedRegion(auxiliaryRequest);
+            const int left = std::clamp(
+                static_cast<int>(std::lround(
+                    normalized.left * frame.bgra.cols)),
+                0,
+                frame.bgra.cols - 1);
+            const int top = std::clamp(
+                static_cast<int>(std::lround(
+                    normalized.top * frame.bgra.rows)),
+                0,
+                frame.bgra.rows - 1);
+            const int right = std::clamp(
+                static_cast<int>(std::lround(
+                    (normalized.left + normalized.width) *
+                    frame.bgra.cols)),
+                left + 1,
+                frame.bgra.cols);
+            const int bottom = std::clamp(
+                static_cast<int>(std::lround(
+                    (normalized.top + normalized.height) *
+                    frame.bgra.rows)),
+                top + 1,
+                frame.bgra.rows);
+            frame.auxiliaryBgra = frame.bgra(
+                cv::Rect(left, top, right - left, bottom - top));
+            frame.auxiliaryScreenRectangle = {
+                left,
+                top,
+                right,
+                bottom};
+        }
+        return true;
+    }
+
     void Tick()
     {
-        if (!running || captureBackend == nullptr)
+        if (!running)
         {
             return;
         }
@@ -1815,14 +1903,23 @@ struct vanta::CaptureController::Implementation
                 auxiliaryNormalizedRegion;
         }
         const std::string previousStatus = status;
-        if (!captureBackend->TryGetFrame(
+        bool receivedFrame = false;
+        if (activeSettings.source == CaptureSourceKind::sunshineStream)
+        {
+            receivedFrame = TryGetSunshineFrame(frame, auxiliaryRequest);
+        }
+        else if (captureBackend != nullptr)
+        {
+            receivedFrame = captureBackend->TryGetFrame(
                 frame,
                 status,
                 regionIndex == 1,
                 regionSize,
                 auxiliaryRequest.enabled
                     ? &auxiliaryRequest
-                    : nullptr))
+                    : nullptr);
+        }
+        if (!receivedFrame)
         {
             if (status != previousStatus &&
                 status.find("error") != std::string::npos)
@@ -1839,6 +1936,11 @@ struct vanta::CaptureController::Implementation
         }
 
         ProcessFrame(frame);
+        if (activeSettings.source == CaptureSourceKind::sunshineStream &&
+            previewShaderResource != nullptr)
+        {
+            status = "Sunshine stream is feeding Vanta's capture pipeline";
+        }
         if (!firstFrameLogged &&
             previewShaderResource != nullptr)
         {
@@ -2020,6 +2122,7 @@ struct vanta::CaptureController::Implementation
                      captureRectangle.height) * screenScaleY))};
         outline.visible =
             running &&
+            activeSettings.source != CaptureSourceKind::sunshineStream &&
             drawOutline &&
             IsValidRectangle(outline.screenRectangle);
         std::copy(
@@ -2343,19 +2446,15 @@ struct vanta::CaptureController::Implementation
             const char* backends[]{
                 "Windows Graphics Capture",
                 "Desktop Duplication"};
-            const char* sources[]{"Window", "Monitor"};
+            const char* sources[]{
+                "Window",
+                "Monitor",
+                "Sunshine stream"};
             const char* regions[]{
                 "Full source",
                 "Centered square"};
 
             bool changed = custom::Combo(
-                "Backend",
-                &backendIndex,
-                backends,
-                IM_ARRAYSIZE(backends));
-            selectionChanged |= changed;
-            settingsChanged |= changed;
-            changed = custom::Combo(
                 "Source",
                 &sourceIndex,
                 sources,
@@ -2363,18 +2462,45 @@ struct vanta::CaptureController::Implementation
             selectionChanged |= changed;
             settingsChanged |= changed;
 
+            if (sourceIndex != 2)
+            {
+                changed = custom::Combo(
+                    "Backend",
+                    &backendIndex,
+                    backends,
+                    IM_ARRAYSIZE(backends));
+                selectionChanged |= changed;
+                settingsChanged |= changed;
+            }
+            else
+            {
+                ImGui::TextDisabled(
+                    "Backend: native Sunshine receiver");
+            }
+
             if (sourceIndex == 0)
             {
                 changed = RenderWindowSelector();
             }
-            else
+            else if (sourceIndex == 1)
             {
                 changed = RenderMonitorSelector();
+            }
+            else
+            {
+                ImGui::TextWrapped(
+                    "Frames are decoded by Stream Receiver and passed to "
+                    "Vanta's normal OpenCV capture pipeline.");
+                ImGui::TextDisabled(
+                    "GPU preview remains direct; CPU readback occurs only "
+                    "while this source is selected.");
+                changed = false;
             }
             selectionChanged |= changed;
             settingsChanged |= changed;
 
-            if (custom::Button(
+            if (sourceIndex != 2 &&
+                custom::Button(
                     "Refresh sources",
                     ImVec2(
                         ImGui::GetContentRegionAvail().x,
@@ -2401,18 +2527,26 @@ struct vanta::CaptureController::Implementation
                     "%d px");
             }
 
-            settingsChanged |= custom::Checkbox(
-                "Draw capture outline",
-                &drawOutline);
-            if (drawOutline)
+            if (sourceIndex != 2)
             {
-                settingsChanged |= custom::ColorEdit4(
-                    "Outline color",
-                    outlineColor,
-                    ImGuiColorEditFlags_NoSidePreview |
-                        ImGuiColorEditFlags_AlphaBar |
-                    ImGuiColorEditFlags_NoInputs |
-                        ImGuiColorEditFlags_AlphaPreview);
+                settingsChanged |= custom::Checkbox(
+                    "Draw capture outline",
+                    &drawOutline);
+                if (drawOutline)
+                {
+                    settingsChanged |= custom::ColorEdit4(
+                        "Outline color",
+                        outlineColor,
+                        ImGuiColorEditFlags_NoSidePreview |
+                            ImGuiColorEditFlags_AlphaBar |
+                            ImGuiColorEditFlags_NoInputs |
+                            ImGuiColorEditFlags_AlphaPreview);
+                }
+            }
+            else
+            {
+                ImGui::TextDisabled(
+                    "Screen outlines are unavailable for remote frames.");
             }
 
             settingsChanged |= custom::Checkbox(
@@ -2657,6 +2791,8 @@ struct vanta::CaptureController::Implementation
     std::vector<MonitorEntry> monitors;
     CaptureSettings activeSettings;
     std::unique_ptr<CaptureBackend> captureBackend;
+    vanta::SunshineVideoFrameProvider sunshineVideoFrameProvider;
+    std::uint64_t sunshineFrameSequence{};
 
     ComPtr<ID3D11Device> previewDevice;
     ComPtr<ID3D11DeviceContext> previewContext;
@@ -2718,6 +2854,31 @@ namespace vanta
             previewContext,
             ownProcessId,
             initialConfig);
+    }
+
+    void CaptureController::SetSunshineVideoFrameProvider(
+        SunshineVideoFrameProvider provider)
+    {
+        auto& impl = *implementation_;
+        const bool sunshineSelected = impl.sourceIndex == 2;
+        if (sunshineSelected && impl.running)
+        {
+            impl.StopCapture();
+        }
+        impl.sunshineVideoFrameProvider = std::move(provider);
+        if (sunshineSelected && impl.captureEnabled)
+        {
+            if (!impl.sunshineVideoFrameProvider)
+            {
+                impl.status = "Sunshine stream source is not available";
+            }
+            else if (!impl.StartCapture())
+            {
+                vanta::log::Warning(
+                    "Sunshine capture source could not start: %s",
+                    impl.status.c_str());
+            }
+        }
     }
 
     void CaptureController::Shutdown()
@@ -2844,6 +3005,8 @@ namespace vanta
             implementation_->outline;
         result.visible =
             implementation_->running &&
+            implementation_->activeSettings.source !=
+                CaptureSourceKind::sunshineStream &&
             implementation_->drawOutline &&
             IsValidRectangle(result.screenRectangle);
         std::copy(
@@ -2861,6 +3024,8 @@ namespace vanta
             implementation_->outline.screenRectangle;
         return
             implementation_->running &&
+            implementation_->activeSettings.source !=
+                CaptureSourceKind::sunshineStream &&
             IsValidRectangle(rectangle);
     }
 
@@ -2986,7 +3151,128 @@ namespace vanta
             impl.latestAuxiliaryScreenRectangle;
         return
             impl.running &&
+            impl.activeSettings.source !=
+                CaptureSourceKind::sunshineStream &&
             !impl.latestAuxiliaryFrame.empty() &&
             IsValidRectangle(rectangle);
+    }
+
+    bool RunSunshineCaptureSourceSelfTest()
+    {
+        constexpr D3D_FEATURE_LEVEL levels[]{
+            D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_10_1,
+            D3D_FEATURE_LEVEL_10_0};
+        ComPtr<ID3D11Device> device;
+        ComPtr<ID3D11DeviceContext> context;
+        D3D_FEATURE_LEVEL selected{};
+        const HRESULT result = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            levels,
+            static_cast<UINT>(std::size(levels)),
+            D3D11_SDK_VERSION,
+            &device,
+            &selected,
+            &context);
+        if (FAILED(result))
+        {
+            vanta::log::Error(
+                "receiver capture self-test could not create a hardware D3D11 device: 0x%08lX",
+                static_cast<unsigned long>(result));
+            return false;
+        }
+
+        std::uint64_t supplied{};
+        CaptureController capture;
+        capture.SetSunshineVideoFrameProvider(
+            [&supplied](
+                const std::uint64_t afterSequence,
+                cv::Mat& output,
+                std::uint64_t& sequence)
+            {
+                constexpr std::uint64_t frameCount = 8;
+                if (afterSequence != supplied || supplied >= frameCount)
+                {
+                    return false;
+                }
+                ++supplied;
+                output = cv::Mat(
+                    1080,
+                    1920,
+                    CV_8UC4,
+                    cv::Scalar(
+                        static_cast<double>(13 + supplied),
+                        42,
+                        99,
+                        255));
+                sequence = supplied;
+                return true;
+            });
+        CaptureConfig config;
+        config.sourceIndex = 2;
+        config.regionIndex = 1;
+        config.regionSize = 640;
+        config.drawOutline = false;
+        if (!capture.Initialize(
+                device.Get(),
+                context.Get(),
+                GetCurrentProcessId(),
+                &config))
+        {
+            vanta::log::Error(
+                "receiver capture self-test could not initialize Vanta's capture source");
+            capture.Shutdown();
+            return false;
+        }
+
+        for (int index = 0; index < 8; ++index)
+        {
+            capture.Tick();
+        }
+        // A provider that has no new sequence must not cause Vanta to republish
+        // a duplicate capture frame.
+        capture.Tick();
+        cv::Mat frame;
+        RECT captureRectangle{};
+        std::uint64_t publishedSequence{};
+        std::int64_t publishedTimestamp{};
+        const cv::Vec4b firstPixel =
+            capture.WaitForCenteredFrame(
+                0,
+                frame,
+                publishedSequence,
+                publishedTimestamp,
+                0) &&
+                frame.type() == CV_8UC4 &&
+                !frame.empty()
+            ? frame.at<cv::Vec4b>(0, 0)
+            : cv::Vec4b{};
+        const bool valid =
+            frame.type() == CV_8UC4 &&
+            frame.cols == 640 &&
+            frame.rows == 640 &&
+            supplied == 8 &&
+            publishedSequence == 8 &&
+            publishedTimestamp > 0 &&
+            firstPixel[0] == 21 &&
+            firstPixel[1] == 42 &&
+            firstPixel[2] == 99 &&
+            firstPixel[3] == 255 &&
+            !capture.GetCaptureScreenRectangle(captureRectangle);
+        capture.Shutdown();
+        if (!valid)
+        {
+            vanta::log::Error(
+                "receiver capture self-test failed: Sunshine frame was not published through Vanta's capture pipeline");
+            return false;
+        }
+        vanta::log::Info(
+            "receiver capture self-test passed: Sunshine frames feed Vanta's OpenCV capture pipeline");
+        return true;
     }
 }

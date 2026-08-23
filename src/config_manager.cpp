@@ -172,6 +172,38 @@ namespace
         return JsonObject{};
     }
 
+    vanta::MouseButtonBinding MouseButtonFromStoredValue(
+        int value,
+        vanta::MouseButtonBinding fallback)
+    {
+        const auto button =
+            static_cast<vanta::MouseButtonBinding>(value);
+        return vanta::IsMouseButtonBinding(button)
+            ? button
+            : fallback;
+    }
+
+    vanta::MouseButtonBinding MouseButtonFromLegacyVirtualKey(
+        int value,
+        vanta::MouseButtonBinding fallback)
+    {
+        // Profiles through schema 6 persisted Win32 virtual-key numbers.
+        // Only the four mouse options are carried forward to MAKCU bindings.
+        switch (value)
+        {
+        case 1:
+            return vanta::MouseButtonBinding::left;
+        case 2:
+            return vanta::MouseButtonBinding::right;
+        case 5:
+            return vanta::MouseButtonBinding::x1;
+        case 6:
+            return vanta::MouseButtonBinding::x2;
+        default:
+            return fallback;
+        }
+    }
+
     JsonObject ColorToJson(
         const vanta::RgbaColor& rgbaColor)
     {
@@ -451,7 +483,6 @@ namespace
             result,
             L"required_consecutive_frames",
             config.requiredConsecutiveFrames);
-        PutNumber(result, L"reset_key", config.resetKey);
         result.Insert(
             L"safe_color",
             ColorToJson(config.safeColor));
@@ -538,12 +569,6 @@ namespace
                     object,
                     L"required_consecutive_frames",
                     result.requiredConsecutiveFrames));
-        result.resetKey =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"reset_key",
-                    result.resetKey));
         result.safeColor =
             ColorFromJson(
                 Child(object, L"safe_color"),
@@ -712,7 +737,10 @@ namespace
         JsonObject result;
         PutBoolean(result, L"enabled", config.enabled);
         PutNumber(result, L"color_target", config.hsvRangeIndex);
-        PutNumber(result, L"hold_key", config.triggerKey);
+        PutNumber(
+            result,
+            L"hold_button",
+            static_cast<int>(config.holdButton));
         PutNumber(result, L"capture_radius", config.roiOffset);
         PutNumber(result, L"ray_length", config.rayLength);
         PutNumber(result, L"ray_half_width", config.rayHalfWidth);
@@ -721,16 +749,13 @@ namespace
         PutNumber(result, L"shot_delay", config.burstDelay);
         PutNumber(result, L"burst_pause", config.burstPause);
         PutNumber(result, L"burst_size", config.burstSize);
-        PutBoolean(
-            result,
-            L"pause_while_moving",
-            config.respectMovement);
         return result;
     }
 
     vanta::TestClickConfig TestClickFromJson(
         const JsonObject& object,
-        const vanta::TestClickConfig& defaults)
+        const vanta::TestClickConfig& defaults,
+        int schema)
     {
         vanta::TestClickConfig result = defaults;
         result.enabled =
@@ -738,9 +763,27 @@ namespace
         result.hsvRangeIndex =
             static_cast<int>(
                 Number(object, L"color_target", result.hsvRangeIndex));
-        result.triggerKey =
-            static_cast<int>(
-                Number(object, L"hold_key", result.triggerKey));
+        if (schema >= 7)
+        {
+            result.holdButton = MouseButtonFromStoredValue(
+                static_cast<int>(
+                    Number(
+                        object,
+                        L"hold_button",
+                        static_cast<int>(
+                            result.holdButton))),
+                result.holdButton);
+        }
+        else
+        {
+            result.holdButton = MouseButtonFromLegacyVirtualKey(
+                static_cast<int>(
+                    Number(
+                        object,
+                        L"hold_key",
+                        0)),
+                result.holdButton);
+        }
         result.roiOffset =
             static_cast<int>(
                 Number(object, L"capture_radius", result.roiOffset));
@@ -764,11 +807,6 @@ namespace
         result.burstSize =
             static_cast<int>(
                 Number(object, L"burst_size", result.burstSize));
-        result.respectMovement =
-            Boolean(
-                object,
-                L"pause_while_moving",
-                result.respectMovement);
         return result;
     }
 
@@ -778,7 +816,10 @@ namespace
         JsonObject result;
         PutBoolean(result, L"enabled", config.enabled);
         PutNumber(result, L"color_target", config.hsvRangeIndex);
-        PutNumber(result, L"aim_key", config.aimKey);
+        PutNumber(
+            result,
+            L"aim_button",
+            static_cast<int>(config.aimButton));
         PutNumber(result, L"kill_fov", config.killFov);
         PutNumber(
             result,
@@ -883,7 +924,8 @@ namespace
 
     vanta::TestMoveConfig TestMoveFromJson(
         const JsonObject& object,
-        const vanta::TestMoveConfig& defaults)
+        const vanta::TestMoveConfig& defaults,
+        int schema)
     {
         vanta::TestMoveConfig result = defaults;
         result.enabled =
@@ -891,9 +933,27 @@ namespace
         result.hsvRangeIndex =
             static_cast<int>(
                 Number(object, L"color_target", result.hsvRangeIndex));
-        result.aimKey =
-            static_cast<int>(
-                Number(object, L"aim_key", result.aimKey));
+        if (schema >= 7)
+        {
+            result.aimButton = MouseButtonFromStoredValue(
+                static_cast<int>(
+                    Number(
+                        object,
+                        L"aim_button",
+                        static_cast<int>(
+                            result.aimButton))),
+                result.aimButton);
+        }
+        else
+        {
+            result.aimButton = MouseButtonFromLegacyVirtualKey(
+                static_cast<int>(
+                    Number(
+                        object,
+                        L"aim_key",
+                        0)),
+                result.aimButton);
+        }
         result.killFov =
             static_cast<int>(
                 Number(object, L"kill_fov", result.killFov));
@@ -1215,11 +1275,13 @@ namespace
             result.testClick =
                 TestClickFromJson(
                     Child(root, L"test_click"),
-                    result.testClick);
+                    result.testClick,
+                    schema);
             result.testMove =
                 TestMoveFromJson(
                     Child(root, L"test_move"),
-                    result.testMove);
+                    result.testMove,
+                    schema);
             return true;
         }
         catch (const winrt::hresult_error& exception)
@@ -1508,7 +1570,7 @@ namespace vanta
 
         LocalConfig local;
         local.capture.backendIndex = 1;
-        local.capture.sourceIndex = 0;
+        local.capture.sourceIndex = 2;
         local.capture.regionIndex = 1;
         local.capture.regionSize = 512;
         local.capture.monitorDevice =
@@ -1530,7 +1592,6 @@ namespace vanta
         local.bombTimer.colorTolerance = 24;
         local.bombTimer.regionLeft = 0.42F;
         local.bombTimer.requiredMatchingPixels = 7;
-        local.bombTimer.resetKey = VK_F8;
         local.bombTimer.widgetOpacity = 0.66F;
         local.bombTimer.hasWidgetPosition = true;
         local.bombTimer.widgetPositionX = 123.0F;
@@ -1588,10 +1649,12 @@ namespace vanta
         SharedProfile profile;
         profile.name = "Self Test";
         profile.testClick.enabled = true;
-        profile.testClick.triggerKey = VK_XBUTTON1;
+        profile.testClick.holdButton =
+            MouseButtonBinding::x1;
         profile.testClick.rayLength = 73;
         profile.testClick.hitMode = 1;
-        profile.testMove.aimKey = VK_LBUTTON;
+        profile.testMove.aimButton =
+            MouseButtonBinding::left;
         profile.testMove.enabled = true;
         profile.testMove.killFov = 155;
         profile.testMove.targetHeightPercent = 42;
@@ -1686,6 +1749,21 @@ namespace vanta
                 legacyProfile,
                 parseError) ||
             legacyProfile.name != "Legacy")
+        {
+            return finish(false);
+        }
+        SharedProfile legacyMouseProfile;
+        if (!DeserializeProfile(
+                "{\"kind\":\"vanta-test-profile\","
+                "\"schema_version\":6,"
+                "\"test_click\":{\"hold_key\":5},"
+                "\"test_move\":{\"aim_key\":2}}",
+                legacyMouseProfile,
+                parseError) ||
+            legacyMouseProfile.testClick.holdButton !=
+                MouseButtonBinding::x1 ||
+            legacyMouseProfile.testMove.aimButton !=
+                MouseButtonBinding::right)
         {
             return finish(false);
         }

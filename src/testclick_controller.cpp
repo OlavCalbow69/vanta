@@ -15,8 +15,6 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <Windows.h>
-
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -35,7 +33,6 @@ namespace
         offline,
         disabled,
         waitingForKey,
-        movementPaused,
         waitingForCapture,
         waitingForMakcu,
         watching,
@@ -49,9 +46,7 @@ namespace
         case TestClickState::disabled:
             return "DISABLED";
         case TestClickState::waitingForKey:
-            return "WAITING FOR KEY";
-        case TestClickState::movementPaused:
-            return "MOVEMENT PAUSED";
+            return "WAITING FOR HOLD BUTTON";
         case TestClickState::waitingForCapture:
             return "WAITING FOR CAPTURE";
         case TestClickState::waitingForMakcu:
@@ -272,7 +267,8 @@ namespace vanta
         std::mutex settingsMutex;
         bool       enabled{false};
         int        hsvRangeIndex{0};           // 0 = current, 1 = alternative
-        int        triggerKey{VK_XBUTTON1};
+        MouseButtonBinding holdButton{
+            MouseButtonBinding::x1};
         int        roiOffset{50};            // half-side of capture square (px)
         int        rayLength{49};            // max step length along each ray (px)
         int        rayHalfWidth{1};          // thickness tolerance (+/- px)
@@ -281,7 +277,6 @@ namespace vanta
         float      burstDelay{0.05F};        // low delay default
         float      burstPause{0.20F};
         int        burstSize{3};
-        bool       respectMovement{true};
 
         CaptureController* capture{nullptr};
         MakcuController*   makcu{nullptr};
@@ -309,15 +304,6 @@ namespace vanta
                 steady_clock::now().time_since_epoch()).count();
         }
 
-        static bool IsMoving()
-        {
-            return
-                (GetAsyncKeyState(0x57) & 0x8000) ||
-                (GetAsyncKeyState(0x41) & 0x8000) ||
-                (GetAsyncKeyState(0x53) & 0x8000) ||
-                (GetAsyncKeyState(0x44) & 0x8000);
-        }
-
         void WorkerLoop()
         {
             threadAlive.store(true);
@@ -332,14 +318,15 @@ namespace vanta
 
             while (running.load(std::memory_order_acquire))
             {
-                bool  snapEnabled, snapRespectMovement, snapBurstLimiter;
-                int   snapHsvRange, snapKey, snapRoi, snapRayLength, snapRayHalf, snapHitMode, snapBurstSize;
+                bool  snapEnabled, snapBurstLimiter;
+                MouseButtonBinding snapHoldButton;
+                int   snapHsvRange, snapRoi, snapRayLength, snapRayHalf, snapHitMode, snapBurstSize;
                 float snapBurstDelay, snapBurstPause;
                 {
                     std::lock_guard<std::mutex> lk(settingsMutex);
                     snapEnabled          = enabled;
                     snapHsvRange         = hsvRangeIndex;
-                    snapKey              = triggerKey;
+                    snapHoldButton       = holdButton;
                     snapRoi              = roiOffset;
                     snapRayLength        = rayLength;
                     snapRayHalf          = rayHalfWidth;
@@ -348,7 +335,6 @@ namespace vanta
                     snapBurstSize        = burstSize;
                     snapBurstDelay       = burstDelay;
                     snapBurstPause       = burstPause;
-                    snapRespectMovement  = respectMovement;
                 }
 
                 if (!snapEnabled)
@@ -364,37 +350,8 @@ namespace vanta
                     continue;
                 }
 
-                if ((GetAsyncKeyState(snapKey) & 0x8000) == 0)
-                {
-                    state.store(TestClickState::waitingForKey);
-                    triggerActive.store(false);
-                    lastHits.store(0);
-                    matchingPixels.store(0);
-                    hitUpState.store(false);
-                    hitLeftState.store(false);
-                    hitRightState.store(false);
-                    burstCount   = 0;
-                    lastShotTime = 0.0;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                    continue;
-                }
-
-                if (snapRespectMovement && IsMoving())
-                {
-                    state.store(TestClickState::movementPaused);
-                    triggerActive.store(false);
-                    lastHits.store(0);
-                    matchingPixels.store(0);
-                    hitUpState.store(false);
-                    hitLeftState.store(false);
-                    hitRightState.store(false);
-                    burstCount = 0;
-                    lastShotTime = 0.0;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-
-                if (makcu == nullptr || !makcu->IsConnected())
+                if (makcu == nullptr ||
+                    !makcu->IsMouseButtonInputAvailable())
                 {
                     state.store(TestClickState::waitingForMakcu);
                     triggerActive.store(false);
@@ -403,7 +360,24 @@ namespace vanta
                     hitUpState.store(false);
                     hitLeftState.store(false);
                     hitRightState.store(false);
+                    burstCount   = 0;
+                    lastShotTime = 0.0;
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+
+                if (!makcu->IsMouseButtonPressed(snapHoldButton))
+                {
+                    state.store(TestClickState::waitingForKey);
+                    triggerActive.store(false);
+                    lastHits.store(0);
+                    matchingPixels.store(0);
+                    hitUpState.store(false);
+                    hitLeftState.store(false);
+                    hitRightState.store(false);
+                    burstCount = 0;
+                    lastShotTime = 0.0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     continue;
                 }
 
@@ -631,7 +605,6 @@ namespace vanta
                 : currentState == TestClickState::watching
                     ? ImVec4(0.45F, 0.96F, 0.65F, 1.0F)
                     : currentState == TestClickState::waitingForKey ||
-                            currentState == TestClickState::movementPaused ||
                             currentState == TestClickState::waitingForCapture ||
                             currentState == TestClickState::waitingForMakcu
                         ? ImVec4(1.0F, 0.75F, 0.32F, 1.0F)
@@ -686,34 +659,39 @@ namespace vanta
             {
             drawCategory("ACTIVATION");
 
-            const char* keyNames[]{
-                "Mouse4 (XButton1)", "Mouse5 (XButton2)",
-                "Right Mouse",       "Caps Lock",
-                "Left Alt",          "Left Shift"};
-            const int keyValues[]{
-                VK_XBUTTON1, VK_XBUTTON2,
-                VK_RBUTTON,  VK_CAPITAL,
-                VK_LMENU,    VK_LSHIFT};
-            constexpr int keyCount =
-                static_cast<int>(sizeof(keyValues) / sizeof(keyValues[0]));
+            const char* buttonNames[]{
+                "Left click",
+                "Right click",
+                "Mouse X1",
+                "Mouse X2"};
+            const MouseButtonBinding buttonValues[]{
+                MouseButtonBinding::left,
+                MouseButtonBinding::right,
+                MouseButtonBinding::x1,
+                MouseButtonBinding::x2};
+            constexpr int buttonCount =
+                static_cast<int>(
+                    sizeof(buttonValues) /
+                    sizeof(buttonValues[0]));
 
-            int selectedKey = 0;
-            for (int i = 0; i < keyCount; ++i)
+            int selectedButton = 0;
+            for (int i = 0; i < buttonCount; ++i)
             {
-                if (keyValues[i] == impl.triggerKey)
+                if (buttonValues[i] == impl.holdButton)
                 {
-                    selectedKey = i;
+                    selectedButton = i;
                     break;
                 }
             }
-            if (custom::Combo("Hold key", &selectedKey, keyNames, keyCount))
+            if (custom::Combo(
+                    "Hold key (MAKCU)",
+                    &selectedButton,
+                    buttonNames,
+                    buttonCount))
             {
-                impl.triggerKey = keyValues[selectedKey];
+                impl.holdButton = buttonValues[selectedButton];
                 settingsChanged = true;
             }
-            settingsChanged |= custom::Checkbox(
-                "Pause while moving (WASD)",
-                &impl.respectMovement);
 
             drawCategory("TARGET");
 
@@ -799,7 +777,7 @@ namespace vanta
         result.enabled = impl.enabled;
         result.hsvRangeIndex =
             impl.hsvRangeIndex;
-        result.triggerKey = impl.triggerKey;
+        result.holdButton = impl.holdButton;
         result.roiOffset = impl.roiOffset;
         result.rayLength = impl.rayLength;
         result.rayHalfWidth =
@@ -810,8 +788,6 @@ namespace vanta
         result.burstDelay = impl.burstDelay;
         result.burstPause = impl.burstPause;
         result.burstSize = impl.burstSize;
-        result.respectMovement =
-            impl.respectMovement;
         return result;
     }
 
@@ -827,10 +803,10 @@ namespace vanta
             0,
             static_cast<int>(
                 kHsvColorTargets.size()) - 1);
-        impl.triggerKey =
-            config.triggerKey != 0
-            ? config.triggerKey
-            : VK_XBUTTON1;
+        impl.holdButton =
+            IsMouseButtonBinding(config.holdButton)
+            ? config.holdButton
+            : MouseButtonBinding::x1;
         impl.roiOffset =
             std::clamp(config.roiOffset, 10, 150);
         impl.rayLength =
@@ -861,8 +837,6 @@ namespace vanta
                 1.50F);
         impl.burstSize =
             std::clamp(config.burstSize, 1, 8);
-        impl.respectMovement =
-            config.respectMovement;
         impl.settingsRevision.fetch_add(
             1,
             std::memory_order_relaxed);

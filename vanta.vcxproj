@@ -54,20 +54,19 @@
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\include\makcu;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;MAKCU_SHARED;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world500.lib;freetype.lib;makcu-cpp_import.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"
-copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)makcu-cpp.dll"</Command>
+      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -81,8 +80,8 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\include\makcu;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;MAKCU_SHARED;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -90,13 +89,12 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world500.lib;freetype.lib;makcu-cpp_import.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"
-copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)makcu-cpp.dll"</Command>
+      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -111,10 +109,24 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
     <ClCompile Include="src\overlay_app.cpp" />
     <ClCompile Include="src\pretty_menu.cpp" />
     <ClCompile Include="src\rp2040_controller.cpp" />
+    <ClCompile Include="src\hardware_video_decoder.cpp">
+      <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="src\sunshine_pairing.cpp" />
+    <ClCompile Include="src\stream_receiver_controller.cpp" />
     <ClCompile Include="src\testclick_controller.cpp" />
     <ClCompile Include="src\testmove_controller.cpp" />
     <ClCompile Include="src\update_controller.cpp" />
     <ClCompile Include="src\update_shared.cpp" />
+    <ClCompile Include="vendor\makcu-cpp\src\makcu.cpp">
+      <DisableSpecificWarnings>4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="vendor\makcu-cpp\src\makcu_c.cpp">
+      <DisableSpecificWarnings>4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <ClCompile Include="vendor\makcu-cpp\src\serialport.cpp">
+      <DisableSpecificWarnings>4101;4244;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
     <ClCompile Include="vendor\imgui\imgui.cpp" />
     <ClCompile Include="vendor\imgui\imgui_draw.cpp" />
     <ClCompile Include="vendor\imgui\imgui_freetype.cpp">
@@ -139,6 +151,9 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
     <ClInclude Include="src\overlay_app.hpp" />
     <ClInclude Include="src\pretty_menu.hpp" />
     <ClInclude Include="src\rp2040_controller.hpp" />
+    <ClInclude Include="src\hardware_video_decoder.hpp" />
+    <ClInclude Include="src\sunshine_pairing.hpp" />
+    <ClInclude Include="src\stream_receiver_controller.hpp" />
     <ClInclude Include="src\testclick_controller.hpp" />
     <ClInclude Include="src\testmove_controller.hpp" />
     <ClInclude Include="src\update_controller.hpp" />
@@ -159,8 +174,9 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
     <ClInclude Include="vendor\imgui\custom\font_defines.h" />
     <ClInclude Include="vendor\imgui\custom\notifications.h" />
     <ClInclude Include="vendor\imgui\custom\Sounds.hpp" />
-    <ClInclude Include="vendor\makcu-cpp-1.3.5-win64\include\makcu\makcu.h" />
-    <ClInclude Include="vendor\makcu-cpp-1.3.5-win64\include\makcu\makcu_c.h" />
+    <ClInclude Include="vendor\makcu-cpp\include\makcu.h" />
+    <ClInclude Include="vendor\makcu-cpp\include\makcu_c.h" />
+    <ClInclude Include="vendor\makcu-cpp\include\serialport.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resources\vanta_exe.rc" />
@@ -174,8 +190,6 @@ copy /Y "$(ProjectDir)vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" "$(OutDir)
     <None Include="vendor\opencv\README.md.txt" />
     <None Include="vendor\opencv\lib\x64\opencv_world500.lib" />
     <None Include="vendor\opencv\bin\x64\opencv_world500.dll" />
-    <None Include="vendor\makcu-cpp-1.3.5-win64\lib\makcu-cpp_import.lib" />
-    <None Include="vendor\makcu-cpp-1.3.5-win64\bin\makcu-cpp.dll" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

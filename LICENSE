@@ -1,0 +1,7 @@
+Vanta is licensed under the GNU General Public License, version 3 or any later
+version (GPL-3.0-or-later).
+
+Vanta links the Moonlight common-c protocol core to implement its Sunshine
+receiver. The complete verbatim GPL-3.0 text is included at
+vendor/moonlight-common-c/LICENSE.txt and must remain available with every
+source and binary distribution of Vanta.

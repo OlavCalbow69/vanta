@@ -13,11 +13,24 @@ beside `vanta.exe` automatically. MAKCU uses the prebuilt 1.3.5 Win64 package
 under `vendor\makcu-cpp-1.3.5-win64`; Vanta links its import library through
 the ABI-safe opaque C API and copies `makcu-cpp.dll` beside the executable.
 
+## License
+
+Vanta is GPL-3.0-or-later because its native Sunshine receiver links
+Moonlight common-c. See [LICENSE](LICENSE), [NOTICE.md](NOTICE.md), and the
+complete GPL text in `vendor\moonlight-common-c\LICENSE.txt`.
+
 ## Build
 
 Install Visual Studio Community 2026 with **Desktop development with C++**,
 the MSVC `v145` x64 toolset, and Windows SDK `10.0.26100.0`. Open
-`vanta.sln` or run:
+`vanta.sln` or run the receiver bootstrap once before the first build:
+
+```powershell
+.\scripts\bootstrap-sunshine-receiver.ps1
+```
+
+The script initializes the Moonlight submodule, builds its static `/MT`
+library, and installs static OpenSSL in the local `work\` directory. Then run:
 
 ```powershell
 & 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe' `
@@ -43,8 +56,9 @@ version into both executables, and publishes `vanta-v<version>-win64.zip` plus
 its SHA-256 checksum. No manual tag or repository secret is required.
 
 The ZIP contains `vanta.exe`, `vanta-updater.exe`, OpenCV and MAKCU runtime
-DLLs, and this README. All builds also remain available as three-day Actions
-artifacts.
+DLLs, this README, and the GPL/third-party license notices required by the
+native Sunshine receiver. All builds also remain available as three-day
+Actions artifacts.
 
 ## Run
 
@@ -69,16 +83,54 @@ the rest of the desktop remains genuinely click-through.
 
 Press `Insert` to show or hide the menu. When hidden, the overlay is fully
 click-through and its window is hidden. Drag the lower-right corner to resize
-the menu within the current monitor. Press `End` to close vanta.
+the menu within the current monitor. Press `End` or `Delete` to close Vanta;
+press `Home` to reset the Bomb Timer.
 
 Every supported exit route uses the same graceful shutdown path, including
-`End`, `WM_CLOSE`, `Ctrl+C`, `Ctrl+Break`, console close, and Windows session
+`End`, `Delete`, `WM_CLOSE`, `Ctrl+C`, `Ctrl+Break`, console close, and Windows session
 shutdown. Vanta first stops the TestClick and TestMove workers, then capture,
 MAKCU/RP2040, configuration, ImGui, DirectComposition/D3D11, the native
 outline windows, and their registered window classes. Shutdown is idempotent
 and also handles partial initialization failures.
 
 The console output is mirrored to `vanta.log` beside the executable.
+
+## Sunshine receiver
+
+On the receiving PC, open **Stream Receiver** in Vanta. It automatically
+searches the local network for Sunshine's standard Moonlight service
+(`_nvstream._tcp.local`); select the desired host from **LAN Sunshine hosts**,
+or enter an IP/name and select **Discover entered host**. Vanta shows a new
+four-digit pairing PIN. Select **Start Vanta pairing**, then, while Vanta is
+waiting, open the Sunshine host's Web UI > **PIN**, enter that exact Vanta PIN,
+optionally name the device `Vanta`, and select **Send**. The initial pairing
+request remains open for two minutes so there is time to approve it on the
+host. Vanta generates its own GameStream client certificate; the private
+identity and the host's pinned certificate are saved with Windows DPAPI under
+`%LocalAppData%\Vanta\sunshine`.
+
+After pairing, choose a LAN resolution, frame rate, and bitrate, then select
+**Connect and start Sunshine Desktop**. **Ask Sunshine to match this display mode**
+is enabled by default, matching Moonlight's normal Sunshine behavior so a
+physical or virtual host display can use the requested resolution and refresh
+rate; turn it off if the host display must remain unchanged. Vanta launches
+Sunshine's `Desktop` app
+over its certificate-pinned HTTPS GameStream API, uses Moonlight common-c for
+the GameStream UDP transport, and hardware-decodes H.264 directly to a D3D11
+texture shown in the receiver page. H.264 is deliberately the initial native
+decoder; configure Sunshine to permit H.264 for Vanta. It does not launch an
+external Moonlight process. For a clean handoff, stop any separate active
+Moonlight session before starting Vanta's stream; Vanta refuses to take over
+an already-active Sunshine session.
+
+To make Vanta's existing capture consumers use the remote video, select
+**Sunshine stream** as the source on the `Capture` page. Vanta then copies
+only newly decoded BGRA frames into its normal OpenCV capture pipeline, so
+TestClick, TestMove, and the Bomb Timer receive the same stream frame source.
+The receiver page remains a direct GPU preview when this source is not
+selected. Remote frames have no physical receiver-PC screen coordinates, so
+Vanta deliberately does not draw desktop capture/FOV/calibration outlines for
+that source.
 
 ## Capture
 
@@ -100,7 +152,7 @@ fight the menu controls.
 Capture settings include:
 
 - Windows Graphics Capture or DXGI Desktop Duplication
-- a top-level window or monitor
+- a top-level window, monitor, or native Sunshine stream
 - the full source or a centered square from 128 to 1280 pixels
 - original/color-filtered output or a black-and-white mask
 - a capture-preview color target independent from TestClick and TestMove
@@ -140,6 +192,11 @@ takes over only after connecting successfully. Auto connection can be disabled
 from the page. The legacy `vendor\makcu-cpp` source tree is not compiled or
 linked.
 
+When MAKCU is connected, Vanta enables its physical-button monitor. The
+TestClick hold binding and TestMove aim binding are limited to `Left click`,
+`Right click`, `Mouse X1`, and `Mouse X2`; their press/release state comes from
+the MAKCU callback rather than Windows key-state polling.
+
 Both backends implement clicks as left-down, a 1 ms hold, and left-up. A failed
 release is retried three times and remains pending for recovery before later
 click/move commands and during the main device tick. Backend switching,
@@ -152,13 +209,13 @@ Both workers wait for monotonically newer capture snapshots and never process
 the same frame twice. TestMove provides `Direct`, stateful `WindMouse`, and
 `Axis control` movement. WindMouse advances once per fresh frame, exposes
 gravity, wind, maximum-step, and slowdown-radius controls, and resets its
-velocity when the key, target, capture, or mouse device is lost.
+velocity when the aim button, target, capture, or mouse device is lost.
 
 Axis control defaults to continuous `X + Y` movement and has independent
 horizontal/vertical multipliers plus its own smoothing control. `Horizontal
 only` always emits zero vertical movement. `Hybrid` uses a 100–1000 ms window:
 both axes move during that window, then vertical movement remains disabled
-until the hold key is released and held again or TestMove is disabled and
+until the aim button is released and held again or TestMove is disabled and
 re-enabled.
 
 The Target section exposes `Target height` from 0% at the top to 100% at the
@@ -193,7 +250,7 @@ re-arm.
 The detector region, target color, tolerance, pixel threshold, and confirmation
 frames are fixed to those built-in defaults and are intentionally hidden from
 the GUI. The page provides manual start and reset controls, a working 10-second
-widget test, and a configurable reset hotkey (Home by default). The countdown
+widget test. The countdown
 is rendered in its own topmost,
 capture-excluded native overlay that is permanently click-through and
 non-activating. It uses a semi-transparent dark panel, a 1 px
@@ -265,6 +322,44 @@ Configuration serialization diagnostics use a temporary directory:
 
 ```powershell
 .\build\Release\vanta.exe --config-self-test
+```
+
+Validate the local receiver without contacting a Sunshine host. This encodes
+a small H.264 IDR/P-frame sequence with Windows' inbox encoder, feeds the
+Annex-B access units through Vanta's real receiver callback path, and verifies
+that Vanta publishes a D3D11 GPU presentation texture:
+
+```powershell
+.\build\Release\vanta.exe --receiver-self-test
+```
+
+Validate the handoff from a decoded Sunshine-style frame into Vanta's normal
+capture consumers without contacting a host:
+
+```powershell
+.\build\Release\vanta.exe --receiver-capture-self-test
+```
+
+Verify that Vanta can discover a Sunshine host without pairing or starting a
+stream:
+
+```powershell
+.\build\Release\vanta.exe --receiver-discover 192.168.1.10
+```
+
+To test the same automatic LAN discovery used by the receiver page:
+
+```powershell
+.\build\Release\vanta.exe --receiver-discover-lan
+```
+
+After pairing Vanta through the **Stream Receiver** page, this explicit live
+smoke test launches the paired host's Desktop with display-mode matching off,
+waits for one real H.264 frame to reach Vanta's decoder, and stops the session
+again. It does not pair a client or change the host display mode:
+
+```powershell
+.\build\Release\vanta.exe --receiver-stream-smoke 192.168.1.10
 ```
 
 The updater's version comparison, daily-cache boundary, SHA-256 success/failure,

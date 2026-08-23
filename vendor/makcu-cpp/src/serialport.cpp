@@ -416,44 +416,46 @@ void SerialPort::listenerLoop(std::stop_token stopToken) {
 					buttonPrefixState = ButtonPrefixState::NONE;
 				};
 
-				// Detect standalone button prefix "km." only when the current text line is empty.
-				if (linePos == 0 || buttonPrefixState != ButtonPrefixState::NONE) {
-					switch (buttonPrefixState) {
-						case ButtonPrefixState::NONE:
-							if (byte == 'k') {
-								buttonPrefixState = ButtonPrefixState::K;
-								consumed = true;
-							}
-							break;
-						case ButtonPrefixState::K:
-							if (byte == 'm') {
-								buttonPrefixState = ButtonPrefixState::KM;
-								consumed = true;
-							}
-							else {
-								flushPrefixAsText();
-							}
-							break;
-						case ButtonPrefixState::KM:
-							if (byte == '.') {
-								buttonPrefixState = ButtonPrefixState::KM_DOT;
-								consumed = true;
-							}
-							else {
-								flushPrefixAsText();
-							}
-							break;
-						case ButtonPrefixState::KM_DOT:
-							if (byte < 32) {
-								handleButtonData(byte);
-								buttonPrefixState = ButtonPrefixState::NONE;
-								consumed = true;
-							}
-							else {
-								flushPrefixAsText();
-							}
-							break;
-					}
+				// Button packets are "km." followed by a mask byte (< 0x20).
+				// They can arrive between command-response bytes, including after
+				// the firmware's ">>> " prompt.  Do not restrict detection to the
+				// start of a text line or normal command traffic will hide physical
+				// left/right/side-button events.
+				switch (buttonPrefixState) {
+					case ButtonPrefixState::NONE:
+						if (byte == 'k') {
+							buttonPrefixState = ButtonPrefixState::K;
+							consumed = true;
+						}
+						break;
+					case ButtonPrefixState::K:
+						if (byte == 'm') {
+							buttonPrefixState = ButtonPrefixState::KM;
+							consumed = true;
+						}
+						else {
+							flushPrefixAsText();
+						}
+						break;
+					case ButtonPrefixState::KM:
+						if (byte == '.') {
+							buttonPrefixState = ButtonPrefixState::KM_DOT;
+							consumed = true;
+						}
+						else {
+							flushPrefixAsText();
+						}
+						break;
+					case ButtonPrefixState::KM_DOT:
+						if (byte < 32) {
+							handleButtonData(byte);
+							buttonPrefixState = ButtonPrefixState::NONE;
+							consumed = true;
+						}
+						else {
+							flushPrefixAsText();
+						}
+						break;
 				}
 
 				if (consumed) {

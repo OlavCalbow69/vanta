@@ -16,8 +16,6 @@
 #include <opencv2/geometry/2d.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include <Windows.h>
-
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -111,7 +109,7 @@ namespace
         switch (s)
         {
         case TestMoveState::disabled:          return "DISABLED";
-        case TestMoveState::waitingForKey:     return "WAITING FOR KEY";
+        case TestMoveState::waitingForKey:     return "WAITING FOR AIM BUTTON";
         case TestMoveState::waitingForCapture: return "WAITING FOR CAPTURE";
         case TestMoveState::waitingForMakcu:   return "WAITING FOR MAKCU";
         case TestMoveState::waitingForNewTarget:
@@ -241,8 +239,9 @@ namespace vanta
         bool        enabled{false};
         int         hsvRangeIndex{0};
 
-        // Aim key: hold to activate (default = left mouse button, same as Python)
-        int aimKey{VK_LBUTTON};
+        // MAKCU mouse button held to activate movement.
+        MouseButtonBinding aimButton{
+            MouseButtonBinding::left};
 
         // FOV: only targets within this radius from screen centre are considered.
         // Python used kill_fov = 100.
@@ -328,8 +327,9 @@ namespace vanta
             std::uniform_real_distribution<float> randomUnit(
                 -1.0F,
                 1.0F);
-            bool aimKeyWasHeld = false;
-            int previousAimKey = 0;
+            bool aimButtonWasHeld = false;
+            MouseButtonBinding previousAimButton{
+                MouseButtonBinding::left};
             MovementMethod previousMovementMethod =
                 MovementMethod::direct;
             AxisMovementMode previousAxisMode =
@@ -378,7 +378,8 @@ namespace vanta
                 bool  snapEnabled;
                 bool  snapAntiBelowObjects,
                       snapShortStopEnabled;
-                int   snapHsvRange, snapAimKey, snapKillFov,
+                MouseButtonBinding snapAimButton;
+                int   snapHsvRange, snapKillFov,
                       snapTargetHeightPercent,
                       snapDeadzone, snapMergeProx,
                       snapHybridVerticalTimeMilliseconds,
@@ -402,7 +403,7 @@ namespace vanta
                     std::lock_guard<std::mutex> lk(settingsMutex);
                     snapEnabled    = enabled;
                     snapHsvRange   = hsvRangeIndex;
-                    snapAimKey     = aimKey;
+                    snapAimButton  = aimButton;
                     snapKillFov    = killFov;
                     snapTargetHeightPercent =
                         targetHeightPercent;
@@ -452,32 +453,43 @@ namespace vanta
                     state.store(TestMoveState::disabled);
                     targetVisible.store(false);
                     resetWind();
-                    aimKeyWasHeld = false;
+                    aimButtonWasHeld = false;
                     resetTargetTracking();
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(5));
                     continue;
                 }
 
-                // Aimbot is only active while the aim key is held
-                // Python: win32api.GetAsyncKeyState(KEY_LEFT_MOUSE) < 0
-                //          (<0 means high-bit set, same as & 0x8000)
-                const bool aimKeyHeld =
-                    (GetAsyncKeyState(snapAimKey) &
-                     0x8000) != 0;
-                if (!aimKeyHeld)
+                if (makcu == nullptr ||
+                    !makcu->IsMouseButtonInputAvailable())
+                {
+                    state.store(TestMoveState::waitingForMakcu);
+                    targetVisible.store(false);
+                    resetWind();
+                    aimButtonWasHeld = false;
+                    resetTargetTracking();
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(5));
+                    continue;
+                }
+
+                // The MAKCU button monitor supplies physical press/release
+                // state without querying Windows input APIs.
+                const bool aimButtonHeld =
+                    makcu->IsMouseButtonPressed(snapAimButton);
+                if (!aimButtonHeld)
                 {
                     state.store(TestMoveState::waitingForKey);
                     targetVisible.store(false);
                     resetWind();
-                    aimKeyWasHeld = false;
+                    aimButtonWasHeld = false;
                     resetTargetTracking();
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(2));
                     continue;
                 }
-                if (!aimKeyWasHeld ||
-                    previousAimKey != snapAimKey ||
+                if (!aimButtonWasHeld ||
+                    previousAimButton != snapAimButton ||
                     previousMovementMethod !=
                         snapMovementMethod ||
                     previousAxisMode != snapAxisMode)
@@ -485,22 +497,11 @@ namespace vanta
                     hybridWindowStarted =
                         std::chrono::steady_clock::now();
                 }
-                aimKeyWasHeld = true;
-                previousAimKey = snapAimKey;
+                aimButtonWasHeld = true;
+                previousAimButton = snapAimButton;
                 previousMovementMethod =
                     snapMovementMethod;
                 previousAxisMode = snapAxisMode;
-
-                if (makcu == nullptr || !makcu->IsConnected())
-                {
-                    state.store(TestMoveState::waitingForMakcu);
-                    targetVisible.store(false);
-                    resetWind();
-                    resetTargetTracking();
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(5));
-                    continue;
-                }
 
                 // Block until a fresh capture frame arrives
                 if (capture == nullptr)
@@ -1165,38 +1166,37 @@ namespace vanta
             {
                 drawCategory("ACTIVATION");
 
-                // Aim key selection
-                const char* keyNames[]{
-                    "Left Mouse Button",
-                    "Right Mouse Button",
-                    "Mouse4 (XButton1)",
-                    "Mouse5 (XButton2)",
-                    "Left Alt",
-                    "Left Shift"};
-                const int keyValues[]{
-                    VK_LBUTTON,  VK_RBUTTON,
-                    VK_XBUTTON1, VK_XBUTTON2,
-                    VK_LMENU,    VK_LSHIFT};
-                constexpr int keyCount =
+                const char* buttonNames[]{
+                    "Left click",
+                    "Right click",
+                    "Mouse X1",
+                    "Mouse X2"};
+                const MouseButtonBinding buttonValues[]{
+                    MouseButtonBinding::left,
+                    MouseButtonBinding::right,
+                    MouseButtonBinding::x1,
+                    MouseButtonBinding::x2};
+                constexpr int buttonCount =
                     static_cast<int>(
-                        sizeof(keyValues) / sizeof(keyValues[0]));
+                        sizeof(buttonValues) /
+                        sizeof(buttonValues[0]));
 
-                int selectedKey = 0;
-                for (int i = 0; i < keyCount; ++i)
+                int selectedButton = 0;
+                for (int i = 0; i < buttonCount; ++i)
                 {
-                    if (keyValues[i] == impl.aimKey)
+                    if (buttonValues[i] == impl.aimButton)
                     {
-                        selectedKey = i;
+                        selectedButton = i;
                         break;
                     }
                 }
                 if (custom::Combo(
-                        "Aim key (hold)",
-                        &selectedKey,
-                        keyNames,
-                        keyCount))
+                        "Aim key (MAKCU)",
+                        &selectedButton,
+                        buttonNames,
+                        buttonCount))
                 {
-                    impl.aimKey = keyValues[selectedKey];
+                    impl.aimButton = buttonValues[selectedButton];
                     settingsChanged = true;
                 }
 
@@ -1464,7 +1464,7 @@ namespace vanta
         TestMoveConfig result;
         result.enabled = impl.enabled;
         result.hsvRangeIndex = impl.hsvRangeIndex;
-        result.aimKey = impl.aimKey;
+        result.aimButton = impl.aimButton;
         result.killFov = impl.killFov;
         result.targetHeightPercent =
             impl.targetHeightPercent;
@@ -1532,10 +1532,10 @@ namespace vanta
             0,
             static_cast<int>(
                 kHsvColorTargets.size()) - 1);
-        impl.aimKey =
-            config.aimKey != 0
-            ? config.aimKey
-            : VK_LBUTTON;
+        impl.aimButton =
+            IsMouseButtonBinding(config.aimButton)
+            ? config.aimButton
+            : MouseButtonBinding::left;
         impl.killFov =
             std::clamp(config.killFov, 20, 350);
         impl.targetHeightPercent =

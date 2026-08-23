@@ -22,6 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Generate per-push semantic version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -98,6 +99,10 @@ jobs:
           }
           "MSBUILD_PATH=$msbuild" >> $env:GITHUB_ENV
 
+      - name: Bootstrap Sunshine receiver dependencies
+        shell: pwsh
+        run: .\scripts\bootstrap-sunshine-receiver.ps1
+
       - name: Build Debug x64
         shell: pwsh
         run: |
@@ -124,9 +129,18 @@ jobs:
             'build\Release\vanta-updater.exe',
             'build\Release\opencv_world500.dll',
             'build\Release\makcu-cpp.dll',
-            'README.md'
+            'README.md',
+            'LICENSE',
+            'NOTICE.md'
           )
-          foreach ($file in $runtimeFiles) {
+          $thirdPartyLicenseFiles = @(
+            @{ Source = 'vendor\moonlight-common-c\LICENSE.txt'; Destination = 'MOONLIGHT-GPL-3.0.txt' },
+            @{ Source = 'vendor\moonlight-common-c\enet\LICENSE'; Destination = 'ENET-LICENSE.txt' },
+            @{ Source = 'vendor\moonlight-common-c\nanors\LICENSE'; Destination = 'NANORS-LICENSE.txt' },
+            @{ Source = 'work\vcpkg\installed\x64-windows-static\share\openssl\copyright'; Destination = 'OPENSSL-LICENSE.txt' }
+          )
+          $allFiles = @($runtimeFiles) + @($thirdPartyLicenseFiles | ForEach-Object { $_.Source })
+          foreach ($file in $allFiles) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
               throw "Expected runtime file is missing: $file"
             }
@@ -136,6 +150,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           foreach ($file in $runtimeFiles) {
             Copy-Item -LiteralPath $file -Destination $stage
+          }
+          foreach ($licenseFile in $thirdPartyLicenseFiles) {
+            Copy-Item -LiteralPath $licenseFile.Source -Destination (Join-Path $stage $licenseFile.Destination)
           }
           $zip = Join-Path 'artifacts' $env:VANTA_RELEASE_ZIP
           Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force

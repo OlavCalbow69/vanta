@@ -2214,14 +2214,16 @@ namespace custom
 
 		it_anim->second.circle_anim = ImLerp(it_anim->second.circle_anim, IsItemActive() ? 11.f : 10.f, g.IO.DeltaTime * 6.f);
 
+		const bool increment_pressed = hovered && ImGui::IsKeyPressed(ImGuiKey_Equal, false);
+		const bool decrement_pressed = hovered && ImGui::IsKeyPressed(ImGuiKey_Minus, false);
 		if ((flags & ImGuiSliderFlags_Integer) == 0) {
-			it_anim->second.plus_float = ImLerp(it_anim->second.plus_float, *(float*)p_data <= *(float*)p_max && hovered && GetAsyncKeyState(VK_OEM_PLUS) & 0x01 ? *(float*)p_data += 0.05f : *(float*)p_data >= *(float*)p_min && hovered && GetAsyncKeyState(VK_OEM_MINUS) & 0x01 ? *(float*)p_data -= 0.05f : 0, g.IO.DeltaTime * 6.f);
+			it_anim->second.plus_float = ImLerp(it_anim->second.plus_float, *(float*)p_data <= *(float*)p_max && increment_pressed ? *(float*)p_data += 0.05f : *(float*)p_data >= *(float*)p_min && decrement_pressed ? *(float*)p_data -= 0.05f : 0, g.IO.DeltaTime * 6.f);
 			if (*(float*)p_data > *(float*)p_max) *(float*)p_data = *(float*)p_max;
 			if (*(float*)p_data < *(float*)p_min) *(float*)p_data = *(float*)p_min;
 		}
 		else
 		{
-			it_anim->second.plus_int = ImLerp(it_anim->second.plus_int, *(int*)p_data <= *(int*)p_max && hovered && GetAsyncKeyState(VK_OEM_PLUS) & 0x01 ? *(int*)p_data += 1 : *(int*)p_data >= *(int*)p_min && hovered && GetAsyncKeyState(VK_OEM_MINUS) & 0x01 ? *(int*)p_data -= 1 : 0, g.IO.DeltaTime * 6.f);
+			it_anim->second.plus_int = ImLerp(it_anim->second.plus_int, *(int*)p_data <= *(int*)p_max && increment_pressed ? *(int*)p_data += 1 : *(int*)p_data >= *(int*)p_min && decrement_pressed ? *(int*)p_data -= 1 : 0, g.IO.DeltaTime * 6.f);
 			if (*(int*)p_data > *(int*)p_max) *(int*)p_data = *(int*)p_max;
 			if (*(int*)p_data < *(int*)p_min) *(int*)p_data = *(int*)p_min;
 		}

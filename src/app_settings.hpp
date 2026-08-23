@@ -34,6 +34,32 @@ namespace vanta
         slowMove = 1
     };
 
+    // These values intentionally mirror MAKCU's mouse-button identifiers.
+    // Keeping the binding independent of Win32 virtual-key values lets the
+    // automation workers use only the MAKCU input monitor.
+    enum class MouseButtonBinding : std::uint8_t
+    {
+        left = 0,
+        right = 1,
+        x1 = 3,
+        x2 = 4
+    };
+
+    constexpr bool IsMouseButtonBinding(
+        MouseButtonBinding button) noexcept
+    {
+        switch (button)
+        {
+        case MouseButtonBinding::left:
+        case MouseButtonBinding::right:
+        case MouseButtonBinding::x1:
+        case MouseButtonBinding::x2:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     struct CaptureConfig
     {
         int backendIndex{};
@@ -82,7 +108,6 @@ namespace vanta
         float regionHeight{68.0F / 1080.0F};
         int requiredMatchingPixels{3};
         int requiredConsecutiveFrames{3};
-        int resetKey{0x24};
         RgbaColor safeColor{
             120.0F / 255.0F,
             1.0F,
@@ -105,7 +130,8 @@ namespace vanta
     {
         bool enabled{};
         int hsvRangeIndex{};
-        int triggerKey{};
+        MouseButtonBinding holdButton{
+            MouseButtonBinding::x1};
         int roiOffset{50};
         int rayLength{49};
         int rayHalfWidth{1};
@@ -114,14 +140,14 @@ namespace vanta
         float burstDelay{0.05F};
         float burstPause{0.20F};
         int burstSize{3};
-        bool respectMovement{true};
     };
 
     struct TestMoveConfig
     {
         bool enabled{};
         int hsvRangeIndex{};
-        int aimKey{};
+        MouseButtonBinding aimButton{
+            MouseButtonBinding::left};
         int killFov{100};
         int targetHeightPercent{15};
         bool drawFovOutline{true};
@@ -206,7 +232,7 @@ namespace vanta
 
     struct LocalConfig
     {
-        static constexpr int schemaVersion = 5;
+        static constexpr int schemaVersion = 6;
         CaptureConfig capture;
         MouseOutputConfig mouseOutput;
         UpdateConfig updates;
@@ -216,7 +242,7 @@ namespace vanta
 
     struct SharedProfile
     {
-        static constexpr int schemaVersion = 6;
+        static constexpr int schemaVersion = 7;
         std::string name;
         TestClickConfig testClick;
         TestMoveConfig testMove;

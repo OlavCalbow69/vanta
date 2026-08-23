@@ -6,12 +6,23 @@
 #include <d3d11.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace cv { class Mat; }
 
 namespace vanta
 {
+    bool RunSunshineCaptureSourceSelfTest();
+
+    // Supplies a new CPU BGRA frame after the caller's last consumed source
+    // sequence. It lets the normal capture pipeline consume a decoded
+    // Sunshine frame without treating Vanta's own window as a desktop source.
+    using SunshineVideoFrameProvider = std::function<bool(
+        std::uint64_t afterSequence,
+        cv::Mat& output,
+        std::uint64_t& sequence)>;
+
     struct CaptureOutline
     {
         bool visible{};
@@ -43,6 +54,8 @@ namespace vanta
             ID3D11DeviceContext* previewContext,
             DWORD ownProcessId,
             const CaptureConfig* initialConfig = nullptr);
+        void SetSunshineVideoFrameProvider(
+            SunshineVideoFrameProvider provider);
         void Shutdown();
         void Tick();
         void RenderPanel();

@@ -319,7 +319,6 @@ namespace vanta
 
         mutable std::mutex settingsMutex;
         BombTimerConfig config;
-        int resetKeyMode{};
 
         mutable std::mutex runtimeMutex;
         DetectorDebounce detector;
@@ -337,7 +336,6 @@ namespace vanta
         std::thread worker;
         std::condition_variable workerCondition;
         std::mutex workerMutex;
-        bool resetKeyWasDown{};
 
         mutable std::mutex previewFrameMutex;
         cv::Mat latestPreviewFrame;
@@ -1355,24 +1353,6 @@ namespace vanta
 
         void Tick()
         {
-            const bool enabled = IsEnabled();
-            int resetKey = VK_HOME;
-            {
-                std::lock_guard<std::mutex> lock(
-                    settingsMutex);
-                resetKey = config.resetKey;
-            }
-            const bool resetDown =
-                enabled &&
-                resetKey != 0 &&
-                (GetAsyncKeyState(resetKey) &
-                 0x8000) != 0;
-            if (resetDown && !resetKeyWasDown)
-            {
-                ResetCountdown("hotkey");
-            }
-            resetKeyWasDown = resetDown;
-
             bool expired = false;
             {
                 std::lock_guard<std::mutex> lock(
@@ -1771,12 +1751,8 @@ namespace vanta
                     {
                         resetRequested = true;
                     }
-                    settingsChanged |= custom::Keybind(
-                        "Reset hotkey",
-                        &config.resetKey,
-                        &resetKeyMode);
                     ImGui::TextDisabled(
-                        "45.0 s countdown | warning at 6.9 s");
+                        "45.0 s countdown | warning at 6.9 s | reset from this menu");
 
                 }
 
