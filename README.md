@@ -55,8 +55,8 @@ monotonically increasing `vMAJOR.MINOR.RUN_NUMBER` version, compiles that exact
 version into both executables, and publishes `vanta-v<version>-win64.zip` plus
 its SHA-256 checksum. No manual tag or repository secret is required.
 
-The ZIP contains `vanta.exe`, `vanta-updater.exe`, OpenCV and MAKCU runtime
-DLLs, this README, and the GPL/third-party license notices required by the
+The ZIP contains `vanta.exe`, `vanta-updater.exe`, the OpenCV runtime
+DLL, this README, and the GPL/third-party license notices required by the
 native Sunshine receiver. All builds also remain available as three-day
 Actions artifacts.
 

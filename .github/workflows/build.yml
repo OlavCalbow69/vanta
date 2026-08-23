@@ -128,7 +128,6 @@ jobs:
             'build\Release\vanta.exe',
             'build\Release\vanta-updater.exe',
             'build\Release\opencv_world500.dll',
-            'build\Release\makcu-cpp.dll',
             'README.md',
             'LICENSE',
             'NOTICE.md'
