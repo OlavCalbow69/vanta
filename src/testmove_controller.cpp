@@ -1,6 +1,8 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "testmove_controller.hpp"
+#include "target_detection.hpp"
+#include "target_detection_ui.hpp"
 
 #include "capture_controller.hpp"
 #include "color_targets.hpp"
@@ -238,6 +240,8 @@ namespace vanta
         std::mutex  settingsMutex;
         bool        enabled{false};
         int         hsvRangeIndex{0};
+        TargetDetectionConfig detector;
+        bool previewEnabled{};
 
         // MAKCU mouse button held to activate movement.
         MouseButtonBinding aimButton{
@@ -316,7 +320,7 @@ namespace vanta
             std::uint64_t lastSequence = 0;
             cv::Mat       frame;
             std::uint64_t sequence    = 0;
-            std::int64_t  timestamp   = 0;
+            CapturedFrameMetadata frameMetadata;
             double        nextSampleTime = 0.0;
             float         windX = 0.0F;
             float         windY = 0.0F;
@@ -376,6 +380,7 @@ namespace vanta
             {
                 // Snapshot settings under lock
                 bool  snapEnabled;
+                TargetDetectionConfig snapDetector;
                 bool  snapAntiBelowObjects,
                       snapShortStopEnabled;
                 MouseButtonBinding snapAimButton;
@@ -402,6 +407,7 @@ namespace vanta
                 {
                     std::lock_guard<std::mutex> lk(settingsMutex);
                     snapEnabled    = enabled;
+                    snapDetector = detector;
                     snapHsvRange   = hsvRangeIndex;
                     snapAimButton  = aimButton;
                     snapKillFov    = killFov;
@@ -512,11 +518,10 @@ namespace vanta
                     resetTargetTracking();
                     continue;
                 }
-                if (!capture->WaitForCenteredFrame(
+                if (!capture->WaitForCenteredFrameWithMetadata(
                         lastSequence,
                         frame,
-                        sequence,
-                        timestamp,
+                        frameMetadata,
                         10))
                 {
                     state.store(TestMoveState::waitingForCapture);
@@ -524,6 +529,7 @@ namespace vanta
                     resetWind();
                     continue;
                 }
+                sequence = frameMetadata.sequence;
                 lastSequence = sequence;
 
                 if (frame.empty())
@@ -554,27 +560,8 @@ namespace vanta
                 cv::Mat hsv;
                 cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
 
-                const auto& hsvRange =
-                    vanta::kHsvColorTargets[
-                        static_cast<std::size_t>(
-                        std::clamp(
-                            snapHsvRange,
-                            0,
-                            static_cast<int>(
-                                vanta::kHsvColorTargets.size()) - 1))];
-
                 cv::Mat mask;
-                cv::inRange(
-                    hsv,
-                    cv::Scalar(
-                        hsvRange.lower[0],
-                        hsvRange.lower[1],
-                        hsvRange.lower[2]),
-                    cv::Scalar(
-                        hsvRange.upper[0],
-                        hsvRange.upper[1],
-                        hsvRange.upper[2]),
-                    mask);
+                vanta::BuildHsvMask(hsv, snapHsvRange, mask);
 
                 // ── Diagnostic pixel count (sampled every 100 ms) ─────────
                 const double nowSec = NowSeconds();
@@ -592,7 +579,7 @@ namespace vanta
                         {
                             if (vals[col] == 0) continue;
                             const auto& p = colors[col];
-                            if (!bl.count(BgrKey(p[0], p[1], p[2])))
+                            if (!ColorTarget(snapHsvRange).purpleBlacklist || !bl.count(BgrKey(p[0], p[1], p[2])))
                                 ++px;
                         }
                     }
@@ -600,7 +587,28 @@ namespace vanta
                     nextSampleTime = nowSec + 0.10;
                 }
 
-                // ── Dilate — Python: cv2.dilate(mask, np.ones((4,4)), iter=1)
+                std::vector<DetectedTarget> candidates;
+                if (snapDetector.enabled)
+                {
+                    if (ColorTarget(snapHsvRange).purpleBlacklist)
+                    {
+                        const auto& blacklist = Blacklist();
+                        for (int y = 0; y < mask.rows; ++y)
+                            for (int x = 0; x < mask.cols; ++x)
+                            {
+                                const auto& p = bgr.at<cv::Vec3b>(y,x);
+                                if (mask.at<std::uint8_t>(y,x) && blacklist.contains(BgrKey(p[0],p[1],p[2])))
+                                    mask.at<std::uint8_t>(y,x) = 0;
+                            }
+                    }
+                    auto result = DetectTargets(mask, snapDetector,
+                        {frameMetadata.sourceWidth,frameMetadata.sourceHeight,frameMetadata.cropX,frameMetadata.cropY},
+                        effectiveKillFov, snapTargetHeightPercent);
+                    candidates = std::move(result.targets);
+                }
+                else
+                {
+                // Legacy profiles retain their original 4x4 dilation path.
                 cv::Mat dilated;
                 cv::dilate(mask, dilated, kernel,
                            cv::Point(-1, -1), 1);
@@ -624,6 +632,10 @@ namespace vanta
                 // ── Merge rects — Python: unify_rectangles(raw_rects, proximity=10)
                 std::vector<cv::Rect> mergedRects =
                     UnifyRectangles(std::move(rawRects), snapMergeProx);
+                for (const auto& r : mergedRects)
+                    candidates.push_back({r, cv::Point2d(r.x + r.width / 2,
+                        r.y + static_cast<int>(r.height * snapTargetHeightPercent / 100.0F))});
+                }
 
                 // ── Find best target ─────────────────────────────────────────
                 // Aim height is measured down from the target's top edge.
@@ -636,16 +648,12 @@ namespace vanta
                 int   bestDx   = 0;
                 int   bestDy   = 0;
 
-                for (const auto& r : mergedRects)
+                for (const auto& candidate : candidates)
                 {
                     const int hx =
-                        r.x + r.width / 2;
+                        static_cast<int>(std::lround(candidate.aim.x));
                     const int hy =
-                        r.y + static_cast<int>(
-                            static_cast<float>(r.height) *
-                            static_cast<float>(
-                                snapTargetHeightPercent) /
-                            100.0F);
+                        static_cast<int>(std::lround(candidate.aim.y));
                     if (ShouldIgnoreTargetBelowCrosshair(
                             hy,
                             fcy,
@@ -665,7 +673,8 @@ namespace vanta
                     const int px = std::clamp(hx, 0, bgr.cols - 1);
                     const int py = std::clamp(hy, 0, bgr.rows - 1);
                     const auto& pixel = bgr.at<cv::Vec3b>(py, px);
-                    if (bl.count(BgrKey(pixel[0], pixel[1], pixel[2])))
+                    if (!snapDetector.enabled && ColorTarget(snapHsvRange).purpleBlacklist &&
+                        bl.count(BgrKey(pixel[0], pixel[1], pixel[2])))
                         continue;
 
                     minDist = dist;
@@ -1222,10 +1231,40 @@ namespace vanta
                     "Kill FOV",
                     &impl.killFov,
                     20, 350, "%d px");
+                ImGui::BeginDisabled(impl.detector.enabled && impl.detector.aimPointMode==AimPointMode::maskTop);
                 settingsChanged |= custom::SliderInt(
-                    "Target height",
+                    "Target height (bounding box)",
                     &impl.targetHeightPercent,
                     0, 100, "%d%% from top");
+                ImGui::EndDisabled();
+                settingsChanged |= RenderDetectionControls(impl.detector);
+                ImGui::Checkbox("Detector preview (works without mouse output)", &impl.previewEnabled);
+                if (impl.previewEnabled && impl.detector.enabled && impl.capture)
+                {
+                    cv::Mat image;
+                    CapturedFrameMetadata metadata;
+                    if (impl.capture->WaitForCenteredFrameWithMetadata(0,image,metadata,0))
+                    {
+                        cv::Mat bgr,hsv,mask;
+                        cv::cvtColor(image,bgr,cv::COLOR_BGRA2BGR);
+                        cv::cvtColor(bgr,hsv,cv::COLOR_BGR2HSV);
+                        BuildHsvMask(hsv,impl.hsvRangeIndex,mask);
+                        if (ColorTarget(impl.hsvRangeIndex).purpleBlacklist)
+                            for (int y=0;y<mask.rows;++y)
+                                for (int x=0;x<mask.cols;++x)
+                                {
+                                    const auto p=bgr.at<cv::Vec3b>(y,x);
+                                    if (Blacklist().contains(BgrKey(p[0],p[1],p[2]))) mask.at<std::uint8_t>(y,x)=0;
+                                }
+                        const int previewFov=std::min(impl.killFov,
+                            std::max(0,std::min(image.cols/2,image.rows/2)-3));
+                        auto preview=DetectTargets(mask,impl.detector,
+                            {metadata.sourceWidth,metadata.sourceHeight,metadata.cropX,metadata.cropY},
+                            previewFov,impl.targetHeightPercent);
+                        RenderDetectionPreview(preview,impl.antiBelowObjects);
+                    }
+                    else ImGui::TextDisabled("Waiting for a captured frame.");
+                }
                 settingsChanged |= custom::Checkbox(
                     "Draw Kill FOV outline",
                     &impl.drawFovOutline);
@@ -1463,6 +1502,7 @@ namespace vanta
             impl.settingsMutex);
         TestMoveConfig result;
         result.enabled = impl.enabled;
+        result.detector = impl.detector;
         result.hsvRangeIndex = impl.hsvRangeIndex;
         result.aimButton = impl.aimButton;
         result.killFov = impl.killFov;
@@ -1527,6 +1567,7 @@ namespace vanta
         std::lock_guard<std::mutex> lock(
             impl.settingsMutex);
         impl.enabled = config.enabled;
+        impl.detector = SanitizeDetectionConfig(config.detector);
         impl.hsvRangeIndex = std::clamp(
             config.hsvRangeIndex,
             0,

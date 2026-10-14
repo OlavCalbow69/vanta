@@ -13,6 +13,10 @@
     <ClCompile Include="src\main.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\capture_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\config_manager.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\color_targets.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\target_detection.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\target_detection_ui.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\makcu_protocol_self_test.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\logger.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\makcu_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\overlay_app.cpp"><Filter>Source</Filter></ClCompile>
@@ -42,6 +46,8 @@
     <ClInclude Include="src\app_settings.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\config_manager.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\color_targets.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\target_detection.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\target_detection_ui.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\logger.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\makcu_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\capture_controller.hpp"><Filter>Source</Filter></ClInclude>
@@ -74,6 +80,7 @@
     <ClInclude Include="vendor\makcu-cpp\include\makcu.h"><Filter>Vendor\MAKCU</Filter></ClInclude>
     <ClInclude Include="vendor\makcu-cpp\include\makcu_c.h"><Filter>Vendor\MAKCU</Filter></ClInclude>
     <ClInclude Include="vendor\makcu-cpp\include\serialport.h"><Filter>Vendor\MAKCU</Filter></ClInclude>
+    <ClInclude Include="vendor\makcu-cpp\include\host_protocol.hpp"><Filter>Vendor\MAKCU</Filter></ClInclude>
     <ClInclude Include="resources\resource.h"><Filter>Resources</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>

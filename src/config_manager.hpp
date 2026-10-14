@@ -17,6 +17,7 @@ namespace vanta
     class TestClickController;
     class TestMoveController;
     class UpdateController;
+    class StreamReceiverController;
 
     class ConfigManager
     {
@@ -35,12 +36,14 @@ namespace vanta
             const CaptureController& capture,
             const MakcuController& mouseOutput,
             const BombTimerController& bombTimer,
-            const UpdateController& updates);
+            const UpdateController& updates,
+            const StreamReceiverController& sunshine);
         void AutoSaveLocal(
             const CaptureController& capture,
             const MakcuController& mouseOutput,
             const BombTimerController& bombTimer,
-            const UpdateController& updates);
+            const UpdateController& updates,
+            const StreamReceiverController& sunshine);
         void RenderPanel(
             HWND owner,
             TestClickController& testClick,

@@ -9,9 +9,11 @@ widgets, console/file logging, and the embedded `assets\favicon.ico` icon.
 The same embedded Vanta artwork is uploaded as a D3D11 texture and displayed
 beside the `VANTA` title in the menu header.
 OpenCV 5.0.0 is vendored under `vendor\opencv`; its runtime DLL is copied
-beside `vanta.exe` automatically. MAKCU uses the prebuilt 1.3.5 Win64 package
-under `vendor\makcu-cpp-1.3.5-win64`; Vanta links its import library through
-the ABI-safe opaque C API and copies `makcu-cpp.dll` beside the executable.
+beside `vanta.exe` automatically. MAKCU's vendored C++ sources are compiled into
+the executable through their opaque C API; no separate MAKCU DLL is required.
+
+This feature branch adds the [1440p detector and MAKCU 4.094 update](README-DETECTOR.md).
+It includes contour filters, mask-top aiming, configurable morphology, and red/yellow presets.
 
 ## License
 
@@ -43,7 +45,6 @@ The output is:
 build\Release\vanta.exe
 build\Release\vanta-updater.exe
 build\Release\opencv_world500.dll
-build\Release\makcu-cpp.dll
 ```
 
 ## Automated builds and releases
@@ -171,8 +172,9 @@ selected outline opacity.
 
 The OpenCV filter converts BGRA to BGR and then HSV, supports the original
 inclusive range `[144, 106, 172]` through `[151, 255, 255]` and the alternative
-range `[135, 63, 102]` through `[155, 255, 255]`, and removes the 75 supplied
-exact blacklist colors as BGR values. With `Black/white mask` enabled,
+range `[135, 63, 102]` through `[155, 255, 255]`, yellow, and dual-range red
+across the hue boundary. The 75 supplied exact blacklist colors apply to purple
+only. With `Black/white mask` enabled,
 non-matching pixels are black and matching pixels are white.
 
 Windows Graphics Capture captures the selected window directly. Desktop
@@ -189,8 +191,8 @@ left/right click, and wheel test controls. Auto detect/connect is enabled by
 default and retries every two seconds. MAKCU is always preferred; RP2040 is
 selected as a fallback when MAKCU is unavailable, and a MAKCU attached later
 takes over only after connecting successfully. Auto connection can be disabled
-from the page. The legacy `vendor\makcu-cpp` source tree is not compiled or
-linked.
+from the page. The `vendor\makcu-cpp` sources include a documented V4 compatibility
+patch for baud discovery, numeric firmware replies, and interleaved button packets.
 
 When MAKCU is connected, Vanta enables its physical-button monitor. The
 TestClick hold binding and TestMove aim binding are limited to `Left click`,

@@ -1,6 +1,8 @@
 #include "overlay_app.hpp"
 
 #include "capture_controller.hpp"
+#include "target_detection.hpp"
+#include "target_detection_ui.hpp"
 #include "bomb_timer_controller.hpp"
 #include "config_manager.hpp"
 #include "hardware_video_decoder.hpp"
@@ -1157,7 +1159,7 @@ namespace
                 options_.selfTestFrames == 0 &&
                     options_.captureTestBackend == 0 &&
                     VANTA_AUTOMATED_RELEASE_BUILD != 0);
-            streamReceiver_.Initialize(device_.Get());
+            streamReceiver_.Initialize(device_.Get(), &initialConfig.sunshine);
             capture_.SetSunshineVideoFrameProvider(
                 [this](
                     const std::uint64_t afterSequence,
@@ -1201,7 +1203,7 @@ namespace
                 capture_,
                 makcu_,
                 bombTimer_,
-                updates_);
+                updates_, streamReceiver_);
             if (options_.selfTestFrames == 0)
             {
                 RegisterHotkeys();
@@ -1271,7 +1273,7 @@ namespace
                     capture_,
                     makcu_,
                     bombTimer_,
-                    updates_);
+                    updates_, streamReceiver_);
 
                 if (options_.selfTestFrames != 0 &&
                     renderedFrames_ >= options_.selfTestFrames)
@@ -3142,6 +3144,10 @@ namespace vanta
                 "  vanta.exe --self-test N   render N frames and exit\n"
                 "  vanta.exe --config-self-test validate JSON in a temporary folder\n"
                 "  vanta.exe --receiver-self-test validate H.264 D3D11 hardware decoding\n"
+                "  vanta.exe --detector-self-test validate contour/color/aim/resolution handling\n"
+                "  vanta.exe --detector-ui-self-test validate detector controls and preview draw lists\n"
+                "  vanta.exe --makcu-self-test validate serial framing and baud handshake\n"
+                "  vanta.exe --makcu-probe COMn query connected firmware without injecting moves\n"
                 "  vanta.exe --receiver-capture-self-test validate Sunshine-to-capture frame delivery\n"
                 "  vanta.exe --receiver-discover-lan auto-discover Sunshine hosts on this LAN\n"
                 "  vanta.exe --receiver-discover HOST verify a Sunshine host without pairing\n"
@@ -3153,6 +3159,18 @@ namespace vanta
                 "  --capture-test-duplication-window test DXGI window crop\n");
             return 0;
         }
+        if (HasArgument(argumentCount, arguments, L"--detector-self-test"))
+            return RunTargetDetectionSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount, arguments, L"--detector-ui-self-test"))
+            return RunDetectionUiSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount, arguments, L"--makcu-self-test"))
+            return RunMakcuCompatibilitySelfTest() ? 0 : 1;
+        for (int index=1;index+1<argumentCount;++index)
+            if (wcscmp(arguments[index],L"--makcu-probe")==0)
+            {
+                const std::wstring port=arguments[index+1];
+                return RunMakcuConnectionProbe(Utf8FromWide(port)) ? 0 : 1;
+            }
         if (HasArgument(
                 argumentCount,
                 arguments,

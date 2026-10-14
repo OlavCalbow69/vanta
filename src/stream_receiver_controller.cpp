@@ -374,10 +374,11 @@ namespace vanta
         char host[256]{};
         char pin[5]{};
         bool lanDiscoveryStarted{};
-        int requestedWidth{1920};
-        int requestedHeight{1080};
+        int requestedWidth{2560};
+        int requestedHeight{1440};
         int requestedFps{120};
-        int requestedBitrateKbps{80000};
+        int requestedBitrateKbps{150000};
+        std::atomic<std::uint64_t> settingsRevision{0};
         bool requestDisplayMode{true};
         std::string status{"Enter the LAN address of the Sunshine host, then select Discover."};
         std::optional<sunshine::HostInfo> discoveredHost;
@@ -830,9 +831,17 @@ namespace vanta
     StreamReceiverController::StreamReceiverController() : implementation_(std::make_unique<Implementation>()) {}
     StreamReceiverController::~StreamReceiverController() { Shutdown(); }
 
-    void StreamReceiverController::Initialize(ID3D11Device* device)
+    void StreamReceiverController::Initialize(ID3D11Device* device, const SunshineStreamConfig* config)
     {
         implementation_->device = device;
+        if (config)
+        {
+            implementation_->requestedWidth=config->width;
+            implementation_->requestedHeight=config->height;
+            implementation_->requestedFps=config->fps;
+            implementation_->requestedBitrateKbps=config->bitrateKbps;
+            implementation_->requestDisplayMode=config->requestDisplayMode;
+        }
         if (!implementation_->GeneratePairingPin())
         {
             vanta::log::Warning("Sunshine receiver could not generate its initial pairing PIN");
@@ -856,9 +865,22 @@ namespace vanta
         }
     }
 
+    SunshineStreamConfig StreamReceiverController::GetConfig() const
+    {
+        const auto& impl=*implementation_;
+        return {impl.requestedWidth,impl.requestedHeight,impl.requestedFps,
+            impl.requestedBitrateKbps,impl.requestDisplayMode};
+    }
+
+    std::uint64_t StreamReceiverController::SettingsRevision() const noexcept
+    {
+        return implementation_->settingsRevision.load(std::memory_order_relaxed);
+    }
+
     void StreamReceiverController::RenderPanel()
     {
         auto& impl = *implementation_;
+        const SunshineStreamConfig before = GetConfig();
         const float height = std::max(450.0F, ImGui::GetContentRegionAvail().y - 40.0F);
         custom::Child(ICON_RADIO_LINE "  Sunshine receiver##sunshine-receiver", ImVec2(0.0F, height), true);
         ImGui::TextWrapped("Vanta pairs directly with Sunshine, launches Sunshine Desktop through a certificate-pinned HTTPS request, then receives its UDP video with Moonlight common-c. No external Moonlight process is used.");
@@ -986,6 +1008,7 @@ namespace vanta
         ImGui::InputInt("FPS", &impl.requestedFps, 0, 0);
         ImGui::InputInt("Bitrate (kbps)", &impl.requestedBitrateKbps, 0, 0);
         custom::Checkbox("Ask Sunshine to match this display mode", &impl.requestDisplayMode);
+        if (before != GetConfig()) impl.settingsRevision.fetch_add(1,std::memory_order_relaxed);
         if (activeJob || streamActive)
         {
             ImGui::EndDisabled();

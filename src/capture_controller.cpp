@@ -2149,6 +2149,10 @@ struct vanta::CaptureController::Implementation
             ++sessionPublishedFrames;
             latestFrameTimestampNanoseconds =
                 frameTimestampNanoseconds;
+            latestMetadata = {latestFrameSequence, frameTimestampNanoseconds,
+                sourceWidth, sourceHeight,
+                captured.centeredRegionApplied ? (sourceWidth - capture.cols) / 2 : captureRectangle.x,
+                captured.centeredRegionApplied ? (sourceHeight - capture.rows) / 2 : captureRectangle.y};
         }
         latestFrameCondition.notify_all();
 
@@ -2194,18 +2198,8 @@ struct vanta::CaptureController::Implementation
                             0,
                             static_cast<int>(
                                 vanta::kHsvColorTargets.size()) - 1))];
-            cv::inRange(
-                hsv,
-                cv::Scalar(
-                    colorTarget.lower[0],
-                    colorTarget.lower[1],
-                    colorTarget.lower[2]),
-                cv::Scalar(
-                    colorTarget.upper[0],
-                    colorTarget.upper[1],
-                    colorTarget.upper[2]),
-                mask);
-            RemoveBlacklistedPixels(bgr, mask);
+            vanta::BuildHsvMask(hsv, colorTargetIndex, mask);
+            if (colorTarget.purpleBlacklist) RemoveBlacklistedPixels(bgr, mask);
             matchedPixels = cv::countNonZero(mask);
 
             if (binaryMask)
@@ -2579,15 +2573,8 @@ struct vanta::CaptureController::Implementation
                             0,
                             static_cast<int>(
                                 vanta::kHsvColorTargets.size()) - 1))];
-            ImGui::TextDisabled(
-                "HSV [%d,%d,%d] to [%d,%d,%d]\n"
-                "75 blacklist colors (OpenCV BGR)",
-                colorTarget.lower[0],
-                colorTarget.lower[1],
-                colorTarget.lower[2],
-                colorTarget.upper[0],
-                colorTarget.upper[1],
-                colorTarget.upper[2]);
+            ImGui::TextDisabled("%s\n%s", colorTarget.description,
+                colorTarget.purpleBlacklist ? "Purple blacklist enabled" : "Purple blacklist not applied");
 
             if (backendIndex == 1 && sourceIndex == 0)
             {
@@ -2818,6 +2805,7 @@ struct vanta::CaptureController::Implementation
     std::uint64_t latestFrameSequence{};
     std::uint64_t sessionPublishedFrames{};
     std::int64_t latestFrameTimestampNanoseconds{};
+    vanta::CapturedFrameMetadata latestMetadata;
 
     mutable std::mutex auxiliaryFrameMutex;
     mutable std::condition_variable
@@ -3048,6 +3036,17 @@ namespace vanta
         std::int64_t& captureTimestampNanoseconds,
         std::uint32_t timeoutMilliseconds) const
     {
+        CapturedFrameMetadata metadata;
+        if (!WaitForCenteredFrameWithMetadata(afterSequence, out, metadata, timeoutMilliseconds)) return false;
+        sequence = metadata.sequence;
+        captureTimestampNanoseconds = metadata.captureTimestampNanoseconds;
+        return true;
+    }
+
+    bool CaptureController::WaitForCenteredFrameWithMetadata(
+        const std::uint64_t afterSequence, cv::Mat& out,
+        CapturedFrameMetadata& metadata, const std::uint32_t timeoutMilliseconds) const
+    {
         std::unique_lock<std::mutex> lock(
             implementation_->latestFrameMutex);
         const bool available =
@@ -3066,9 +3065,7 @@ namespace vanta
             return false;
         }
         out = implementation_->latestCenteredFrame;
-        sequence = implementation_->latestFrameSequence;
-        captureTimestampNanoseconds =
-            implementation_->latestFrameTimestampNanoseconds;
+        metadata = implementation_->latestMetadata;
         return true;
     }
 
@@ -3202,8 +3199,8 @@ namespace vanta
                 }
                 ++supplied;
                 output = cv::Mat(
-                    1080,
-                    1920,
+                    supplied <= 4 ? 1080 : 1440,
+                    supplied <= 4 ? 1920 : 2560,
                     CV_8UC4,
                     cv::Scalar(
                         static_cast<double>(13 + supplied),
@@ -3230,9 +3227,18 @@ namespace vanta
             return false;
         }
 
+        bool firstGeometryValid=false;
         for (int index = 0; index < 8; ++index)
         {
             capture.Tick();
+            if (index==3)
+            {
+                cv::Mat image;
+                CapturedFrameMetadata metadata;
+                firstGeometryValid=capture.WaitForCenteredFrameWithMetadata(0,image,metadata,0) &&
+                    metadata.sourceWidth==1920 && metadata.sourceHeight==1080 &&
+                    metadata.cropX==640 && metadata.cropY==220 && metadata.sequence==4;
+            }
         }
         // A provider that has no new sequence must not cause Vanta to republish
         // a duplicate capture frame.
@@ -3241,6 +3247,10 @@ namespace vanta
         RECT captureRectangle{};
         std::uint64_t publishedSequence{};
         std::int64_t publishedTimestamp{};
+        CapturedFrameMetadata metadata;
+        const bool finalGeometryValid=capture.WaitForCenteredFrameWithMetadata(0,frame,metadata,0) &&
+            metadata.sourceWidth==2560 && metadata.sourceHeight==1440 &&
+            metadata.cropX==960 && metadata.cropY==400 && metadata.sequence==8;
         const cv::Vec4b firstPixel =
             capture.WaitForCenteredFrame(
                 0,
@@ -3253,6 +3263,7 @@ namespace vanta
             ? frame.at<cv::Vec4b>(0, 0)
             : cv::Vec4b{};
         const bool valid =
+            firstGeometryValid && finalGeometryValid &&
             frame.type() == CV_8UC4 &&
             frame.cols == 640 &&
             frame.rows == 640 &&

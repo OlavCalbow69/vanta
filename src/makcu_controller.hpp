@@ -7,6 +7,8 @@
 
 namespace vanta
 {
+    bool RunMakcuCompatibilitySelfTest();
+    bool RunMakcuConnectionProbe(const std::string& port);
     class MakcuController
     {
     public:

@@ -1,6 +1,8 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "config_manager.hpp"
+#include "target_detection.hpp"
+#include "stream_receiver_controller.hpp"
 
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Data.Json.h>
@@ -810,10 +812,76 @@ namespace
         return result;
     }
 
+    using Detector = vanta::TargetDetectionConfig;
+    constexpr std::pair<const wchar_t*, bool Detector::*> detectorBooleans[]{
+        {L"enabled",&Detector::enabled},{L"area_filter",&Detector::areaFilter},
+        {L"width_filter",&Detector::widthFilter},{L"height_filter",&Detector::heightFilter},
+        {L"aspect_filter",&Detector::aspectFilter},{L"solidity_filter",&Detector::solidityFilter},
+        {L"flat_filter",&Detector::flatFilter},{L"orb_filter",&Detector::orbFilter},
+        {L"closing_enabled",&Detector::closingEnabled}};
+    constexpr std::pair<const wchar_t*, double Detector::*> detectorNumbers[]{
+        {L"minimum_area",&Detector::minimumArea},{L"maximum_area",&Detector::maximumArea},
+        {L"minimum_width",&Detector::minimumWidth},{L"maximum_width",&Detector::maximumWidth},
+        {L"minimum_height",&Detector::minimumHeight},{L"maximum_height",&Detector::maximumHeight},
+        {L"minimum_aspect",&Detector::minimumAspect},{L"maximum_aspect",&Detector::maximumAspect},
+        {L"minimum_solidity",&Detector::minimumSolidity},{L"maximum_solidity",&Detector::maximumSolidity},
+        {L"flat_aspect_maximum",&Detector::flatAspectMaximum},{L"flat_minimum_width",&Detector::flatMinimumWidth},
+        {L"orb_aspect_minimum",&Detector::orbAspectMinimum},{L"orb_aspect_maximum",&Detector::orbAspectMaximum},
+        {L"orb_minimum_width",&Detector::orbMinimumWidth},{L"orb_fill_minimum",&Detector::orbFillMinimum},
+        {L"orb_solidity_minimum",&Detector::orbSolidityMinimum},{L"merge_proximity",&Detector::mergeProximity},
+        {L"offset_x",&Detector::offsetX},{L"offset_y",&Detector::offsetY}};
+    constexpr std::pair<const wchar_t*, int Detector::*> detectorIntegers[]{
+        {L"reference_width",&Detector::referenceWidth},{L"reference_height",&Detector::referenceHeight},
+        {L"closing_kernel",&Detector::closingKernel},{L"dilation_kernel",&Detector::dilationKernel},
+        {L"top_rows",&Detector::topRows}};
+
+    JsonObject DetectorToJson(const Detector& c)
+    {
+        JsonObject object;
+        for (const auto& [key,member]:detectorBooleans) PutBoolean(object,key,c.*member);
+        for (const auto& [key,member]:detectorNumbers) PutNumber(object,key,c.*member);
+        for (const auto& [key,member]:detectorIntegers) PutNumber(object,key,c.*member);
+        PutNumber(object,L"aim_point_mode",static_cast<int>(c.aimPointMode));
+        return object;
+    }
+
+    Detector DetectorFromJson(const JsonObject& object)
+    {
+        Detector c;
+        for (const auto& [key,member]:detectorBooleans) c.*member=Boolean(object,key,c.*member);
+        for (const auto& [key,member]:detectorNumbers) c.*member=Number(object,key,c.*member);
+        for (const auto& [key,member]:detectorIntegers)
+            c.*member=static_cast<int>(std::clamp(Number(object,key,c.*member),-100000.0,100000.0));
+        c.aimPointMode=Number(object,L"aim_point_mode",1)==0
+            ? vanta::AimPointMode::boundingBox : vanta::AimPointMode::maskTop;
+        return vanta::SanitizeDetectionConfig(c);
+    }
+
+    JsonObject SunshineToJson(const vanta::SunshineStreamConfig& c)
+    {
+        JsonObject object;
+        PutNumber(object,L"width",c.width); PutNumber(object,L"height",c.height);
+        PutNumber(object,L"fps",c.fps); PutNumber(object,L"bitrate_kbps",c.bitrateKbps);
+        PutBoolean(object,L"request_display_mode",c.requestDisplayMode);
+        return object;
+    }
+
+    vanta::SunshineStreamConfig SunshineFromJson(const JsonObject& object)
+    {
+        vanta::SunshineStreamConfig c;
+        c.width=static_cast<int>(std::clamp(Number(object,L"width",c.width),64.0,16384.0));
+        c.height=static_cast<int>(std::clamp(Number(object,L"height",c.height),64.0,16384.0));
+        c.fps=static_cast<int>(std::clamp(Number(object,L"fps",c.fps),1.0,1000.0));
+        c.bitrateKbps=static_cast<int>(std::clamp(Number(object,L"bitrate_kbps",c.bitrateKbps),1000.0,500000.0));
+        c.requestDisplayMode=Boolean(object,L"request_display_mode",c.requestDisplayMode);
+        return c;
+    }
+
     JsonObject TestMoveToJson(
         const vanta::TestMoveConfig& config)
     {
         JsonObject result;
+        result.Insert(L"detector",DetectorToJson(config.detector));
         PutBoolean(result, L"enabled", config.enabled);
         PutNumber(result, L"color_target", config.hsvRangeIndex);
         PutNumber(
@@ -928,6 +996,14 @@ namespace
         int schema)
     {
         vanta::TestMoveConfig result = defaults;
+        if (schema >= 8) result.detector=DetectorFromJson(Child(object,L"detector"));
+        else
+        {
+            result.detector.enabled=false;
+            result.detector.aimPointMode=vanta::AimPointMode::boundingBox;
+            result.detector.closingEnabled=false;
+            result.detector.offsetX=result.detector.offsetY=0.0;
+        }
         result.enabled =
             Boolean(object, L"enabled", result.enabled);
         result.hsvRangeIndex =
@@ -1129,6 +1205,7 @@ namespace
         root.Insert(
             L"capture",
             CaptureToJson(config.capture));
+        root.Insert(L"sunshine",SunshineToJson(config.sunshine));
         root.Insert(
             L"mouse_output",
             MouseOutputToJson(config.mouseOutput));
@@ -1179,6 +1256,7 @@ namespace
                 return false;
             }
             result = defaults;
+            if (schema >= 7) result.sunshine=SunshineFromJson(Child(root,L"sunshine"));
             result.capture =
                 CaptureFromJson(
                     Child(root, L"capture"),
@@ -1313,6 +1391,25 @@ namespace
             std::istreambuf_iterator<char>(input),
             std::istreambuf_iterator<char>());
         return input.good() || input.eof();
+    }
+
+    bool BackupBeforeSchemaUpgrade(const std::filesystem::path& path, const int nextSchema)
+    {
+        std::error_code error;
+        if (!std::filesystem::exists(path,error)) return !error;
+        std::string text;
+        if (!ReadText(path,text)) return false;
+        try
+        {
+            const auto object=JsonObject::Parse(winrt::to_hstring(text));
+            const int schema=static_cast<int>(Number(object,L"schema_version",0));
+            if (schema<=0 || schema>=nextSchema) return true;
+            auto backup=path;
+            backup += L".schema-"+std::to_wstring(schema)+L".bak";
+            std::filesystem::copy_file(path,backup,std::filesystem::copy_options::skip_existing,error);
+            return !error;
+        }
+        catch (...) { return false; }
     }
 
     bool AtomicWrite(
@@ -1741,6 +1838,31 @@ namespace vanta
             return finish(false);
         }
         SharedProfile rejectedProfile;
+        SharedProfile schemaSeven;
+        if (!DeserializeProfile("{\"kind\":\"vanta-test-profile\",\"schema_version\":7,"
+                "\"test_move\":{\"target_height_percent\":23,\"merge_proximity\":11}}",
+                schemaSeven,parseError) || schemaSeven.testMove.detector.enabled ||
+            schemaSeven.testMove.detector.aimPointMode != AimPointMode::boundingBox ||
+            schemaSeven.testMove.targetHeightPercent != 23 || schemaSeven.testMove.mergeProximity != 11)
+            return finish(false);
+        SharedProfile detectorProfile;
+        detectorProfile.testMove.detector.closingKernel=7;
+        detectorProfile.testMove.detector.dilationKernel=5;
+        detectorProfile.testMove.detector.offsetX=-3.25;
+        detectorProfile.testMove.detector.orbFillMinimum=.73;
+        SharedProfile detectorDecoded;
+        if (!DeserializeProfile(SerializeProfile(detectorProfile),detectorDecoded,parseError) ||
+            SerializeProfile(detectorDecoded)!=SerializeProfile(detectorProfile) ||
+            !detectorDecoded.testMove.detector.enabled ||
+            detectorDecoded.testMove.detector.aimPointMode!=AimPointMode::maskTop)
+            return finish(false);
+        LocalConfig streamConfig,streamDecoded;
+        streamConfig.sunshine={1920,1080,144,95000,false};
+        if (!DeserializeLocal(SerializeLocal(streamConfig),LocalConfig{},streamDecoded,parseError) ||
+            streamConfig.sunshine!=streamDecoded.sunshine ||
+            LocalConfig{}.sunshine.width!=2560 || LocalConfig{}.sunshine.height!=1440 ||
+            LocalConfig{}.sunshine.fps!=120 || LocalConfig{}.sunshine.bitrateKbps!=150000)
+            return finish(false);
         SharedProfile legacyProfile;
         if (!DeserializeProfile(
                 "{\"kind\":\"vanta-test-profile\","
@@ -1776,6 +1898,17 @@ namespace vanta
             return finish(false);
         }
 
+        const auto oldProfilePath=testDirectory/L"legacy-profile.json";
+        const std::string oldProfile="{\"kind\":\"vanta-test-profile\",\"schema_version\":7}";
+        if (!AtomicWrite(oldProfilePath,oldProfile,changed) ||
+            !BackupBeforeSchemaUpgrade(oldProfilePath,SharedProfile::schemaVersion)) return finish(false);
+        std::string backupText;
+        auto backupPath=oldProfilePath;
+        backupPath+=L".schema-7.bak";
+        if (!ReadText(backupPath,backupText) || backupText!=oldProfile) return finish(false);
+        if (!AtomicWrite(oldProfilePath,SerializeProfile(detectorProfile),changed) ||
+            !BackupBeforeSchemaUpgrade(oldProfilePath,SharedProfile::schemaVersion) ||
+            !ReadText(backupPath,backupText) || backupText!=oldProfile) return finish(false);
         return finish(true);
     }
 
@@ -1798,6 +1931,7 @@ namespace vanta
         std::uint64_t bombTimerRevision{};
         std::uint64_t updateRevision{};
         std::uint64_t menuRevision{};
+        std::uint64_t sunshineRevision{};
 
         bool SaveLocalConfig(
             const LocalConfig& config)
@@ -1807,6 +1941,11 @@ namespace vanta
                 return true;
             }
             bool changed = false;
+            if (!BackupBeforeSchemaUpgrade(localPath,LocalConfig::schemaVersion))
+            {
+                status="Could not preserve the older local settings before migration";
+                return false;
+            }
             if (!AtomicWrite(
                     localPath,
                     SerializeLocal(config),
@@ -1894,6 +2033,11 @@ namespace vanta
             bool changed = false;
             const auto path =
                 ProfilePath(profile.name);
+            if (!BackupBeforeSchemaUpgrade(path,SharedProfile::schemaVersion))
+            {
+                status="Could not preserve the older profile before migration";
+                return false;
+            }
             if (!AtomicWrite(
                     path,
                     SerializeProfile(profile),
@@ -2359,7 +2503,8 @@ namespace vanta
         const CaptureController& capture,
         const MakcuController& mouseOutput,
         const BombTimerController& bombTimer,
-        const UpdateController& updates)
+        const UpdateController& updates,
+        const StreamReceiverController& sunshine)
     {
         auto& impl = *implementation_;
         impl.captureRevision =
@@ -2372,13 +2517,15 @@ namespace vanta
             updates.SettingsRevision();
         impl.menuRevision =
             menu::SettingsRevision();
+        impl.sunshineRevision = sunshine.SettingsRevision();
     }
 
     void ConfigManager::AutoSaveLocal(
         const CaptureController& capture,
         const MakcuController& mouseOutput,
         const BombTimerController& bombTimer,
-        const UpdateController& updates)
+        const UpdateController& updates,
+        const StreamReceiverController& sunshine)
     {
         auto& impl = *implementation_;
         if (!impl.enabled)
@@ -2404,12 +2551,13 @@ namespace vanta
             updateRevision ==
                 impl.updateRevision &&
             menuRevision ==
-                impl.menuRevision)
+                impl.menuRevision && sunshine.SettingsRevision() == impl.sunshineRevision)
         {
             return;
         }
 
         LocalConfig current;
+        current.sunshine = sunshine.GetConfig();
         current.capture =
             capture.GetConfig();
         current.mouseOutput =
@@ -2432,6 +2580,7 @@ namespace vanta
                 updateRevision;
             impl.menuRevision =
                 menuRevision;
+            impl.sunshineRevision = sunshine.SettingsRevision();
         }
     }
 

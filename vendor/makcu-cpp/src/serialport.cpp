@@ -1,4 +1,5 @@
 #include "../include/serialport.h"
+#include "host_protocol.hpp"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -143,6 +144,7 @@ void SerialPort::close() {
 
 	// Mark closed so no new I/O starts while we tear down.
 	m_isOpen.store(false, std::memory_order_release);
+	m_binaryCondition.notify_all();
 
 	// Cancel all pending commands with double-checked locking for safety
 	// First pass: mark all commands as cancelled to prevent new promise operations
@@ -261,9 +263,8 @@ std::future<std::string> SerialPort::sendTrackedCommand(const std::string& comma
 	}
 
 	// Send command with ID tracking (shared logic)
-	std::string trackedCommand = expectResponse ?
-	                             command + "#" + std::to_string(cmdId) + "\r\n" :
-	                             command + "\r\n";
+	// V4 does not promise #id correlation; queries use the pending-order queue.
+	std::string trackedCommand = command + "\r\n";
 
 	// Unified write operation
 	ssize_t bytesWritten = platformWrite(trackedCommand.c_str(), trackedCommand.length());
@@ -328,182 +329,60 @@ bool SerialPort::sendCommand(const std::string& command) {
 }
 
 void SerialPort::listenerLoop(std::stop_token stopToken) {
-	// Optimized read buffers (shared logic)
-	std::vector<uint8_t> readBuffer(BUFFER_SIZE);
-	std::vector<uint8_t> lineBuffer(LINE_BUFFER_SIZE);
-	size_t linePos = 0;
-	enum class ButtonPrefixState : uint8_t {
-		NONE,
-		K,
-		KM,
-		KM_DOT
-	};
-	ButtonPrefixState buttonPrefixState = ButtonPrefixState::NONE;
+    protocol::ReplyParser parser;
+    parser.onText = [this](const std::string& line) { processResponse(line); };
+    parser.onButtons = [this](uint8_t mask) { handleButtonData(mask); };
+    parser.onBinary = [this](uint8_t opcode, std::span<const uint8_t> payload) {
+        std::lock_guard lock(m_binaryMutex);
+        if (opcode == m_binaryOpcode && m_binaryOpcode != 0) {
+            m_binaryResponse.assign(payload.begin(),payload.end());
+            m_binaryReady = true;
+            m_binaryCondition.notify_all();
+        }
+    };
+    std::array<uint8_t,BUFFER_SIZE> bytes{};
+    auto lastCleanup=std::chrono::steady_clock::now();
+    while (!stopToken.stop_requested() && m_isOpen.load(std::memory_order_acquire)) {
+        try {
+            const auto availableBytes=platformBytesAvailable();
+            if (availableBytes != 0) {
+                const auto count=platformRead(bytes.data(),std::min(availableBytes,bytes.size()));
+                if (count>0) parser.feed(std::span(bytes).first(static_cast<size_t>(count)));
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+            const auto now=std::chrono::steady_clock::now();
+            if (now-lastCleanup>=std::chrono::milliseconds(50)) {
+                cleanupTimedOutCommands();
+                lastCleanup=now;
+            }
+        } catch (...) {
+            if (!m_isOpen.load(std::memory_order_acquire)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+}
 
-	auto lastCleanup = std::chrono::steady_clock::now();
-	constexpr auto cleanupInterval = std::chrono::milliseconds(50);
-
-	auto appendTextByte = [&](uint8_t byte) {
-		if (byte == 0x0A) { // Line feed
-			if (linePos > 0) {
-				std::string line(lineBuffer.begin(), lineBuffer.begin() + linePos);
-				linePos = 0;
-				if (!line.empty()) {
-					processResponse(line);
-				}
-			}
-			return;
-		}
-
-		if (byte == 0x0D) { // Ignore carriage return
-			return;
-		}
-
-		if (linePos < LINE_BUFFER_SIZE - 1) {
-			lineBuffer[linePos++] = byte;
-			return;
-		}
-
-		// Buffer overflow protection - discard line and reset.
-#ifdef DEBUG
-		std::cerr << "SerialPort: Line buffer overflow, discarding data" << std::endl;
-#endif
-		linePos = 0;
-		buttonPrefixState = ButtonPrefixState::NONE;
-	};
-
-	while (!stopToken.stop_requested() && m_isOpen.load(std::memory_order_acquire)) {
-		try {
-			// Unified bytes available check
-			size_t bytesAvailable = platformBytesAvailable();
-			if (bytesAvailable == 0) {
-				std::this_thread::sleep_for(std::chrono::microseconds(500));
-				continue;
-			}
-
-			// Unified read operation
-			size_t bytesToRead = std::min<size_t>(bytesAvailable, static_cast<size_t>(BUFFER_SIZE));
-			ssize_t bytesRead = platformRead(readBuffer.data(), bytesToRead);
-
-			if (bytesRead <= 0) {
-				std::this_thread::sleep_for(std::chrono::milliseconds(1));
-				continue;
-			}
-
-			// Shared byte processing logic
-			for (ssize_t i = 0; i < bytesRead; ++i) {
-				const uint8_t byte = readBuffer[i];
-				bool consumed = false;
-
-				auto flushPrefixAsText = [&]() {
-					switch (buttonPrefixState) {
-						case ButtonPrefixState::K:
-							appendTextByte('k');
-							break;
-						case ButtonPrefixState::KM:
-							appendTextByte('k');
-							appendTextByte('m');
-							break;
-						case ButtonPrefixState::KM_DOT:
-							appendTextByte('k');
-							appendTextByte('m');
-							appendTextByte('.');
-							break;
-						case ButtonPrefixState::NONE:
-						default:
-							break;
-					}
-					buttonPrefixState = ButtonPrefixState::NONE;
-				};
-
-				// Button packets are "km." followed by a mask byte (< 0x20).
-				// They can arrive between command-response bytes, including after
-				// the firmware's ">>> " prompt.  Do not restrict detection to the
-				// start of a text line or normal command traffic will hide physical
-				// left/right/side-button events.
-				switch (buttonPrefixState) {
-					case ButtonPrefixState::NONE:
-						if (byte == 'k') {
-							buttonPrefixState = ButtonPrefixState::K;
-							consumed = true;
-						}
-						break;
-					case ButtonPrefixState::K:
-						if (byte == 'm') {
-							buttonPrefixState = ButtonPrefixState::KM;
-							consumed = true;
-						}
-						else {
-							flushPrefixAsText();
-						}
-						break;
-					case ButtonPrefixState::KM:
-						if (byte == '.') {
-							buttonPrefixState = ButtonPrefixState::KM_DOT;
-							consumed = true;
-						}
-						else {
-							flushPrefixAsText();
-						}
-						break;
-					case ButtonPrefixState::KM_DOT:
-						if (byte < 32) {
-							handleButtonData(byte);
-							buttonPrefixState = ButtonPrefixState::NONE;
-							consumed = true;
-						}
-						else {
-							flushPrefixAsText();
-						}
-						break;
-				}
-
-				if (consumed) {
-					continue;
-				}
-
-				appendTextByte(byte);
-			}
-
-			// Periodic cleanup of timed-out commands (shared logic)
-			auto now = std::chrono::steady_clock::now();
-			if (now - lastCleanup > cleanupInterval) {
-				cleanupTimedOutCommands();
-				lastCleanup = now;
-			}
-
-		}
-		catch (const std::exception& e) {
-			// Log specific exception for debugging but continue running
-			// In production, you might want to use a proper logging framework
-#ifdef DEBUG
-			std::cerr << "SerialPort listener exception: " << e.what() << std::endl;
-#endif
-
-			// Brief pause to prevent tight exception loops
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
-			// Check if port is still open after exception
-			if (!m_isOpen.load(std::memory_order_acquire)) {
-				// Port was closed, exit gracefully
-				break;
-			}
-		}
-		catch (...) {
-			// Unknown exception - be more cautious
-#ifdef DEBUG
-			std::cerr << "SerialPort listener unknown exception" << std::endl;
-#endif
-
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-			// Check if port is still open after unknown exception
-			if (!m_isOpen.load(std::memory_order_acquire)) {
-				// Port was closed, exit gracefully
-				break;
-			}
-		}
-	}
+std::vector<uint8_t> SerialPort::queryBinary(uint8_t opcode, std::chrono::milliseconds timeout) {
+    std::lock_guard request(m_binaryQueryMutex);
+    if (!isOpen()) return {};
+    {
+        std::lock_guard lock(m_binaryMutex);
+        m_binaryOpcode=opcode;
+        m_binaryReady=false;
+        m_binaryResponse.clear();
+    }
+    const std::array<uint8_t,5> frame{0xDE,0xAD,0,0,opcode};
+    if (!write(std::span(frame))) {
+        std::lock_guard lock(m_binaryMutex);
+        m_binaryOpcode=0;
+        return {};
+    }
+    std::unique_lock lock(m_binaryMutex);
+    const bool received=m_binaryCondition.wait_for(lock,timeout,
+        [this] { return m_binaryReady || !m_isOpen.load(std::memory_order_acquire); });
+    m_binaryOpcode=0;
+    return received && m_binaryReady ? m_binaryResponse : std::vector<uint8_t>{};
 }
 
 void SerialPort::handleButtonData(uint8_t data) {
@@ -584,6 +463,10 @@ void SerialPort::processResponse(const std::string& response) {
 			continue;
 		}
 		try {
+			if (protocol::IsEchoOrPrompt(untrackedContent,it->second->command)) {
+				m_pendingCommandOrder.push_front(cmdId);
+				return;
+			}
 			it->second->promise.set_value(untrackedContent);
 		}
 		catch (...) {

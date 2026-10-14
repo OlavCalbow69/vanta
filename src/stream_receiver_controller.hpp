@@ -1,4 +1,5 @@
 #pragma once
+#include "app_settings.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -39,7 +40,9 @@ namespace vanta
         StreamReceiverController(const StreamReceiverController&) = delete;
         StreamReceiverController& operator=(const StreamReceiverController&) = delete;
 
-        void Initialize(ID3D11Device* device);
+        void Initialize(ID3D11Device* device, const SunshineStreamConfig* config = nullptr);
+        SunshineStreamConfig GetConfig() const;
+        std::uint64_t SettingsRevision() const noexcept;
         void Tick();
         void RenderPanel();
         void Shutdown();

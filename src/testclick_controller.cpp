@@ -163,7 +163,8 @@ namespace
         int cy,
         int rayLength,
         int rayHalf,
-        int requiredHits)
+        int requiredHits,
+        bool applyBlacklist)
     {
         RayResults res;
         const auto& bl = Blacklist();
@@ -188,7 +189,7 @@ namespace
                 if (mRow[x] != 0)
                 {
                     const auto& px = cRow[x];
-                    if (!bl.count(BgrKey(px[0], px[1], px[2])))
+                    if (!applyBlacklist || !bl.count(BgrKey(px[0], px[1], px[2])))
                     {
                         res.hitUp = true;
                         break;
@@ -217,7 +218,7 @@ namespace
                 if (mask.ptr<std::uint8_t>(y)[x] != 0)
                 {
                     const auto& px = bgr.ptr<cv::Vec3b>(y)[x];
-                    if (!bl.count(BgrKey(px[0], px[1], px[2])))
+                    if (!applyBlacklist || !bl.count(BgrKey(px[0], px[1], px[2])))
                     {
                         res.hitLeft = true;
                         break;
@@ -246,7 +247,7 @@ namespace
                 if (mask.ptr<std::uint8_t>(y)[x] != 0)
                 {
                     const auto& px = bgr.ptr<cv::Vec3b>(y)[x];
-                    if (!bl.count(BgrKey(px[0], px[1], px[2])))
+                    if (!applyBlacklist || !bl.count(BgrKey(px[0], px[1], px[2])))
                     {
                         res.hitRight = true;
                         break;
@@ -418,33 +419,14 @@ namespace vanta
                     bgrRoi,
                     hsv,
                     cv::COLOR_BGR2HSV);
-                const auto& hsvRange =
-                    vanta::kHsvColorTargets[
-                        static_cast<std::size_t>(
-                        std::clamp(
-                            snapHsvRange,
-                            0,
-                            static_cast<int>(
-                                vanta::kHsvColorTargets.size()) - 1))];
-                cv::inRange(
-                    hsv,
-                    cv::Scalar(
-                        hsvRange.lower[0],
-                        hsvRange.lower[1],
-                        hsvRange.lower[2]),
-                    cv::Scalar(
-                        hsvRange.upper[0],
-                        hsvRange.upper[1],
-                        hsvRange.upper[2]),
-                    mask);
+                vanta::BuildHsvMask(hsv, snapHsvRange, mask);
 
                 const double diagnosticTime = NowSeconds();
                 if (diagnosticTime >= nextPixelSampleTime)
                 {
-                    matchingPixels.store(
-                        RemoveBlacklistedAndCount(
-                            bgrRoi,
-                            mask));
+                    matchingPixels.store(vanta::ColorTarget(snapHsvRange).purpleBlacklist
+                        ? RemoveBlacklistedAndCount(bgrRoi, mask)
+                        : cv::countNonZero(mask));
                     nextPixelSampleTime =
                         diagnosticTime + 0.10;
                 }
@@ -462,7 +444,8 @@ namespace vanta
                     lcy,
                     effectiveRayLength,
                     snapRayHalf,
-                    requiredHits);
+                    requiredHits,
+                    vanta::ColorTarget(snapHsvRange).purpleBlacklist);
 
                 hitUpState.store(rays.hitUp);
                 hitLeftState.store(rays.hitLeft);

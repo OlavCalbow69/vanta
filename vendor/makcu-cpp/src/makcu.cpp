@@ -1,5 +1,7 @@
 #include "../include/makcu.h"
 #include "../include/serialport.h"
+#include "host_protocol.hpp"
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -174,6 +176,7 @@ namespace makcu {
     public:
         std::unique_ptr<SerialPort> serialPort;
         DeviceInfo deviceInfo;
+        std::string firmwareVersion;
         std::atomic<ConnectionStatus> atomicStatus{ConnectionStatus::DISCONNECTED};
         std::atomic<bool> connected;
         std::atomic<bool> highPerformanceMode;
@@ -627,63 +630,54 @@ namespace makcu {
 
         m_impl->atomicStatus.store(ConnectionStatus::CONNECTING, std::memory_order_release);
 
-        // Open at initial baud rate
-        if (!m_impl->serialPort->open(targetPort, INITIAL_BAUD_RATE)) {
-            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-            m_impl->setLastError("Serial port open failed: " + m_impl->serialPort->getLastError());
+        protocol::ProbeOperations operations;
+        operations.open = [&](uint32_t baud) {
+            if (!m_impl->serialPort->open(targetPort,baud)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            return true;
+        };
+        operations.close = [&] { m_impl->serialPort->close(); };
+        operations.identity = [&]() -> std::string {
+            for (int attempt=0;attempt<2;++attempt) {
+                try {
+                    auto response=m_impl->serialPort->sendTrackedCommand("km.version()",true,
+                        std::chrono::milliseconds(250));
+                    const auto identity=response.get();
+                    if (identity.starts_with("km.MAKCU")) return identity;
+                } catch (...) {}
+            }
+            return {};
+        };
+        operations.firmware = [&] {
+            return protocol::FirmwareInteger(m_impl->serialPort->queryBinary(0x04));
+        };
+        operations.switchToFast = [&](bool textBaud) {
+            bool sent=false;
+            if (textBaud) sent=m_impl->serialPort->sendCommand("km.baud(4000000)");
+            else {
+                const std::array<uint8_t,9> frame{0xDE,0xAD,5,0,0xA5,0,9,0x3D,0};
+                sent=m_impl->serialPort->write(std::span(frame)) && m_impl->serialPort->flush();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            return sent;
+        };
+        protocol::ProbeResult result;
+        if (!protocol::ProbeConnection(operations,highSpeed,result)) {
+            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR,std::memory_order_release);
+            m_impl->setLastError("MAKCU identity/firmware handshake failed at 4000000 and 115200 baud");
             return false;
         }
-
-        // Switch to high-speed mode if requested
-        if (highSpeed && !Impl::performBaudRateChange(m_impl->serialPort.get(), HIGH_SPEED_BAUD_RATE))
-        {
-            m_impl->serialPort->close();
-            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-            m_impl->deviceInfo.isConnected = false;
-            return false;
+        m_impl->firmwareVersion=result.identity + " (numeric firmware unavailable)";
+        if (result.firmware>=4000 && result.firmware<5000) {
+            std::ostringstream version;
+            version << result.firmware/1000 << '.' << std::setw(3) << std::setfill('0')
+                    << result.firmware%1000;
+            m_impl->firmwareVersion=version.str();
         }
-
-        // Validate connection after baud rate switch
-        if (!m_impl->serialPort->isOpen() || !m_impl->serialPort->isActuallyConnected()) {
-            m_impl->setLastError("Serial port not opened or connected!");
-            m_impl->serialPort->close();
-            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-            m_impl->deviceInfo.isConnected = false;
-            return false;
-        }
-
-        // Initialize device
+        // Streams are enabled only after both discovery and the final reopen.
         if (!m_impl->initializeDevice()) {
             m_impl->serialPort->close();
-            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-            m_impl->deviceInfo.isConnected = false;
-            return false;
-        }
-
-        // Final validation that device is responsive
-        try {
-            // Test device responsiveness with a simple command
-            auto future = m_impl->serialPort->sendTrackedCommand("km.version()", true, 
-                std::chrono::milliseconds(100));
-            
-            // Wait for response with timeout
-            if (future.wait_for(std::chrono::milliseconds(150)) == std::future_status::timeout) {
-                m_impl->setLastError("Device connection response timeout!");
-                m_impl->serialPort->close();
-                m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-                m_impl->deviceInfo.isConnected = false;
-                return false;
-            }
-            
-            // Get the result to ensure no exception
-            future.get();
-        }
-        catch (...) {
-            // Device not responding properly
-            m_impl->setLastError("Device not responding properly!");
-            m_impl->serialPort->close();
-            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR, std::memory_order_release);
-            m_impl->deviceInfo.isConnected = false;
+            m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR,std::memory_order_release);
             return false;
         }
 
@@ -767,6 +761,7 @@ namespace makcu {
 
             // Always close the serial port if it is still open.
             if (m_impl->serialPort->isOpen()) {
+                if (shouldNotify) static_cast<void>(m_impl->serialPort->sendCommand("km.buttons(0)"));
                 m_impl->serialPort->close();
             }
 
@@ -799,9 +794,11 @@ namespace makcu {
     }
 
     std::string Device::getVersion() const {
+        std::lock_guard lock(m_impl->mutex);
         if (!m_impl->connected.load()) {
             return "";
         }
+        if (!m_impl->firmwareVersion.empty()) return m_impl->firmwareVersion;
 
         // Retry with escalating timeouts to tolerate temporary instability
         // immediately after a baud-rate transition.

@@ -57,6 +57,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -83,6 +84,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -106,6 +108,7 @@
     <ClCompile Include="src\config_manager.cpp" />
     <ClCompile Include="src\logger.cpp" />
     <ClCompile Include="src\makcu_controller.cpp" />
+    <ClCompile Include="src\makcu_protocol_self_test.cpp" />
     <ClCompile Include="src\overlay_app.cpp" />
     <ClCompile Include="src\pretty_menu.cpp" />
     <ClCompile Include="src\rp2040_controller.cpp" />
@@ -116,6 +119,9 @@
     <ClCompile Include="src\stream_receiver_controller.cpp" />
     <ClCompile Include="src\testclick_controller.cpp" />
     <ClCompile Include="src\testmove_controller.cpp" />
+    <ClCompile Include="src\color_targets.cpp" />
+    <ClCompile Include="src\target_detection.cpp" />
+    <ClCompile Include="src\target_detection_ui.cpp" />
     <ClCompile Include="src\update_controller.cpp" />
     <ClCompile Include="src\update_shared.cpp" />
     <ClCompile Include="vendor\makcu-cpp\src\makcu.cpp">
@@ -145,6 +151,8 @@
     <ClInclude Include="src\bomb_timer_controller.hpp" />
     <ClInclude Include="src\config_manager.hpp" />
     <ClInclude Include="src\color_targets.hpp" />
+    <ClInclude Include="src\target_detection.hpp" />
+    <ClInclude Include="src\target_detection_ui.hpp" />
     <ClInclude Include="src\logger.hpp" />
     <ClInclude Include="src\makcu_controller.hpp" />
     <ClInclude Include="src\capture_controller.hpp" />
@@ -177,6 +185,7 @@
     <ClInclude Include="vendor\makcu-cpp\include\makcu.h" />
     <ClInclude Include="vendor\makcu-cpp\include\makcu_c.h" />
     <ClInclude Include="vendor\makcu-cpp\include\serialport.h" />
+    <ClInclude Include="vendor\makcu-cpp\include\host_protocol.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="resources\vanta_exe.rc" />

@@ -30,6 +30,7 @@
 #include <chrono>
 #include <span>
 #include <stop_token>
+#include <condition_variable>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -82,6 +83,8 @@ namespace makcu {
 
         // Fast fire-and-forget commands
         [[nodiscard]] bool sendCommand(const std::string& command);
+        std::vector<uint8_t> queryBinary(uint8_t opcode,
+            std::chrono::milliseconds timeout = std::chrono::milliseconds(250));
 
         // Legacy methods for compatibility
         [[nodiscard]] bool write(std::span<const uint8_t> data);
@@ -134,6 +137,12 @@ namespace makcu {
         std::unordered_map<int, std::unique_ptr<PendingCommand>> m_pendingCommands;
         std::deque<int> m_pendingCommandOrder;
         std::mutex m_commandMutex;
+        std::mutex m_binaryQueryMutex;
+        std::mutex m_binaryMutex;
+        std::condition_variable m_binaryCondition;
+        uint8_t m_binaryOpcode{};
+        bool m_binaryReady{};
+        std::vector<uint8_t> m_binaryResponse;
 
         // High-performance listener thread
         std::jthread m_listenerThread;

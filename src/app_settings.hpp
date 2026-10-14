@@ -126,6 +126,59 @@ namespace vanta
         float widgetPositionY{};
     };
 
+    struct SunshineStreamConfig
+    {
+        int width{2560};
+        int height{1440};
+        int fps{120};
+        int bitrateKbps{150000};
+        bool requestDisplayMode{true};
+        bool operator==(const SunshineStreamConfig&) const = default;
+    };
+
+    enum class AimPointMode : int { boundingBox = 0, maskTop = 1 };
+
+    // Lengths/areas are reference-frame pixels, independent of the ROI crop.
+    // Morphology kernels are always actual decoded pixels.
+    struct TargetDetectionConfig
+    {
+        bool enabled{true};
+        int referenceWidth{2560};
+        int referenceHeight{1440};
+        bool areaFilter{true};
+        double minimumArea{5.0};
+        double maximumArea{3500.0};
+        bool widthFilter{true};
+        double minimumWidth{1.0};
+        double maximumWidth{160.0};
+        bool heightFilter{true};
+        double minimumHeight{1.0};
+        double maximumHeight{240.0};
+        bool aspectFilter{true};
+        double minimumAspect{0.0};
+        double maximumAspect{100.0};
+        bool solidityFilter{true};
+        double minimumSolidity{0.0};
+        double maximumSolidity{1.0};
+        bool flatFilter{true};
+        double flatAspectMaximum{0.25};
+        double flatMinimumWidth{27.0};
+        bool orbFilter{true};
+        double orbAspectMinimum{0.70};
+        double orbAspectMaximum{1.25};
+        double orbMinimumWidth{20.0};
+        double orbFillMinimum{0.65};
+        double orbSolidityMinimum{0.90};
+        bool closingEnabled{true};
+        int closingKernel{3};
+        int dilationKernel{3};
+        double mergeProximity{16.0};
+        AimPointMode aimPointMode{AimPointMode::maskTop};
+        int topRows{4};
+        double offsetX{1.0};
+        double offsetY{7.0};
+    };
+
     struct TestClickConfig
     {
         bool enabled{};
@@ -145,6 +198,7 @@ namespace vanta
     struct TestMoveConfig
     {
         bool enabled{};
+        TargetDetectionConfig detector;
         int hsvRangeIndex{};
         MouseButtonBinding aimButton{
             MouseButtonBinding::left};
@@ -232,8 +286,9 @@ namespace vanta
 
     struct LocalConfig
     {
-        static constexpr int schemaVersion = 6;
+        static constexpr int schemaVersion = 7;
         CaptureConfig capture;
+        SunshineStreamConfig sunshine;
         MouseOutputConfig mouseOutput;
         UpdateConfig updates;
         BombTimerConfig bombTimer;
@@ -242,7 +297,7 @@ namespace vanta
 
     struct SharedProfile
     {
-        static constexpr int schemaVersion = 7;
+        static constexpr int schemaVersion = 8;
         std::string name;
         TestClickConfig testClick;
         TestMoveConfig testMove;

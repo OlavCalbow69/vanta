@@ -13,6 +13,15 @@ namespace cv { class Mat; }
 
 namespace vanta
 {
+    struct CapturedFrameMetadata
+    {
+        std::uint64_t sequence{};
+        std::int64_t captureTimestampNanoseconds{};
+        int sourceWidth{};
+        int sourceHeight{};
+        int cropX{};
+        int cropY{};
+    };
     bool RunSunshineCaptureSourceSelfTest();
 
     // Supplies a new CPU BGRA frame after the caller's last consumed source
@@ -77,6 +86,11 @@ namespace vanta
             cv::Mat& out,
             std::uint64_t& sequence,
             std::int64_t& captureTimestampNanoseconds,
+            std::uint32_t timeoutMilliseconds) const;
+        bool WaitForCenteredFrameWithMetadata(
+            std::uint64_t afterSequence,
+            cv::Mat& out,
+            CapturedFrameMetadata& metadata,
             std::uint32_t timeoutMilliseconds) const;
         void SetAuxiliaryNormalizedRegion(
             const NormalizedCaptureRegion& region);

@@ -30,3 +30,14 @@ Vanta and Moonlight common-c statically link OpenSSL built by the bootstrap
 script through vcpkg. OpenSSL is licensed under Apache-2.0; vcpkg installs its
 full text at `work/vcpkg/installed/x64-windows-static/share/openssl/copyright`.
 The release workflow includes that text in the binary bundle.
+
+## Microsoft Visual C++ runtime
+
+OpenCV imports Microsoft's release C++ runtime. Binary packages include the
+official x64 CRT DLLs from the build machine's licensed Visual Studio Redist
+directory as app-local dependencies, not Debug CRT or System32 copies.
+These components remain Microsoft software under its redistribution terms;
+the Visual Studio redistribution notice is included in the package's licenses
+directory. See [Microsoft's deployment documentation](https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files).
+App-local runtimes must be updated when repackaging; Microsoft recommends
+centrally installed redistributables for independent servicing.

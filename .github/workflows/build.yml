@@ -121,6 +121,16 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      - name: Verify stable detector and serial compatibility
+        shell: pwsh
+        run: |
+          foreach ($configuration in @('Debug','Release')) {
+            foreach ($check in @('--detector-self-test','--detector-ui-self-test','--config-self-test','--makcu-self-test')) {
+              & ".\build\$configuration\vanta.exe" $check
+              if ($LASTEXITCODE -ne 0) { throw "$configuration $check failed" }
+            }
+          }
+
       - name: Verify and package runtime bundle
         shell: pwsh
         run: |
@@ -129,6 +139,7 @@ jobs:
             'build\Release\vanta-updater.exe',
             'build\Release\opencv_world500.dll',
             'README.md',
+            'README-DETECTOR.md',
             'LICENSE',
             'NOTICE.md'
           )
@@ -150,6 +161,7 @@ jobs:
           foreach ($file in $runtimeFiles) {
             Copy-Item -LiteralPath $file -Destination $stage
           }
+          .\scripts\copy-vc-runtime.ps1 -Destination $stage
           foreach ($licenseFile in $thirdPartyLicenseFiles) {
             Copy-Item -LiteralPath $licenseFile.Source -Destination (Join-Path $stage $licenseFile.Destination)
           }
