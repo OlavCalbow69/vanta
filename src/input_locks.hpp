@@ -10,6 +10,9 @@
 namespace vanta
 {
     enum class InputOwner : std::uint8_t { manual,python,testMove,testClick };
+    // Only a native event may provide an edge. A cached/full state read alone
+    // never establishes that a held button was freshly pressed.
+    enum class PhysicalButtonEdge : std::uint8_t { snapshot,press,release };
     struct OutputContext
     {
         InputOwner owner{InputOwner::manual};
@@ -87,7 +90,7 @@ namespace vanta
         void FinishRecovery(bool clean);
         void Configure(const MouseOutputConfig& config);
         void SetPolicy(InputOwner owner,bool enabled,std::uint64_t generation,MouseButtonBinding activation);
-        void PhysicalButtons(std::uint8_t mask) noexcept;
+        void PhysicalButtons(std::uint8_t mask,PhysicalButtonEdge edge=PhysicalButtonEdge::snapshot) noexcept;
         void PhysicalButton(MouseButtonBinding button,bool pressed) noexcept;
         bool TryMove(int x,int y,const OutputContext& context);
         bool TryClick(const OutputContext& context,int holdMilliseconds);

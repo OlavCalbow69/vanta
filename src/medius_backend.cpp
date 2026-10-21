@@ -35,6 +35,28 @@ namespace vanta
         }
         std::string LastMediusError(){std::array<char,1024> text{};medius_last_error_message(text.data(),text.size());return text.data();}
         bool Firmware346(const MediusChipFirmware& f){return f.major==3 && f.minor==4 && f.patch==6;}
+        bool DecodeNativeButtons(const MediusCatchEvent& event,std::uint8_t& mask,PhysicalButtonEdge& edge)
+        {
+            if(event.kind!=MEDIUS_CATCH_EVENT_KIND_USAGES || event.clock!=MEDIUS_CLOCK_DOMAIN_HOST_CHIP)return false;
+            const auto& snapshot=event.data.usages;
+            if(snapshot.class_!=MEDIUS_CLASS_BUTTON || snapshot.n>MEDIUS_MAX_USAGES ||
+                (snapshot.direction!=MEDIUS_DIRECTION_POSITIVE && snapshot.direction!=MEDIUS_DIRECTION_NEGATIVE) ||
+                (snapshot.direction==MEDIUS_DIRECTION_POSITIVE && !snapshot.n))return false;
+            mask=0;bool hasOtherButtons{};
+            for(unsigned i=0;i<snapshot.n;++i)
+            {
+                const auto& usage=snapshot.usages[i];if(usage.kind!=MEDIUS_CLASS_BUTTON)return false;
+                if(usage.id>=5){hasOtherButtons=true;continue;}
+                const auto bit=static_cast<std::uint8_t>(1U<<usage.id);
+                if(mask&bit)return false;
+                mask|=bit;
+            }
+            edge=snapshot.direction==MEDIUS_DIRECTION_POSITIVE?PhysicalButtonEdge::press:PhysicalButtonEdge::release;
+            // A native button outside Vanta's five-button model may have caused
+            // POS. Do not misidentify an already held activation as that press.
+            if(hasOtherButtons)edge=PhysicalButtonEdge::snapshot;
+            return true;
+        }
         std::string FirmwareText(const MediusChipFirmware& f)
         {return std::to_string(f.major)+'.'+std::to_string(f.minor)+'.'+std::to_string(f.patch);}
         bool DecodeMasks(const MediusLocks& locks,const MediusBearing& bearing,InputMaskReadback& snapshot)
@@ -156,7 +178,7 @@ namespace vanta
         std::jthread maintenance,buttonReader;std::atomic_bool healthy{false},armed{false},connectCancelled{false};
         bool optionsOwned{},fusePrepared{},moving{},motionPending{},clickActive{},clickCompleted{},clickAborted{};
         OutputContext context;
-        MediusRecoverySettings saved;std::function<void(std::uint8_t)> buttons;
+        MediusRecoverySettings saved;std::function<void(std::uint8_t,PhysicalButtonEdge)> buttons;
         std::string identity,status="Medius disconnected",deviceFirmware="unknown",hostFirmware="unknown",lastFailure;
         std::uint64_t lastFailureUs{};unsigned protocol{},nativePeriodUs{},pollPeriodUs{};bool rateConfirmed{};
         MediusCaps capabilities{};MediusStats baseline{};std::uint16_t session{};
@@ -243,13 +265,13 @@ namespace vanta
                 MediusCatchEvent event{};
                 if(!medius_event_stream_recv_timeout(events,20,&event))
                 {if(!medius_event_stream_is_connected(events) && !stop.stop_requested()){Fail("Physical-button event stream disconnected");break;}continue;}
-                if(event.kind!=MEDIUS_CATCH_EVENT_KIND_USAGES)continue;
-                const auto& usages=event.data.usages;if(usages.class_!=MEDIUS_CLASS_BUTTON)continue;
-                std::uint8_t mask{};for(unsigned i=0;i<usages.n;++i)
-                    if(usages.usages[i].id<5)mask|=static_cast<std::uint8_t>(1U<<usages.usages[i].id);
-                if(buttons)buttons(mask);
                 const auto dropped=medius_event_stream_dropped(events);
                 if(dropped!=inputDrops.exchange(dropped)){Fail("Physical input monitoring lost events; automation cancelled");break;}
+                if(event.kind!=MEDIUS_CATCH_EVENT_KIND_USAGES)continue;
+                const auto& usages=event.data.usages;if(usages.class_!=MEDIUS_CLASS_BUTTON)continue;
+                std::uint8_t mask{};PhysicalButtonEdge edge{};
+                if(!DecodeNativeButtons(event,mask,edge)){Fail("Invalid native physical-button snapshot; automation cancelled");break;}
+                if(buttons)buttons(mask,edge);
             }
         }
     };
@@ -263,7 +285,8 @@ namespace vanta
         const auto n=medius_find_ports(ports.data(),ports.size(),&total);
         for(std::uintptr_t i=0;i<std::min<std::uintptr_t>(n,ports.size());++i)out.emplace_back(ports[i].path);return out;
     }
-    bool MediusBackend::Open(const std::string& port,const MouseOutputConfig& /*settings*/,std::function<void(std::uint8_t)> buttons,std::string& error)
+    bool MediusBackend::Open(const std::string& port,const MouseOutputConfig& /*settings*/,
+        std::function<void(std::uint8_t,PhysicalButtonEdge)> buttons,std::string& error)
     {
         Close();auto& s=*state_;s.inputDrops=0;
         if(s.connectCancelled){error="Medius connection cancelled";return false;}
@@ -584,6 +607,24 @@ namespace vanta
     bool MediusBackend::RunSelfTest()
     {
         // Opt-in checks compiled into Vanta, never run by the compile-only build.
+        MediusCatchEvent native{};native.kind=MEDIUS_CATCH_EVENT_KIND_USAGES;native.clock=MEDIUS_CLOCK_DOMAIN_HOST_CHIP;
+        auto& buttons=native.data.usages;buttons.class_=MEDIUS_CLASS_BUTTON;buttons.direction=MEDIUS_DIRECTION_POSITIVE;
+        buttons.n=1;buttons.usages[0]=medius_usage_button(MEDIUS_BUTTON_SIDE1);
+        std::uint8_t mask{};PhysicalButtonEdge edge{};
+        if(!DecodeNativeButtons(native,mask,edge) || mask!=8 || edge!=PhysicalButtonEdge::press)return false;
+        buttons.n=0;buttons.direction=MEDIUS_DIRECTION_NEGATIVE;
+        if(!DecodeNativeButtons(native,mask,edge) || mask || edge!=PhysicalButtonEdge::release)return false;
+        buttons.direction=MEDIUS_DIRECTION_POSITIVE;if(DecodeNativeButtons(native,mask,edge))return false;
+        buttons.n=2;buttons.usages[1]=medius_usage_button(MEDIUS_BUTTON_LEFT);
+        if(!DecodeNativeButtons(native,mask,edge) || mask!=9 || edge!=PhysicalButtonEdge::press)return false;
+        buttons.usages[1].id=6;
+        if(!DecodeNativeButtons(native,mask,edge) || mask!=8 || edge!=PhysicalButtonEdge::snapshot)return false;
+        buttons.usages[1]=buttons.usages[0];if(DecodeNativeButtons(native,mask,edge))return false;
+        buttons.n=1;buttons.direction=0;if(DecodeNativeButtons(native,mask,edge))return false;
+        buttons.direction=MEDIUS_DIRECTION_POSITIVE;native.clock=MEDIUS_CLOCK_DOMAIN_DEVICE_CHIP;
+        if(DecodeNativeButtons(native,mask,edge))return false;
+        native.clock=MEDIUS_CLOCK_DOMAIN_HOST_CHIP;buttons.usages[0].kind=1;
+        if(DecodeNativeButtons(native,mask,edge))return false;
         MediusLocks table{};MediusBearing bearing{};bearing.window_ms=kFuseBearingWindowMs;bearing.mode=MEDIUS_BEARING_MODE_PER_AXIS;
         InputMaskReadback actual;
         if(!DecodeMasks(table,bearing,actual) || actual.passthroughMask!=InputManagedLocks)return false;

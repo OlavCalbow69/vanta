@@ -83,6 +83,11 @@ Mouse Output has three saved options, all enabled by default:
 Initial connection, reconnection and emergency release require a newly observed
 released state followed by a press before automated output can resume. Release
 and press the activation button if the first held press does not activate.
+For Medius, a genuine native positive edge identifying one newly pressed button
+also establishes its preceding released state when an initial snapshot was
+missing. Cached held state never provides this evidence; ambiguous initially held
+buttons must be released first. A button held through emergency release stays
+blocked until a real release and new press. Stock cached-mask behavior is retained.
 An already forwarded button press cannot be erased by enabling a mask later.
 Removing a mask restores the real button's current state; disabling a reservation
 while physically holding that button may therefore expose its held state to the

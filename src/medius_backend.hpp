@@ -25,7 +25,7 @@ namespace vanta
         void PrepareConnection();
         void CancelConnection();
         bool Open(const std::string& port,const MouseOutputConfig& settings,
-            std::function<void(std::uint8_t)> buttons,std::string& error);
+            std::function<void(std::uint8_t,PhysicalButtonEdge)> buttons,std::string& error);
         bool Arm(std::string& error);
         bool Close();
         bool Lock(std::uint32_t bit,bool enabled);

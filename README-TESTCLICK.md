@@ -1,4 +1,20 @@
-# TestClick repeat update — 1.1.0.14
+# TestClick — 1.1.0.15
+
+Build 1.1.0.15 fixes a Medius activation gate that could report **Release and press
+activation after connecting or emergency release** even for the first genuine
+press after connection. Medius sends button-class changes, so a released baseline
+may never have arrived. Vanta now carries the native press/release direction into
+the input coordinator. An unambiguous newly pressed button supplies the missing
+evidence that it was released immediately before that native edge.
+
+A held or cached snapshot alone still cannot arm output. Multiple initially held
+buttons stay conservative when the changed button cannot be identified. A button
+that stays held through emergency release still needs a real release and press;
+re-enabling a feature alone does not resume it. Native events for buttons outside
+Vanta's five-button model cannot be mistaken for a new activation press.
+
+On an older build, fully release the activation button and press it again after
+connection. That satisfies the existing gate when its release event is received.
 
 TestClick requests a new left click after the previous press/release completes,
 while its physical activation button stays held and a fresh captured frame
@@ -55,7 +71,7 @@ fallback if the executable directory is not writable. Include the report and
 ## Laptop checklist
 
 1. Keep the previous ZIP for rollback and extract this package into a separate
-   folder. Confirm file version **1.1.0.14** and the intended Mouse Output backend.
+   folder. Confirm file version **1.1.0.15** and the intended Mouse Output backend.
 2. Connect Medius and wait for physical-button monitoring. Enable TestClick,
    choose an activation button, and release then press it once after connection.
 3. Disable the burst limiter. With a continuously valid target, hold activation
@@ -74,6 +90,10 @@ fallback if the executable directory is not writable. Include the report and
    normal shutdown and the existing crash-recovery checklist.
 8. If any step fails, capture the visible **Click status** and save diagnostics.
    A counter advancing alone does not prove the controlled PC received the click.
+9. With buttons released before connecting, verify the first new activation press
+   works without a second cycle. Repeat with a button held through connection and
+   emergency release; it must stay blocked until released and pressed again.
+   Check a first event with several held buttons remains conservative.
 
 ## Build-only validation
 
@@ -81,7 +101,10 @@ Debug and Release x64 compile the opt-in `--testclick-self-test`,
 `--input-lock-self-test` and `--medius-self-test` checks. They cover repeated
 submission under held activation, burst scheduling, generation rearm,
 release/repress during preparation, verification ordering, query failures and
-finite-clip completion accounting. The development PC must not execute these
+finite-clip completion accounting. Native-input checks cover first-press evidence,
+held baselines, ambiguous multi-button snapshots, unmanaged buttons, reconnection,
+emergency rearm and the stock cached-mask path. Diagnostics include known-button
+masks and native press evidence counters. The development PC must not execute these
 checks, launch Vanta or run receiver/hardware tests. Packaging uses `-SkipTests`.
 
 This is a local 2PC development package with automated-release networking

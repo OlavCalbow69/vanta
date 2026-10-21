@@ -586,7 +586,8 @@ namespace vanta
                 connectionFuture=std::async(std::launch::async,[this,config,port]
                 {
                     ConnectionResult result;strncpy_s(result.device.port,port.c_str(),_TRUNCATE);
-                    auto buttons=[this](std::uint8_t mask){monitoredButtonMask=mask;++buttonEventCount;inputLocks.PhysicalButtons(mask);};
+                    auto buttons=[this](std::uint8_t mask,PhysicalButtonEdge edge)
+                    {monitoredButtonMask=mask;++buttonEventCount;inputLocks.PhysicalButtons(mask,edge);};
                     if(medius.Open(port,config,buttons,result.detail) && inputLocks.Attach(medius,port,result.detail))
                     {result.error=MAKCU_SUCCESS;result.version=medius.Identity();buttonMonitoringReady=true;}
                     else {const bool clean=inputLocks.Detach();const bool closed=medius.Close();inputLocks.FinishRecovery(clean && closed);}

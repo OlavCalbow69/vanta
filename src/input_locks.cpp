@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -123,7 +124,9 @@ namespace vanta
         int motionXSign{},motionYSign{};
         bool transitionFreshRequired{};
         std::uint64_t freshAfterUs{};
-        std::uint8_t physical{},observedReleased{};
+        std::uint8_t physical{},physicalKnown{},observedReleased{},lastNativePressProof{};
+        PhysicalButtonEdge lastPhysicalEdge{PhysicalButtonEdge::snapshot};
+        std::uint64_t physicalSnapshots{},nativePressProofs{},lastPhysicalUs{};
         bool attached{},probed{},motion{},motionCancelled{},activationReleased{},injectedLeft{},clickCancelled{},faultCleaned{};
         std::atomic_bool uncertainLeft{};
         OutputContext movement,click;
@@ -158,6 +161,8 @@ namespace vanta
         void ResetVerificationLocked()
         {
             ++connectionEpoch;firmwareMasks={};verifiedExpected={};requestedPolicy={};verificationEpoch=0;
+            physical=physicalKnown=observedReleased=lastNativePressProof=0;
+            lastPhysicalEdge=PhysicalButtonEdge::snapshot;lastPhysicalUs=0;
             freshAfterUs=0;transitionFreshRequired=false;motionGuidedAxes=0;motionXSign=motionYSign=0;
             cancelAllPending=false;
             activationReleased=false;
@@ -645,11 +650,25 @@ namespace vanta
                 if(s.injectedLeft && s.click.owner==owner)s.clickCancelled=true;}}
         if(ending)s.LogReleaseRequested();if(different)s.changed.notify_all();
     }
-    void InputLockCoordinator::PhysicalButtons(std::uint8_t mask) noexcept
+    void InputLockCoordinator::PhysicalButtons(std::uint8_t mask,PhysicalButtonEdge edge) noexcept
     {
-        auto& s=*state_;{std::lock_guard guard(s.state);
+        auto& s=*state_;mask&=0x1FU;{std::lock_guard guard(s.state);
+            std::uint8_t proof{};
+            if(s.attached && s.settings.backend==InputBackend::medius && edge==PhysicalButtonEdge::press)
+            {
+                const auto newlyHeld=static_cast<std::uint8_t>(mask&~s.physical);
+                // Known-up buttons followed by a native positive edge prove a
+                // fresh press. With no initial state, only a single candidate is
+                // unambiguous: POS says the held set grew, so that button was up.
+                // Multiple unknown held buttons must still be released first.
+                proof=static_cast<std::uint8_t>(newlyHeld&s.physicalKnown);
+                if(std::has_single_bit(unsigned(newlyHeld)))proof|=newlyHeld;
+            }
             // This is a complete physical snapshot, including released buttons.
-            s.observedReleased|=static_cast<std::uint8_t>(~mask)&0x1FU;s.physical=mask;
+            s.observedReleased|=(static_cast<std::uint8_t>(~mask)&0x1FU)|proof;
+            s.physical=mask;s.physicalKnown=0x1FU;s.lastNativePressProof=proof;
+            s.lastPhysicalEdge=edge;s.lastPhysicalUs=StreamNowUs();++s.physicalSnapshots;
+            s.nativePressProofs+=std::popcount(unsigned(proof));
             if(s.motion && !(mask&Button(s.movement.activation)))s.activationReleased=true;
             if(s.injectedLeft && s.click.owner!=InputOwner::manual && !(mask&Button(s.click.activation)))s.clickCancelled=true;}
         s.changed.notify_all();
@@ -657,7 +676,10 @@ namespace vanta
     void InputLockCoordinator::PhysicalButton(MouseButtonBinding button,bool pressed) noexcept
     {
         auto& s=*state_;const auto bit=Button(button);
-        {std::lock_guard guard(s.state);if(pressed)s.physical|=bit;
+        {std::lock_guard guard(s.state);s.physicalKnown|=bit;
+            s.lastPhysicalEdge=pressed?PhysicalButtonEdge::press:PhysicalButtonEdge::release;
+            s.lastPhysicalUs=StreamNowUs();s.lastNativePressProof=0;
+            if(pressed)s.physical|=bit;
             else {s.physical&=static_cast<std::uint8_t>(~bit);s.observedReleased|=bit;
                 if(s.motion && s.movement.activation==button)s.activationReleased=true;
                 if(s.injectedLeft && s.click.owner!=InputOwner::manual && s.click.activation==button)s.clickCancelled=true;}}
@@ -865,7 +887,12 @@ namespace vanta
             <<",\"helper_ready\":"<<(s.helperHealthy?"true":"false")
             <<",\"injected_left_release_uncertain\":"<<(s.uncertainLeft?"true":"false")
             <<",\"physical_button_mask\":"<<static_cast<unsigned>(s.physical)
+            <<",\"physical_button_known_mask\":"<<unsigned(s.physicalKnown)
             <<",\"observed_released_mask\":"<<static_cast<unsigned>(s.observedReleased)
+            <<",\"physical_button_snapshots\":"<<s.physicalSnapshots<<",\"last_physical_button_at_local_us\":"<<s.lastPhysicalUs
+            <<",\"last_physical_button_edge\":"<<unsigned(s.lastPhysicalEdge)
+            <<",\"last_native_press_release_proof_mask\":"<<unsigned(s.lastNativePressProof)
+            <<",\"native_press_release_proofs\":"<<s.nativePressProofs
             <<",\"reset_required\":"<<(s.resetRequired?"true":"false")<<",\"requested_mask\":"<<s.requested.load()
             <<",\"applied_mask\":"<<s.applied.load()<<",\"uncertain_mask\":"<<s.uncertain.load()
             <<",\"lock_movement_while_correcting\":"<<(s.settings.lockMovementWhileCorrecting?"true":"false")
@@ -1126,13 +1153,54 @@ namespace vanta
             auto& state=*coordinator.state_;state.worker.request_stop();state.changed.notify_all();state.worker.join();
             fake.Attach(state);fake.EnableFuse(state);state.settings.backend=InputBackend::medius;
             state.attached=state.probed=true;state.ready=true;state.helperHealthy=true;
-            state.policies[1]={true,7,MouseButtonBinding::x1};state.physical=Button(MouseButtonBinding::x1);state.observedReleased=state.physical;
+            state.policies[1]={true,7,MouseButtonBinding::x1};state.physical=Button(MouseButtonBinding::x1);
+            state.physicalKnown=0x1FU;state.observedReleased=state.physical;
         };
+        // A class-change stream may start with a genuine POS press, without a
+        // preceding all-up snapshot. Do not confuse that with a cached held
+        // state. These checks exercise the production validity/rearm gate.
+        FakeMasks activationDevice;InputLockCoordinator activation;setup(activation,activationDevice);auto& arming=*activation.state_;
+        OutputContext held;held.owner=InputOwner::testClick;held.generation=81;held.activation=MouseButtonBinding::x1;
+        activation.SetPolicy(InputOwner::testClick,true,held.generation,held.activation);
+        arming.ResetVerificationLocked();
+        activation.PhysicalButtons(Button(held.activation));
+        if(arming.Valid(held,StreamNowUs()))return false; // A held baseline is insufficient.
+        activation.PhysicalButtons(Button(held.activation),PhysicalButtonEdge::press);
+        if(arming.Valid(held,StreamNowUs()))return false; // Unchanged held state cannot rearm.
+        arming.ResetVerificationLocked();
+        activation.PhysicalButtons(Button(held.activation),PhysicalButtonEdge::press);
+        if(!arming.Valid(held,StreamNowUs()) || arming.lastNativePressProof!=Button(held.activation))return false;
+        // Ambiguous first snapshots cannot attribute a press to every held key.
+        arming.ResetVerificationLocked();
+        activation.PhysicalButtons(Button(MouseButtonBinding::left)|Button(held.activation),PhysicalButtonEdge::press);
+        if(arming.Valid(held,StreamNowUs()) || arming.lastNativePressProof)return false;
+        activation.PhysicalButtons(Button(MouseButtonBinding::left),PhysicalButtonEdge::release);
+        activation.PhysicalButtons(Button(MouseButtonBinding::left)|Button(held.activation),PhysicalButtonEdge::press);
+        if(!arming.Valid(held,StreamNowUs()) || (arming.observedReleased&Button(MouseButtonBinding::left)))return false;
+        // Emergency release preserves the held baseline. A newer configuration
+        // alone, or the same held mask, cannot bypass a real release/press.
+        activation.EmergencyRelease();++held.generation;
+        activation.SetPolicy(InputOwner::testClick,true,held.generation,held.activation);
+        activation.PhysicalButtons(Button(MouseButtonBinding::left)|Button(held.activation));
+        activation.PhysicalButtons(Button(MouseButtonBinding::left)|Button(held.activation),PhysicalButtonEdge::press);
+        if(arming.Valid(held,StreamNowUs()))return false;
+        activation.PhysicalButtons(0,PhysicalButtonEdge::release);
+        activation.PhysicalButtons(Button(held.activation),PhysicalButtonEdge::press);
+        if(!arming.Valid(held,StreamNowUs()))return false;
+        // A new connection forgets old evidence; the stock cached-mask path
+        // retains its original requirement to actually observe release.
+        arming.ResetVerificationLocked();arming.settings.backend=InputBackend::makcu;
+        activation.PhysicalButtons(Button(held.activation),PhysicalButtonEdge::press);
+        if(arming.Valid(held,StreamNowUs()))return false;
+        activation.PhysicalButtons(0);activation.PhysicalButtons(Button(held.activation));
+        if(!arming.Valid(held,StreamNowUs()))return false;
         // Repeated public TryClick calls use the same held activation, with no
         // release edge required between completed finite clicks. Service is
         // driven explicitly; these opt-in checks never open a device.
         FakeMasks clickDevice;InputLockCoordinator repeated;setup(repeated,clickDevice);auto& clicks=*repeated.state_;
+        clicks.ResetVerificationLocked();
         repeated.SetPolicy(InputOwner::testClick,true,41,MouseButtonBinding::x1);
+        repeated.PhysicalButtons(Button(MouseButtonBinding::x1),PhysicalButtonEdge::press);
         OutputContext clickFrame;clickFrame.owner=InputOwner::testClick;clickFrame.generation=41;
         clickFrame.activation=MouseButtonBinding::x1;clickFrame.streamGeneration=3;clickFrame.streamSession=4;
         bool clickConfirmed{};

@@ -1,6 +1,8 @@
-# Medius native output — build 1.1.0.14
+# Medius native output — build 1.1.0.15
 
-Build 1.1.0.14 improves TestClick completion/repeat handling and shows its backend
+Build 1.1.0.15 preserves Medius's native button-edge information so a first genuine,
+unambiguous press can arm TestClick without an earlier released snapshot. Held
+baselines and emergency release remain protected. TestClick shows its backend
 and exact click status directly in the panel. See [TestClick changes and laptop
 checks](README-TESTCLICK.md).
 

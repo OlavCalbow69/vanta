@@ -57,7 +57,7 @@ foreach ($entry in $licenses.GetEnumerator()) {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot $entry.Value) -Destination (Join-Path $licenseRoot $entry.Key)
 }
 @(
-    'Vanta TestClick Repeat / Medius Native / Python Fuse Inputs (local, not an official release)'
+    'Vanta Medius Activation Rearm / TestClick Repeat / Python Fuse Inputs (local, not an official release)'
     "Binary file version: $((Get-Item -LiteralPath (Join-Path $buildRoot 'vanta.exe')).VersionInfo.FileVersion)"
     "Configuration: $Configuration x64"
     "Branch: $((& git -C $repositoryRoot branch --show-current).Trim())"
@@ -103,6 +103,9 @@ foreach ($entry in $licenses.GetEnumerator()) {
     'Firmware render, spread and riding are captured, disabled/verified while owned, then restored during cleanup/recovery.'
     'Generated clicks use a separate finalized firmware clip with 14-34 ms hold; no periodic host refill.'
     'TestClick repeats on fresh valid frames while physical activation remains held; burst settings remain optional.'
+    'Medius native button edge information reaches the input coordinator; an unambiguous new press can supply a missing released baseline.'
+    'Held/cached snapshots cannot rearm; ambiguous or unmanaged button changes stay conservative. Held-through-emergency protection and stock behavior remain.'
+    'Diagnostics include known physical buttons, last native edge and native press release-evidence counters. No detector, ray or movement calculation changes.'
     'Click upload/finalization and both content edges are checked; release completion uses a bounded 100 ms sequence with 20 ms individual query timeouts.'
     'Activation or settings changes during preparation cancel the click without falsely declaring a healthy link failed.'
     'Enable/binding edits publish a new configuration generation immediately, including explicit rearm after emergency release.'
