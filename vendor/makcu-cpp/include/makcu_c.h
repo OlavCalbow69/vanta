@@ -98,10 +98,16 @@ MAKCU_C_API makcu_error_t makcu_connect(makcu_device_t* device, const char* port
 MAKCU_C_API void makcu_disconnect(makcu_device_t* device);
 MAKCU_C_API bool makcu_is_connected(makcu_device_t* device);
 MAKCU_C_API makcu_connection_status_t makcu_get_status(makcu_device_t* device);
+// Copies the latest detailed connection/serial error; never queries GetLastError
+// on the calling thread. An empty buffer means no detailed error was recorded.
+MAKCU_C_API makcu_error_t makcu_get_last_error(makcu_device_t* device, char* error, size_t error_size);
 
 // Device information
 MAKCU_C_API makcu_error_t makcu_get_device_info(makcu_device_t* device, makcu_device_info_t* info);
 MAKCU_C_API makcu_error_t makcu_get_version(makcu_device_t* device, char* version, size_t version_size);
+// Serialized by the input coordinator; must not race device destruction.
+MAKCU_C_API makcu_error_t makcu_query_text(makcu_device_t* device, const char* command,
+    char* response, size_t response_size, uint32_t timeout_ms);
 
 // Mouse button control
 MAKCU_C_API makcu_error_t makcu_mouse_down(makcu_device_t* device, makcu_mouse_button_t button);

@@ -1,0 +1,68 @@
+[workspace]
+members = ["medius-capi"]
+resolver = "3"
+
+[package]
+name = "medius"
+version = "3.4.6"
+edition = "2024"
+rust-version = "1.85"
+description = "Rust library for Medius, replacement firmware for the MAKCU box"
+license = "MIT"
+keywords = ["medius", "mouse", "hid", "serial", "makcu"]
+categories = ["hardware-support", "api-bindings"]
+repository = "https://github.com/K4HVH/medius"
+homepage = "https://medius.k4tech.net"
+
+# docs.rs renders the feature-gated async and mock APIs.
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+async = ["dep:futures-core"]            # wrapper over the sync core (flume async recv, no runtime dep)
+mock = []                               # public scriptable fake box
+tracing = ["dep:tracing"]               # library-side instrumentation
+
+[dependencies]
+thiserror = "2"
+flume = "0.12"
+futures-core = { version = "0.3", default-features = false, optional = true }
+parking_lot = "0.12"
+serialport = "4"
+tracing = { version = "0.1", optional = true }
+sha2 = { version = "0.11.0", default-features = false }
+
+# Windows I/O uses serial2's overlapped COM handle: on serialport's synchronous one the kernel
+# serialises reads against writes, stalling injection behind the reader thread. serialport stays for
+# port discovery, since only it reports USB VID/PID. windows-sys waits on the port's comm events.
+[target.'cfg(windows)'.dependencies]
+serial2 = { version = "0.2", features = ["windows"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# Async tests run on futures' executor::block_on; the wrapper is runtime-agnostic.
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+
+# Only the Linux `hw_full` example uses libc (evdev EVIOCGRAB).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+# Compiles everywhere; running it needs a connected box.
+[[example]]
+name = "basic"
+
+# On-hardware validation suite (Linux; grabs the clone's evdev node). Builds without features;
+# `--features async` (or `--all-features`) adds the async gate.
+[[example]]
+name = "hw_full"
+
+# Times the injection write path on a connected box; run it per platform.
+[[example]]
+name = "inject_latency"

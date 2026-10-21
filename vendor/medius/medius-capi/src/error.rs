@@ -1,0 +1,237 @@
+//! Status codes and the thread-local last-error detail.
+
+use std::cell::RefCell;
+use std::os::raw::c_char;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use medius::Error;
+
+use crate::ctypes::MediusUpdateError;
+
+/// Result of a fallible `medius_*` call: `MEDIUS_OK` is 0, anything else a failure.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediusStatus {
+    Ok = 0,
+    ErrIo = 1,
+    ErrNotFound = 2,
+    ErrNoReply = 3,
+    ErrBadProtoVer = 4,
+    ErrQueryTimeout = 5,
+    ErrDisconnected = 6,
+    ErrFrameTooLong = 7,
+    ErrUpdate = 8,
+    ErrInvalidArg = 9,
+    ErrPanic = 10,
+    ErrUnknown = 11,
+    /// The subscription needs more entries than the box's table holds.
+    ErrCatchTableFull = 12,
+    /// A catch subscription with no filters, which would never yield an event.
+    ErrEmptySubscription = 13,
+    /// A non-zero `capture` on an input class, which carries no packet.
+    ErrCaptureNotApplicable = 14,
+    /// A traffic class passed to `medius_device_input_events`, which cannot decode one.
+    ErrNotAnInputFilter = 15,
+    /// The everything filter passed to `medius_device_input_events`; it covers traffic too.
+    ErrWildcardNotInput = 16,
+    /// An input filter narrowed to one edge, which cannot be decoded into press and release.
+    ErrHalfEdgeInputFilter = 17,
+    /// An exact id equal to the blanket sentinel, which would address the whole class.
+    ErrReservedId = 18,
+    /// `MEDIUS_DIRECTION_WITH` / `_AGAINST` on a target with no bearing.
+    ErrRelativeDirection = 19,
+    /// A lock scale outside `MEDIUS_LOCK_SCALE_MIN ..= MEDIUS_LOCK_SCALE_MAX`.
+    ErrLockScaleRange = 20,
+    /// A negative (reversing) lock scale on a button, key or media usage, which carries one bit.
+    ErrLockScaleUsage = 21,
+    /// `medius_device_set_rewrite` or `medius_device_apply_patch` with the imperfect-clone opt-in off.
+    ErrImperfectRequired = 22,
+    /// A rewrite rule whose `match` and `mask` are different lengths.
+    ErrRewriteMaskLength = 23,
+    /// A rewrite action invalid for its class (a report-only or control-only action misused).
+    ErrRewriteActionClass = 24,
+    /// A rewrite payload larger than the head the box holds for its class.
+    ErrRewritePayloadTooLarge = 25,
+    /// A rewrite rule added to a table that already holds `MEDIUS_MAX_REWRITE_ENTRIES`.
+    ErrRewriteTableFull = 26,
+    /// A transform op that cannot address its `source`/`dest` pair.
+    ErrTransformOpFields = 27,
+    /// A transform added to a table that already holds `MEDIUS_MAX_TRANSFORM_ENTRIES`.
+    ErrTransformTableFull = 28,
+    /// A raw injection direction other than `MEDIUS_DIRECTION_POSITIVE` (IN) or `MEDIUS_DIRECTION_NEGATIVE` (OUT).
+    ErrRawDirection = 29,
+    /// A clip frame with more than `MEDIUS_CLIP_EDGES_MAX` edges or `MEDIUS_CLIP_RAW_MAX` raw reports.
+    ErrClipFrameCount = 30,
+    /// A clip frame that encodes to more than `MEDIUS_CLIP_ENTRY_MAX` bytes.
+    ErrClipFrameTooLong = 31,
+    /// A clip transfer whose data disagrees with its setup packet: `length` bytes for OUT, none for
+    /// IN.
+    ErrClipTransferData = 32,
+    /// A clip packet trigger the box would refuse; `medius_last_error_message` says why.
+    ErrClipPacketTrigger = 33,
+    /// A rewrite rule with more than `MEDIUS_MAX_REWRITE_MATCH` match bytes.
+    ErrRewriteMatchTooLong = 34,
+    /// A rewrite payload larger than what the other held rules leave of
+    /// `MEDIUS_REWRITE_PAYLOAD_POOL`.
+    ErrRewritePoolFull = 35,
+}
+
+#[derive(Default)]
+struct LastError {
+    message: String,
+    proto_ver: u8,
+    update: Option<MediusUpdateError>,
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<LastError> = RefCell::new(LastError::default());
+}
+
+fn store_error(message: String, proto_ver: u8, update: Option<MediusUpdateError>) {
+    LAST_ERROR.with(|e| {
+        let mut e = e.borrow_mut();
+        e.message = message;
+        e.proto_ver = proto_ver;
+        e.update = update;
+    });
+}
+
+pub(crate) fn clear_error() {
+    LAST_ERROR.with(|e| {
+        let mut e = e.borrow_mut();
+        e.message.clear();
+        e.proto_ver = 0;
+        e.update = None;
+    });
+}
+
+fn status_for(err: &Error) -> MediusStatus {
+    match err {
+        Error::Io(_) => MediusStatus::ErrIo,
+        Error::NotFound => MediusStatus::ErrNotFound,
+        Error::NoReply => MediusStatus::ErrNoReply,
+        Error::BadProtoVer { .. } => MediusStatus::ErrBadProtoVer,
+        Error::QueryTimeout => MediusStatus::ErrQueryTimeout,
+        Error::Disconnected => MediusStatus::ErrDisconnected,
+        Error::FrameTooLong => MediusStatus::ErrFrameTooLong,
+        Error::CatchTableFull { .. } => MediusStatus::ErrCatchTableFull,
+        Error::EmptySubscription => MediusStatus::ErrEmptySubscription,
+        Error::CaptureNotApplicable { .. } => MediusStatus::ErrCaptureNotApplicable,
+        Error::NotAnInputFilter { .. } => MediusStatus::ErrNotAnInputFilter,
+        Error::WildcardNotInput => MediusStatus::ErrWildcardNotInput,
+        Error::HalfEdgeInputFilter => MediusStatus::ErrHalfEdgeInputFilter,
+        Error::ReservedId { .. } => MediusStatus::ErrReservedId,
+        Error::RelativeDirection { .. } => MediusStatus::ErrRelativeDirection,
+        Error::RawDirection { .. } => MediusStatus::ErrRawDirection,
+        Error::ClipFrameCount { .. } => MediusStatus::ErrClipFrameCount,
+        Error::ClipFrameTooLong { .. } => MediusStatus::ErrClipFrameTooLong,
+        Error::ClipTransferData { .. } => MediusStatus::ErrClipTransferData,
+        Error::ClipPacketTrigger { .. } => MediusStatus::ErrClipPacketTrigger,
+        Error::ImperfectRequired => MediusStatus::ErrImperfectRequired,
+        Error::RewriteMaskLength { .. } => MediusStatus::ErrRewriteMaskLength,
+        Error::RewriteMatchTooLong { .. } => MediusStatus::ErrRewriteMatchTooLong,
+        Error::RewriteActionClass { .. } => MediusStatus::ErrRewriteActionClass,
+        Error::RewritePayloadTooLarge { .. } => MediusStatus::ErrRewritePayloadTooLarge,
+        Error::RewriteTableFull { .. } => MediusStatus::ErrRewriteTableFull,
+        Error::RewritePoolFull { .. } => MediusStatus::ErrRewritePoolFull,
+        Error::LockScaleRange { .. } => MediusStatus::ErrLockScaleRange,
+        Error::LockScaleUsage { .. } => MediusStatus::ErrLockScaleUsage,
+        Error::TransformOpFields { .. } => MediusStatus::ErrTransformOpFields,
+        Error::TransformTableFull { .. } => MediusStatus::ErrTransformTableFull,
+        Error::Update { .. } => MediusStatus::ErrUpdate,
+        _ => MediusStatus::ErrUnknown,
+    }
+}
+
+pub(crate) fn record(err: &Error) -> MediusStatus {
+    let proto_ver = match err {
+        Error::BadProtoVer { got } => *got,
+        _ => 0,
+    };
+    let update = match err {
+        Error::Update { op, status, arg } => Some(MediusUpdateError {
+            op: *op,
+            status: status.0,
+            arg: *arg,
+        }),
+        _ => None,
+    };
+    store_error(err.to_string(), proto_ver, update);
+    status_for(err)
+}
+
+pub(crate) fn fail(status: MediusStatus, message: &str) -> MediusStatus {
+    store_error(message.to_string(), 0, None);
+    status
+}
+
+/// Map a `Result<(), Error>` to a status, clearing the last error on success.
+pub(crate) fn status_of(result: Result<(), Error>) -> MediusStatus {
+    match result {
+        Ok(()) => {
+            clear_error();
+            MediusStatus::Ok
+        }
+        Err(e) => record(&e),
+    }
+}
+
+/// Run a status-returning body, catching any panic (unwinding across FFI is UB).
+pub(crate) fn guard_status(f: impl FnOnce() -> MediusStatus) -> MediusStatus {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(s) => s,
+        Err(_) => fail(MediusStatus::ErrPanic, "internal panic at the FFI boundary"),
+    }
+}
+
+/// Run a value-returning body, returning `default` on a caught panic.
+pub(crate) fn guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
+
+/// Copy the last error text into `buf` (NUL-terminated, truncated to `cap`); returns the full byte length excluding the NUL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn medius_last_error_message(buf: *mut c_char, cap: usize) -> usize {
+    guard(0, || {
+        LAST_ERROR.with(|e| {
+            let e = e.borrow();
+            let bytes = e.message.as_bytes();
+            let full = bytes.len();
+            if !buf.is_null() && cap > 0 {
+                let n = full.min(cap - 1);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+                    *buf.add(n) = 0;
+                }
+            }
+            full
+        })
+    })
+}
+
+/// The last error's `BadProtoVer` version byte, or 0 if it carried none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn medius_last_error_proto_ver() -> u8 {
+    guard(0, || LAST_ERROR.with(|e| e.borrow().proto_ver))
+}
+
+/// Write the last error's update detail to `*out` and return true. If the last error on this thread
+/// was not an update error, return false and leave `*out` untouched.
+///
+/// # Safety
+/// `out` must be writable, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn medius_last_error_update(out: *mut MediusUpdateError) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return false;
+        }
+        match LAST_ERROR.with(|e| e.borrow().update) {
+            Some(u) => {
+                unsafe { *out = u };
+                true
+            }
+            None => false,
+        }
+    })
+}

@@ -1,0 +1,190 @@
+//! Device-info request decoding (§4.3-4.6) and the HEALTH `rate_confident` bit (§4.2); byte vectors mirror the firmware wire format.
+
+use crate::protocol::{Resp, parse_resp};
+use crate::types::{DeviceKind, Health};
+
+#[test]
+fn decode_version_with_mac() {
+    let p = [0u8, 2, 2, 3, 0, 0x5A, 0x4E, 0x11, 0x22, 0x1e, 0x28];
+    let Some(Resp::Version(v)) = parse_resp(&p) else {
+        panic!("expected Version");
+    };
+    assert_eq!(
+        (v.proto_ver, v.fw_major, v.fw_minor, v.fw_patch),
+        (2, 2, 3, 0)
+    );
+    assert_eq!(v.mac, [0x5A, 0x4E, 0x11, 0x22, 0x1e, 0x28]);
+    assert_eq!(v.mac_hex(), "5a4e11221e28");
+    assert_eq!(v.name, ""); // header-only VERSION means an empty name (older box)
+    assert!(parse_resp(&[0u8, 2, 2, 3, 0]).is_none());
+}
+
+#[test]
+fn decode_version_with_name_tail() {
+    let mut p = vec![0u8, 2, 2, 4, 0, 0x5A, 0x4E, 0x11, 0x22, 0x1e, 0x28];
+    p.extend_from_slice(b"Left PC");
+    let Some(Resp::Version(v)) = parse_resp(&p) else {
+        panic!("expected Version");
+    };
+    assert_eq!(v.mac_hex(), "5a4e11221e28");
+    assert_eq!(v.name, "Left PC");
+}
+
+#[test]
+fn rate_decodes_continuous_vs_change_driven() {
+    let Some(Resp::Rate(r)) = parse_resp(&[4, 0xE8, 0x03, 0xE8, 0x03, 0x01]) else {
+        panic!("expected Rate");
+    };
+    assert_eq!(r.native_period_us, 1000);
+    assert!(r.confident && !r.change_driven);
+    assert_eq!(r.native_hz(), Some(1000.0));
+    let Some(Resp::Rate(k)) = parse_resp(&[4, 0x00, 0x00, 0xE8, 0x03, 0x02]) else {
+        panic!("expected Rate");
+    };
+    assert_eq!(k.native_period_us, 0);
+    assert!(k.change_driven && !k.confident);
+    assert_eq!(k.native_hz(), None);
+    assert_eq!(k.poll_period_us, 1000);
+}
+
+#[test]
+fn decode_device_info_exact_bytes() {
+    let mut p = vec![
+        2u8, 0x6D, 0x04, 0x8B, 0xC0, 0x10, 0x01, 0x00, 0x02, 0x03, 0x02,
+    ];
+    p.extend_from_slice(b"Mamba");
+    let Some(Resp::DeviceInfo(m)) = parse_resp(&p) else {
+        panic!("expected DeviceInfo");
+    };
+    assert_eq!(m.vid, 0x046D);
+    assert_eq!(m.pid, 0xC08B);
+    assert_eq!(m.bcd_device, 0x0110);
+    assert_eq!(m.bcd_usb, 0x0200);
+    assert!(m.has_serial && m.has_bos);
+    assert_eq!(m.kind, DeviceKind::Mouse);
+    assert_eq!(m.product, "Mamba");
+    assert_eq!(format!("{m}"), "046D:C08B Mamba");
+    let Some(Resp::DeviceInfo(h)) = parse_resp(&p[..11]) else {
+        panic!("expected DeviceInfo");
+    };
+    assert_eq!(h.kind, DeviceKind::Mouse);
+    assert!(h.product.is_empty());
+    assert_eq!(format!("{h}"), "046D:C08B");
+}
+
+#[test]
+fn decode_caps_exact_bytes() {
+    let p = [3u8, 5, 0x07, 2, 0, 0, 0];
+    let Some(Resp::Caps(c)) = parse_resp(&p) else {
+        panic!("expected Caps");
+    };
+    assert_eq!(c.mouse.n_buttons, 5);
+    assert!(c.mouse.has_x && c.mouse.has_y && c.mouse.has_wheel);
+    assert!(!c.mouse.pan); // axis flags 0x07 = X|Y|WHEEL, no AC Pan bit
+    assert!(!c.mouse.has_report_id);
+    assert_eq!(c.mouse.n_hid, 2);
+    assert!(c.is_composite());
+    assert!(c.has_mouse() && !c.has_keyboard());
+    assert!(!c.mouse_change_driven && !c.kbd_change_driven);
+}
+
+#[test]
+fn decode_caps_reports_ac_pan_and_a_wide_button_count() {
+    // axis flags 0x17 = X|Y|WHEEL|PAN (0x10); n_buttons past the five named ones.
+    let p = [3u8, 16, 0x17, 1, 0, 0, 0];
+    let Some(Resp::Caps(c)) = parse_resp(&p) else {
+        panic!("expected Caps");
+    };
+    assert_eq!(c.mouse.n_buttons, 16);
+    assert!(c.mouse.has_x && c.mouse.has_y && c.mouse.has_wheel);
+    assert!(c.mouse.pan);
+    assert!(!c.mouse.has_report_id); // 0x17 clears the 0x08 report-id bit
+}
+
+#[cfg(feature = "mock")]
+#[test]
+fn the_mock_reports_ac_pan_through_a_caps_query() {
+    use crate::types::MouseCaps;
+    let mock = crate::MockBox::new().with_mouse_caps(MouseCaps {
+        n_buttons: 8,
+        has_x: true,
+        has_y: true,
+        has_wheel: true,
+        pan: true,
+        has_report_id: false,
+        n_hid: 1,
+    });
+    let dev = crate::Device::with_mock(mock);
+    let c = dev.caps().unwrap();
+    assert!(c.mouse.pan);
+    assert_eq!(c.mouse.n_buttons, 8);
+}
+
+#[test]
+fn decode_rate_exact_bytes() {
+    let p = [4u8, 0xE8, 0x03, 0xE8, 0x03, 0x01];
+    let Some(Resp::Rate(r)) = parse_resp(&p) else {
+        panic!("expected Rate");
+    };
+    assert_eq!(r.native_period_us, 1000);
+    assert_eq!(r.poll_period_us, 1000);
+    assert!(r.confident);
+    assert_eq!(r.native_hz(), Some(1000.0));
+}
+
+#[test]
+fn rate_unlearned_period_is_none() {
+    let p = [4u8, 0x00, 0x00, 0xE8, 0x03, 0x00];
+    let Some(Resp::Rate(r)) = parse_resp(&p) else {
+        panic!("expected Rate");
+    };
+    assert_eq!(r.native_period_us, 0);
+    assert_eq!(r.native_hz(), None); // truthful: 0 means "not learned yet"
+    assert!(!r.confident);
+}
+
+#[test]
+fn decode_stats_exact_bytes_with_saturation() {
+    // The firmware packer test's vector. 0xDEADBEEF proves the three drop counters are full width;
+    // the last two bytes are the session counter.
+    let p = [
+        5u8, 0x04, 0x03, 0x02, 0x01, 0xFF, 0xFF, 0x0A, 0x00, 0xFF, 0x02, 0xFF, 0xFF, 0x07, 0x00,
+        0x09, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A, 0xEF,
+        0xBE,
+    ];
+    let Some(Resp::Stats(s)) = parse_resp(&p) else {
+        panic!("expected Stats");
+    };
+    assert_eq!(s.inject_emits, 0x0102_0304);
+    assert_eq!(s.tx_drops, 0xFFFF);
+    assert_eq!(s.tx_merges, 10);
+    assert_eq!(s.tx_maxdepth, 0xFF);
+    assert_eq!(s.tx_wedges, 2);
+    assert_eq!(s.wakeups, 0xFFFF);
+    assert_eq!(s.reset_count, 7);
+    assert_eq!(s.config_count, 9);
+    assert_eq!(s.link_rx_drops, 0xDEAD_BEEF);
+    assert_eq!(s.host_rx_drops, 0x0102_0304);
+    assert_eq!(s.relay_drops, 0x0A0B_0C0D);
+    assert_eq!(s.session, 0xBEEF);
+}
+
+#[test]
+fn health_rate_confident_bit_roundtrips() {
+    let h = Health::from_flags(0x10);
+    assert!(h.rate_confident);
+    assert!(!h.link_up && !h.mouse_attached && !h.clone_configured && !h.injection_active);
+    assert_eq!(h.to_flags(), 0x10);
+    assert_eq!(Health::from_flags(0x1F).to_flags(), 0x1F);
+}
+
+#[test]
+fn truncated_payloads_decode_to_none() {
+    assert!(parse_resp(&[2, 0, 0]).is_none()); // DEVICE_INFO needs 11
+    assert!(parse_resp(&[3, 5]).is_none()); // CAPS needs 4
+    assert!(parse_resp(&[4, 0xE8, 0x03]).is_none()); // RATE needs 6
+    assert!(parse_resp(&[5, 0, 0, 0]).is_none()); // STATS needs 31
+    assert!(parse_resp(&[5u8; 17]).is_none()); // the v8 STATS reply is short now
+    assert!(parse_resp(&[5u8; 25]).is_none()); // and so is one that stops before relay_drops
+    assert!(parse_resp(&[5u8; 29]).is_none()); // and one that stops before session
+}

@@ -103,6 +103,10 @@ jobs:
         shell: pwsh
         run: .\scripts\bootstrap-sunshine-receiver.ps1
 
+      - name: Build optional Medius native SDK
+        shell: pwsh
+        run: .\scripts\bootstrap-mouse-output.ps1 -CompileChecks
+
       - name: Build Debug x64
         shell: pwsh
         run: |
@@ -125,7 +129,7 @@ jobs:
         shell: pwsh
         run: |
           foreach ($configuration in @('Debug','Release')) {
-            foreach ($check in @('--detector-self-test','--detector-ui-self-test','--config-self-test','--makcu-self-test')) {
+            foreach ($check in @('--stream-pipeline-self-test','--fps-diagnostics-self-test','--python-self-test','--detector-self-test','--detector-ui-self-test','--config-self-test','--makcu-self-test')) {
               & ".\build\$configuration\vanta.exe" $check
               if ($LASTEXITCODE -ne 0) { throw "$configuration $check failed" }
             }
@@ -134,39 +138,10 @@ jobs:
       - name: Verify and package runtime bundle
         shell: pwsh
         run: |
-          $runtimeFiles = @(
-            'build\Release\vanta.exe',
-            'build\Release\vanta-updater.exe',
-            'build\Release\opencv_world500.dll',
-            'README.md',
-            'README-DETECTOR.md',
-            'LICENSE',
-            'NOTICE.md'
-          )
-          $thirdPartyLicenseFiles = @(
-            @{ Source = 'vendor\moonlight-common-c\LICENSE.txt'; Destination = 'MOONLIGHT-GPL-3.0.txt' },
-            @{ Source = 'vendor\moonlight-common-c\enet\LICENSE'; Destination = 'ENET-LICENSE.txt' },
-            @{ Source = 'vendor\moonlight-common-c\nanors\LICENSE'; Destination = 'NANORS-LICENSE.txt' },
-            @{ Source = 'work\vcpkg\installed\x64-windows-static\share\openssl\copyright'; Destination = 'OPENSSL-LICENSE.txt' }
-          )
-          $allFiles = @($runtimeFiles) + @($thirdPartyLicenseFiles | ForEach-Object { $_.Source })
-          foreach ($file in $allFiles) {
-            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-              throw "Expected runtime file is missing: $file"
-            }
-          }
-
-          $stage = "artifacts\vanta-$env:VANTA_RELEASE_TAG-win64"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          foreach ($file in $runtimeFiles) {
-            Copy-Item -LiteralPath $file -Destination $stage
-          }
-          .\scripts\copy-vc-runtime.ps1 -Destination $stage
-          foreach ($licenseFile in $thirdPartyLicenseFiles) {
-            Copy-Item -LiteralPath $licenseFile.Source -Destination (Join-Path $stage $licenseFile.Destination)
-          }
+          .\scripts\package-stable-detector.ps1 -Configuration Release -SkipTests
+          New-Item -ItemType Directory -Force -Path 'artifacts' | Out-Null
           $zip = Join-Path 'artifacts' $env:VANTA_RELEASE_ZIP
-          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Copy-Item -LiteralPath 'build\package\VantaStreaming240Diagnostics-Release.zip' -Destination $zip
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           [System.IO.File]::WriteAllText(
             "$zip.sha256",

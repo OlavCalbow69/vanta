@@ -181,7 +181,8 @@ namespace makcu {
         std::atomic<bool> connected;
         std::atomic<bool> highPerformanceMode;
         mutable std::mutex mutex;
-        static std::string lastError;
+        std::string lastError;
+        mutable std::mutex errorMutex;
 
         // Command cache for ultra-fast lookups
         CommandCache commandCache;
@@ -261,8 +262,8 @@ namespace makcu {
 
         ~Impl() = default;
 
-        // Private static method for the core baud rate change protocol
-        static bool performBaudRateChange(SerialPort* serialPort, uint32_t baudRate) {
+        // Keep errors on the device whose port is being changed.
+        bool performBaudRateChange(uint32_t baudRate) {
             if (!serialPort->isOpen()) {
                 return false;
             }
@@ -304,7 +305,8 @@ namespace makcu {
             return true;
         }
 
-        static void setLastError(const std::string& error) {
+        void setLastError(const std::string& error) {
+            std::lock_guard<std::mutex> lock(errorMutex);
             lastError = error;
         }
 
@@ -318,7 +320,11 @@ namespace makcu {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
             // Enable button monitoring - fire and forget for performance
-            return serialPort->sendCommand("km.buttons(1)");
+            if (!serialPort->sendCommand("km.buttons(1)")) {
+                setLastError("Initialize device button monitor write failed: " + serialPort->getLastError());
+                return false;
+            }
+            return true;
         }
 
         void handleButtonEvent(uint8_t button, bool pressed) {
@@ -578,7 +584,6 @@ namespace makcu {
     Device::Device()
         : m_impl(std::make_unique<Impl>())
         , m_lifetimeToken(std::make_shared<std::atomic<bool>>(true)) {}
-    std::string Device::Impl::lastError = "";
 
     Device::~Device() {
         if (m_lifetimeToken) {
@@ -606,6 +611,7 @@ namespace makcu {
 
     std::string Device::getLastError()
     {
+        std::lock_guard<std::mutex> lock(m_impl->errorMutex);
         return m_impl->lastError;
     }
 
@@ -629,27 +635,47 @@ namespace makcu {
         }
 
         m_impl->atomicStatus.store(ConnectionStatus::CONNECTING, std::memory_order_release);
+        m_impl->setLastError({});
 
+        std::string probeErrors;
+        uint32_t activeBaud{};
+        uint32_t observedFirmware{};
+        const auto recordProbeError=[&](const std::string& detail) {
+            if (!probeErrors.empty()) probeErrors+="; ";
+            probeErrors+=targetPort+" at "+std::to_string(activeBaud)+" baud: "+detail;
+        };
         protocol::ProbeOperations operations;
         operations.open = [&](uint32_t baud) {
-            if (!m_impl->serialPort->open(targetPort,baud)) return false;
+            activeBaud=baud;
+            if (!m_impl->serialPort->open(targetPort,baud)) {
+                recordProbeError(m_impl->serialPort->getLastError());
+                return false;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             return true;
         };
         operations.close = [&] { m_impl->serialPort->close(); };
         operations.identity = [&]() -> std::string {
+            std::string failure="km.version() returned no MAKCU identity";
             for (int attempt=0;attempt<2;++attempt) {
                 try {
                     auto response=m_impl->serialPort->sendTrackedCommand("km.version()",true,
                         std::chrono::milliseconds(250));
                     const auto identity=response.get();
                     if (identity.starts_with("km.MAKCU")) return identity;
-                } catch (...) {}
+                } catch (const std::exception& error) { failure=std::string("km.version(): ")+error.what(); }
+                catch (...) { failure="km.version() failed with an unknown error"; }
             }
+            recordProbeError(failure);
             return {};
         };
         operations.firmware = [&] {
-            return protocol::FirmwareInteger(m_impl->serialPort->queryBinary(0x04));
+            const auto firmware=protocol::FirmwareInteger(m_impl->serialPort->queryBinary(0x04));
+            if (observedFirmware && firmware!=observedFirmware)
+                recordProbeError("Firmware verification changed after reopen: expected "+
+                    std::to_string(observedFirmware)+", received "+std::to_string(firmware));
+            observedFirmware=firmware;
+            return firmware;
         };
         operations.switchToFast = [&](bool textBaud) {
             bool sent=false;
@@ -659,12 +685,15 @@ namespace makcu {
                 sent=m_impl->serialPort->write(std::span(frame)) && m_impl->serialPort->flush();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            if (!sent) recordProbeError("Baud switch write/flush failed: "+m_impl->serialPort->getLastError());
             return sent;
         };
         protocol::ProbeResult result;
         if (!protocol::ProbeConnection(operations,highSpeed,result)) {
             m_impl->atomicStatus.store(ConnectionStatus::CONNECTION_ERROR,std::memory_order_release);
-            m_impl->setLastError("MAKCU identity/firmware handshake failed at 4000000 and 115200 baud");
+            m_impl->setLastError(probeErrors.empty()
+                ? "MAKCU identity/firmware verification failed after reopening "+targetPort
+                : probeErrors);
             return false;
         }
         m_impl->firmwareVersion=result.identity + " (numeric firmware unavailable)";
@@ -1275,8 +1304,8 @@ namespace makcu {
             baudRate = 4000000;
         }
 
-        // Use the static helper method for the core baud rate change
-        if (!Impl::performBaudRateChange(m_impl->serialPort.get(), baudRate)) {
+        // Use the device helper for the core baud rate change.
+        if (!m_impl->performBaudRateChange(baudRate)) {
             disconnect();
             return false;
         }
@@ -1293,7 +1322,7 @@ namespace makcu {
                 } else {
                     // Communication test failed, attempt recovery to known-safe default speed.
                     bool recovered = (baudRate != 115200) &&
-                        Impl::performBaudRateChange(m_impl->serialPort.get(), 115200);
+                        m_impl->performBaudRateChange(115200);
                     if (!recovered) {
                         disconnect();
                     }
@@ -1302,7 +1331,7 @@ namespace makcu {
             } catch (...) {
                 // Exception occurred, attempt recovery to known-safe default speed.
                 bool recovered = (baudRate != 115200) &&
-                    Impl::performBaudRateChange(m_impl->serialPort.get(), 115200);
+                    m_impl->performBaudRateChange(115200);
                 if (!recovered) {
                     disconnect();
                 }
@@ -1523,6 +1552,15 @@ namespace makcu {
             }
         }
         return true;
+    }
+
+    std::string Device::queryText(const std::string& command, uint32_t timeoutMs) {
+        if (!m_impl->connected.load()) throw std::runtime_error("MAKCU disconnected");
+        auto result = m_impl->serialPort->sendTrackedCommand(command, true,
+            std::chrono::milliseconds(timeoutMs));
+        if (result.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready)
+            throw std::runtime_error("MAKCU text query timeout; reconnect before another query");
+        return result.get();
     }
 
     // Legacy raw command interface (not recommended)

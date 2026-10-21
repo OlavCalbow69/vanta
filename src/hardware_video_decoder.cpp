@@ -1,107 +1,137 @@
 #include "hardware_video_decoder.hpp"
-
+#include "logger.hpp"
 #include <Windows.h>
-#include <strmif.h>
-#include <codecapi.h>
+#include <d3d11_4.h>
 #include <d3d10_1.h>
-#include <d3d11.h>
-#include <mfapi.h>
-#include <mferror.h>
-#include <mfidl.h>
-#include <mftransform.h>
-#include <opencv2/core.hpp>
+#include <d3dcompiler.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
-
-#include <algorithm>
+#include "imgui.h"
+#pragma warning(push,0)
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/error.h>
+}
+#pragma warning(pop)
 #include <array>
-#include <chrono>
+#include <atomic>
 #include <condition_variable>
-#include <cstdio>
-#include <cstdint>
 #include <cstring>
-#include <deque>
-#include <limits>
-#include <mutex>
-#include <new>
-#include <string>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <sstream>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace
 {
     using Microsoft::WRL::ComPtr;
-
-    constexpr std::size_t kMaximumQueuedFrames = 3;
-    constexpr std::size_t kMaximumCompressedFrameBytes = 32U * 1024U * 1024U;
-    constexpr std::size_t kPresentationTextureCount = 3;
-
-    [[nodiscard]] std::string HResultMessage(const HRESULT result)
+    constexpr std::size_t kQueueLimit=3;
+    constexpr std::size_t kMaximumFrameBytes=32*1024*1024;
+    std::string Utf8(const wchar_t* value)
     {
-        std::array<wchar_t, 512> buffer{};
-        const DWORD length = FormatMessageW(
-            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-            nullptr,
-            static_cast<DWORD>(result),
-            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-            buffer.data(),
-            static_cast<DWORD>(buffer.size()),
-            nullptr);
-        if (length == 0)
-        {
-            char numeric[32]{};
-            std::snprintf(numeric, sizeof(numeric), "0x%08lX", static_cast<unsigned long>(result));
-            return numeric;
-        }
-        const int utf8Length = WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(length), nullptr, 0, nullptr, nullptr);
-        std::string message(static_cast<std::size_t>(utf8Length), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, buffer.data(), static_cast<int>(length), message.data(), utf8Length, nullptr, nullptr);
-        while (!message.empty() && (message.back() == '\r' || message.back() == '\n' || message.back() == ' '))
-        {
-            message.pop_back();
-        }
-        return message;
+        const int length=WideCharToMultiByte(CP_UTF8,0,value,-1,nullptr,0,nullptr,nullptr);
+        if (length<2) return {};
+        std::string result(length,'\0');
+        WideCharToMultiByte(CP_UTF8,0,value,-1,result.data(),length,nullptr,nullptr);
+        result.pop_back(); return result;
     }
-
-    [[nodiscard]] bool IsD3D11AwareSynchronousTransform(IMFTransform* transform)
+    std::string AdapterId(const LUID& id)
     {
-        ComPtr<IMFAttributes> attributes;
-        UINT32 d3d11Aware{};
-        UINT32 asynchronous{};
-        return SUCCEEDED(transform->GetAttributes(&attributes)) &&
-               SUCCEEDED(attributes->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) &&
-               d3d11Aware != 0 &&
-               (!SUCCEEDED(attributes->GetUINT32(MF_TRANSFORM_ASYNC, &asynchronous)) || asynchronous == 0);
+        char result[32]{}; std::snprintf(result,sizeof(result),"%08x:%08x",unsigned(id.HighPart),unsigned(id.LowPart));
+        return result;
     }
-
-    void PreferLowLatency(IMFTransform* transform)
+    std::string AvError(int code)
+    { char buffer[AV_ERROR_MAX_STRING_SIZE]{}; av_strerror(code,buffer,sizeof(buffer)); return buffer; }
+    std::string HrError(HRESULT code)
+    { char buffer[32]{}; std::snprintf(buffer,sizeof(buffer),"0x%08lx",static_cast<unsigned long>(code)); return buffer; }
+    const GUID& Profile(int format)
     {
-        ComPtr<IMFAttributes> attributes;
-        if (SUCCEEDED(transform->GetAttributes(&attributes)))
-        {
-            attributes->SetUINT32(MF_LOW_LATENCY, TRUE);
-        }
-
-        // The Windows H.264 MFT exposes this optional codec setting on
-        // supported systems. A decoder that does not implement it simply
-        // ignores the best-effort request.
-        ComPtr<ICodecAPI> codecApi;
-        if (SUCCEEDED(transform->QueryInterface(IID_PPV_ARGS(&codecApi))))
-        {
-            VARIANT enabled{};
-            VariantInit(&enabled);
-            enabled.vt = VT_BOOL;
-            enabled.boolVal = VARIANT_TRUE;
-            codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &enabled);
-            VariantClear(&enabled);
-        }
+        if (format==VIDEO_FORMAT_H265) return D3D11_DECODER_PROFILE_HEVC_VLD_MAIN;
+        if (format==VIDEO_FORMAT_AV1_MAIN8) return D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0;
+        return D3D11_DECODER_PROFILE_H264_VLD_NOFGT;
     }
-
-    struct EncodedFrame
+    AVCodecID CodecId(int format)
     {
-        std::vector<unsigned char> data;
-        std::uint64_t presentationTimeUs{};
-        int frameType{};
+        return format==VIDEO_FORMAT_H265 ? AV_CODEC_ID_HEVC : format==VIDEO_FORMAT_AV1_MAIN8 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_H264;
+    }
+    std::string CodecName(int format)
+    { return format==VIDEO_FORMAT_H265 ? "HEVC Main" : format==VIDEO_FORMAT_AV1_MAIN8 ? "AV1 Main" : "H.264 High"; }
+    int DeviceFormats(ID3D11Device* device,int width,int height)
+    {
+        ComPtr<ID3D11VideoDevice> video;
+        if (!device || FAILED(device->QueryInterface(IID_PPV_ARGS(&video)))) return 0;
+        int formats{};
+        for (int format:{VIDEO_FORMAT_H264,VIDEO_FORMAT_H265,VIDEO_FORMAT_AV1_MAIN8})
+        {
+            BOOL supported{}; UINT count{};
+            D3D11_VIDEO_DECODER_DESC description{Profile(format),UINT(width),UINT(height),DXGI_FORMAT_NV12};
+            if (SUCCEEDED(video->CheckVideoDecoderFormat(&description.Guid,DXGI_FORMAT_NV12,&supported)) && supported &&
+                SUCCEEDED(video->GetVideoDecoderConfigCount(&description,&count)) && count && vanta::HardwareVideoDecoder::HasHardwareDecoder(format)) formats|=format;
+        }
+        return formats;
+    }
+    bool MakeDevice(IDXGIAdapter* adapter,ID3D11Device** device,ID3D11DeviceContext** context)
+    {
+        const D3D_FEATURE_LEVEL levels[]{D3D_FEATURE_LEVEL_11_1,D3D_FEATURE_LEVEL_11_0};
+        D3D_FEATURE_LEVEL selected{};
+        return SUCCEEDED(D3D11CreateDevice(adapter,D3D_DRIVER_TYPE_UNKNOWN,nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT|D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            levels,UINT(std::size(levels)),D3D11_SDK_VERSION,device,&selected,context));
+    }
+    std::string JsonString(const std::string& value)
+    {
+        std::ostringstream out; out<<'"';
+        for (unsigned char c:value)
+        {
+            if (c=='"' || c=='\\') out<<'\\'<<char(c);
+            else if (c=='\n') out<<"\\n";
+            else if (c=='\r') out<<"\\r";
+            else if (c<32) out<<"\\u"<<std::hex<<std::setw(4)<<std::setfill('0')<<int(c)<<std::dec;
+            else out<<char(c);
+        }
+        out<<'"'; return out.str();
+    }
+    struct GpuWaitEvent
+    {
+        HANDLE value=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        ~GpuWaitEvent(){if(value)CloseHandle(value);}
+    };
+    struct DecodeCompletion
+    {
+        ComPtr<ID3D11Query> query;
+        ComPtr<ID3D11Fence> fence;
+        std::unique_ptr<GpuWaitEvent> event;
+        std::uint64_t value{};
+    };
+    struct FrameLease
+    {
+        AVFrame* frame{};
+        ComPtr<ID3D11Texture2D> texture;
+        UINT slice{};
+        std::uint64_t readyFence{};
+        std::shared_ptr<DecodeCompletion> completion;
+        vanta::CapturedFrameMetadata metadata;
+        ~FrameLease() { av_frame_free(&frame); }
+    };
+    struct EncodedPacket
+    {
+        AVBufferRef* buffer{};
+        int size{};
+        vanta::CapturedFrameMetadata metadata;
+        int type{};
+        EncodedPacket()=default;
+        EncodedPacket(const EncodedPacket&)=delete;
+        EncodedPacket& operator=(const EncodedPacket&)=delete;
+        EncodedPacket(EncodedPacket&& other) noexcept
+            :buffer(std::exchange(other.buffer,nullptr)),size(other.size),metadata(other.metadata),type(other.type){}
+        EncodedPacket& operator=(EncodedPacket&& other) noexcept
+        {if(this!=&other){av_buffer_unref(&buffer);buffer=std::exchange(other.buffer,nullptr);size=other.size;metadata=other.metadata;type=other.type;}return *this;}
+        ~EncodedPacket(){av_buffer_unref(&buffer);}
     };
 }
 
@@ -109,1101 +139,1053 @@ namespace vanta
 {
     struct HardwareVideoDecoder::Implementation
     {
+        std::recursive_mutex lifecycleMutex;
         mutable std::mutex stateMutex;
-        std::condition_variable queueCondition;
-        std::condition_variable readyCondition;
-        std::thread decodeThread;
-        std::deque<EncodedFrame> queue;
-        std::deque<std::vector<unsigned char>> reusableCompressedBuffers;
-
-        ComPtr<ID3D11Device> device;
-        ComPtr<ID3D11DeviceContext> deviceContext;
+        std::condition_variable_any queueCondition,frameCondition;
+        GpuWaitEvent frameEvent;
+        std::jthread decodeThread;
+        BoundedStreamQueue<EncodedPacket,3> queue;
+        std::mutex packetPoolMutex;
+        std::array<AVBufferPool*,9> packetPools{};
+        AVBufferRef* PacketBuffer(std::size_t size)
+        {
+            std::lock_guard lock(packetPoolMutex);
+            std::size_t capacity=256*1024,index=0;
+            while(capacity<size && index+1<packetPools.size()){capacity*=2;++index;}
+            if(capacity<size)return nullptr;
+            if(!packetPools[index])packetPools[index]=av_buffer_pool_init(capacity,nullptr);
+            return packetPools[index] ? av_buffer_pool_get(packetPools[index]) : nullptr;
+        }
+        FrameMetadataLedger pendingMetadata;
+        std::function<void()> requestIdrCallback;
+        DecodedVideoStats stats;
+        std::mutex aggregateMutex;
+        DecodedVideoStats cachedStats;
+        std::uint64_t nextAggregateUs{};
+        std::deque<std::pair<std::uint64_t,int>> receivedTimes;
+        std::deque<std::uint64_t> decodedTimes,publishedTimes;
+        std::atomic_bool accepting{false},stopped{true};
+        std::atomic_uint64_t generation{0},session{0},nextSequence{0};
+        StreamRecoveryState recovery;
+        int selectedFormat{};
+        std::uint32_t lastFrameNumber{};
+        bool haveFrameNumber{};
+        std::shared_ptr<FrameLease> latestFrame;
+        std::deque<std::shared_ptr<FrameLease>> pendingGpuFrames;
+        std::vector<std::shared_ptr<DecodeCompletion>> decodeCompletions;
+        std::atomic_size_t gpuFramesInFlight{0};
+        AVCodecContext* codec{};
+        AVBufferRef* hardwareDevice{};
+        std::recursive_mutex contextMutex;
+        ComPtr<ID3D11Device> renderDevice,device;
+        ComPtr<ID3D11DeviceContext> renderContext,context;
         ComPtr<ID3D11VideoDevice> videoDevice;
         ComPtr<ID3D11VideoContext> videoContext;
-        ComPtr<IMFDXGIDeviceManager> deviceManager;
-        UINT deviceManagerToken{};
-        bool mediaFoundationStarted{};
+        ComPtr<ID3D11DeviceContext4> decodeContext4,renderContext4;
+        ComPtr<ID3D11Fence> decodeFence,renderDecodeFence,renderFence;
+        ComPtr<ID3D11DeviceContext4> readbackCompletionContext;
+        ComPtr<ID3D11Fence> readbackCompletionFence;
+        std::uint64_t readbackFenceValue{};
+        std::uint64_t nextDecodeFence{},nextRenderFence{};
+        bool separateDevices{};
+        std::atomic_bool bindYuv{false};
+        RollingStreamMetric reassemblyMetric,decodeMetric,readbackMetric,publicationMetric,hostMetric;
+        RollingStreamMetric compressedQueueMetric,decodeSubmitMetric,gpuCompletionMetric,cpuCopyMetric,dispatchMetric;
+        std::uint64_t lastSlotPressureSequence{}; // readback thread only
 
-        mutable std::mutex frameMutex;
-        std::array<ComPtr<ID3D11Texture2D>, kPresentationTextureCount> presentationTextures;
-        std::array<ComPtr<ID3D11VideoProcessorOutputView>, kPresentationTextureCount> presentationOutputViews;
-        std::array<ComPtr<ID3D11ShaderResourceView>, kPresentationTextureCount> presentationShaderViews;
-        ComPtr<ID3D11Texture2D> cpuReadbackTexture;
-        ComPtr<ID3D11VideoProcessorEnumerator> processorEnumerator;
-        ComPtr<ID3D11VideoProcessor> processor;
-        DXGI_FORMAT processorInputFormat{DXGI_FORMAT_UNKNOWN};
-        int processorInputWidth{};
-        int processorInputHeight{};
-        std::size_t nextPresentationTexture{};
-        std::size_t latestPresentationTexture{kPresentationTextureCount};
-        std::uint64_t latestPresentationSequence{};
-
-        bool workerStop{};
-        bool workerReady{};
-        bool workerFailed{};
-        bool acceptingFrames{};
-        int selectedFormat{};
-        int configuredWidth{};
-        int configuredHeight{};
-        int configuredFps{};
-        std::uint64_t receivedFrames{};
-        std::uint64_t submittedFrames{};
-        std::uint64_t decodedFrames{};
-        std::uint64_t droppedFrames{};
-        std::chrono::steady_clock::time_point frameRateWindowStart{};
-        std::uint64_t frameRateWindowReceivedFrames{};
-        std::uint64_t frameRateWindowDecodedFrames{};
-        double receivedFramesPerSecond{};
-        double decodedFramesPerSecond{};
-        std::string status{"Hardware decoder is not configured."};
-        std::string startupError;
-
-        void ResetFrameRatesLocked()
+        struct ReadbackSlot
         {
-            receivedFrames = 0;
-            submittedFrames = 0;
-            decodedFrames = 0;
-            droppedFrames = 0;
-            frameRateWindowStart = std::chrono::steady_clock::now();
-            frameRateWindowReceivedFrames = 0;
-            frameRateWindowDecodedFrames = 0;
-            receivedFramesPerSecond = 0.0;
-            decodedFramesPerSecond = 0.0;
+            bool busy{},previewOnly{};
+            std::shared_ptr<FrameLease> frame;
+            cv::Rect rectangle,aligned;
+            ComPtr<ID3D11Texture2D> bgra,staging;
+            ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
+            ComPtr<ID3D11VideoProcessor> processor;
+            ComPtr<ID3D11VideoProcessorOutputView> output;
+            ComPtr<ID3D11Query> completion;
+            struct InputView {ID3D11Texture2D* texture{};UINT slice{};ComPtr<ID3D11VideoProcessorInputView> view;};
+            std::vector<InputView> inputViews;
+            std::unique_ptr<GpuWaitEvent> completionEvent;
+            std::uint64_t completionValue{};
+            std::uint64_t issuedUs{};
+            std::uint64_t generation{};
+            int sourceWidth{},sourceHeight{};
+        };
+        std::mutex readbackMutex;
+        std::array<ReadbackSlot,3> slots;
+        CpuFrameStoragePool cpuPool;
+        CpuFrameSnapshot latestCpuSnapshot;
+        cv::Rect lastIssuedRegion;
+        std::uint64_t lastPublishedSequence{};
+        std::atomic_uint64_t lastIssuedSequence{0};
+
+        struct Preview
+        {
+            std::shared_ptr<FrameLease> frame;
+            ComPtr<ID3D11Texture2D> opened;
+            ComPtr<ID3D11ShaderResourceView> y,uv,bgraView;
+            ComPtr<ID3D11Query> completion;
+            std::uint64_t fenceValue{};
+            bool submitted{};
+            bool conversionOnly{};
+            ReadbackSlot* convertedSlot{};
+        };
+        std::mutex previewMutex;
+        std::shared_ptr<Preview> activePreview;
+        std::vector<std::shared_ptr<Preview>> retiredPreviews;
+        ComPtr<ID3D11PixelShader> yuvShader;
+        std::array<ReadbackSlot,3> previewSlots;
+        std::uint64_t previewUs{};
+        bool previewDrawn{};
+
+        static void LockDevice(void* opaque) { static_cast<Implementation*>(opaque)->contextMutex.lock(); }
+        static void UnlockDevice(void* opaque) { static_cast<Implementation*>(opaque)->contextMutex.unlock(); }
+
+        static AVPixelFormat ChooseFormat(AVCodecContext* codec,const AVPixelFormat* formats)
+        {
+            auto& self=*static_cast<Implementation*>(codec->opaque);
+            for (auto p=formats;*p!=AV_PIX_FMT_NONE;++p) if (*p==AV_PIX_FMT_D3D11)
+            {
+                av_buffer_unref(&codec->hw_frames_ctx);
+                if (avcodec_get_hw_frames_parameters(codec,codec->hw_device_ctx,*p,&codec->hw_frames_ctx)<0) return AV_PIX_FMT_NONE;
+                auto* frames=reinterpret_cast<AVHWFramesContext*>(codec->hw_frames_ctx->data);
+                auto* d3d=reinterpret_cast<AVD3D11VAFramesContext*>(frames->hwctx);
+                if (self.bindYuv) d3d->BindFlags|=D3D11_BIND_SHADER_RESOURCE;
+                if (self.separateDevices && self.bindYuv) d3d->MiscFlags|=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+                frames->initial_pool_size+=12; // Decoder references plus bounded readback/preview leases.
+                int initialized=av_hwframe_ctx_init(codec->hw_frames_ctx);
+                if(initialized<0 && self.bindYuv)
+                {
+                    // Some drivers can decode NV12 but reject decoder/SRV/shared
+                    // texture combinations. Keep hardware decoding and share BGRA.
+                    av_buffer_unref(&codec->hw_frames_ctx);
+                    if(avcodec_get_hw_frames_parameters(codec,codec->hw_device_ctx,*p,&codec->hw_frames_ctx)<0)return AV_PIX_FMT_NONE;
+                    frames=reinterpret_cast<AVHWFramesContext*>(codec->hw_frames_ctx->data);frames->initial_pool_size+=12;
+                    initialized=av_hwframe_ctx_init(codec->hw_frames_ctx);self.bindYuv=false;
+                    {std::lock_guard lock(self.stateMutex);self.stats.synchronization+="; reusable GPU BGRA preview fallback";}
+                    log::Info("Direct YUV texture allocation unavailable; using GPU BGRA preview conversion");
+                }
+                if(initialized<0){self.Fail("D3D11VA hardware surface allocation failed: "+AvError(initialized));return AV_PIX_FMT_NONE;}
+                return *p;
+            }
+            return AV_PIX_FMT_NONE; // Hardware-only contract.
         }
 
-        // Update only a few times per second. This keeps the displayed rate
-        // stable while still showing a stopped or bottlenecked stream quickly.
-        void UpdateFrameRatesLocked()
+        void Fail(const std::string& message)
         {
-            const auto now = std::chrono::steady_clock::now();
-            if (frameRateWindowStart.time_since_epoch().count() == 0)
-            {
-                frameRateWindowStart = now;
-                frameRateWindowReceivedFrames = receivedFrames;
-                frameRateWindowDecodedFrames = decodedFrames;
-                return;
-            }
-
-            const double elapsedSeconds = std::chrono::duration<double>(
-                now - frameRateWindowStart).count();
-            if (elapsedSeconds < 0.5)
-            {
-                return;
-            }
-
-            receivedFramesPerSecond = static_cast<double>(
-                receivedFrames - frameRateWindowReceivedFrames) /
-                elapsedSeconds;
-            decodedFramesPerSecond = static_cast<double>(
-                decodedFrames - frameRateWindowDecodedFrames) /
-                elapsedSeconds;
-            frameRateWindowStart = now;
-            frameRateWindowReceivedFrames = receivedFrames;
-            frameRateWindowDecodedFrames = decodedFrames;
+            std::shared_ptr<FrameLease> retired;
+            {std::lock_guard lock(stateMutex);++generation;++session;stats.failed=true;stats.hardwareActive=false;stats.status=message;retired=std::move(latestFrame);}
+            accepting=false; frameCondition.notify_all(); queueCondition.notify_all();if(frameEvent.value)SetEvent(frameEvent.value);
+            log::Error("Receiver: %s",message.c_str());
         }
 
-        void StopDecodeThread()
+        void BeginRecovery()
         {
-            {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                acceptingFrames = false;
-                workerStop = true;
-                queue.clear();
-                reusableCompressedBuffers.clear();
-            }
+            std::lock_guard lock(stateMutex);
+            recovery.Begin();
+            stats.status="Waiting for a recovery IDR and verified hardware output";
             queueCondition.notify_all();
-            readyCondition.notify_all();
-            if (decodeThread.joinable())
-            {
-                decodeThread.join();
-            }
+        }
+        int RejectAccessUnit()
+        {
+            {std::lock_guard lock(stateMutex);if(!accepting || stopped || stats.failed)return DR_OK;
+                ++stats.decoderFailures;++stats.droppedFrames;recovery.Begin();}
+            queueCondition.notify_one();return DR_OK;
         }
 
-        void ClearPresentationResources()
+        bool SetupDevices(ID3D11Device* ui,std::string& error)
         {
-            std::lock_guard<std::mutex> lock(frameMutex);
-            for (auto& texture : presentationTextures) texture.Reset();
-            for (auto& view : presentationOutputViews) view.Reset();
-            for (auto& view : presentationShaderViews) view.Reset();
-            cpuReadbackTexture.Reset();
-            processor.Reset();
-            processorEnumerator.Reset();
-            processorInputFormat = DXGI_FORMAT_UNKNOWN;
-            processorInputWidth = 0;
-            processorInputHeight = 0;
-            nextPresentationTexture = 0;
-            latestPresentationTexture = kPresentationTextureCount;
-            // Keep the sequence monotonic across a stream resize/reconfigure
-            // so Capture's Sunshine source never mistakes a new frame for an
-            // already consumed pre-resize frame.
-        }
-
-        [[nodiscard]] bool SelectNv12OutputType(IMFTransform* transform, std::string& error)
-        {
-            HRESULT result{};
-            for (DWORD index = 0;; ++index)
+            renderDevice=ui; ui->GetImmediateContext(&renderContext);
+            ComPtr<IDXGIDevice> dxgi; ComPtr<IDXGIAdapter> adapter;
+            if (FAILED(ui->QueryInterface(IID_PPV_ARGS(&dxgi))) || FAILED(dxgi->GetAdapter(&adapter)))
+            {error="Cannot identify the rendering adapter";return false;}
+            DXGI_ADAPTER_DESC description{}; adapter->GetDesc(&description);
+            {std::lock_guard lock(stateMutex);stats.adapter=Utf8(description.Description)+" ["+AdapterId(description.AdapterLuid)+"]";}
+            ComPtr<ID3D11Device> other; ComPtr<ID3D11DeviceContext> otherContext;
+            ComPtr<ID3D11Device5> other5,ui5;
+            if (MakeDevice(adapter.Get(),&other,&otherContext) && SUCCEEDED(other.As(&other5)) &&
+                SUCCEEDED(renderDevice.As(&ui5)) && SUCCEEDED(otherContext.As(&decodeContext4)) &&
+                SUCCEEDED(renderContext.As(&renderContext4)) &&
+                SUCCEEDED(other5->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&decodeFence))) &&
+                SUCCEEDED(ui5->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&renderFence))))
             {
-                ComPtr<IMFMediaType> outputType;
-                result = transform->GetOutputAvailableType(0, index, &outputType);
-                if (result == MF_E_NO_MORE_TYPES)
+                HANDLE handle{};
+                if (SUCCEEDED(decodeFence->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&handle)))
                 {
-                    break;
-                }
-                if (FAILED(result))
-                {
-                    continue;
-                }
-                GUID subtype{};
-                if (FAILED(outputType->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_NV12)
-                {
-                    continue;
-                }
-                if (SUCCEEDED(transform->SetOutputType(0, outputType.Get(), 0)))
-                {
-                    return true;
-                }
-            }
-
-            error = "The Windows H.264 hardware decoder has no D3D11 NV12 output format";
-            return false;
-        }
-
-        [[nodiscard]] bool SetInitialInputAndOutputTypes(IMFTransform* transform, std::string& error)
-        {
-            ComPtr<IMFMediaType> inputType;
-            HRESULT result = MFCreateMediaType(&inputType);
-            if (FAILED(result) ||
-                FAILED(inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) ||
-                // common-c assembles one complete Annex-B picture per decode
-                // unit (including SPS/PPS before an IDR), which is exactly
-                // the contract for MFVideoFormat_H264. H264_ES is for
-                // arbitrary fragmented elementary-stream samples.
-                FAILED(inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264)) ||
-                FAILED(MFSetAttributeSize(inputType.Get(), MF_MT_FRAME_SIZE, configuredWidth, configuredHeight)) ||
-                FAILED(MFSetAttributeRatio(inputType.Get(), MF_MT_FRAME_RATE, std::max(1, configuredFps), 1)) ||
-                FAILED(MFSetAttributeRatio(inputType.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1)) ||
-                // H.264 may signal progressive/interlaced structure in-band.
-                // This value lets the decoder honour either form.
-                FAILED(inputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_MixedInterlaceOrProgressive)) ||
-                FAILED(transform->SetInputType(0, inputType.Get(), 0)))
-            {
-                error = "The Windows H.264 hardware decoder rejected Vanta's input format";
-                return false;
-            }
-            return SelectNv12OutputType(transform, error);
-        }
-
-        [[nodiscard]] bool CreateTransform(ComPtr<IMFTransform>& transform, MFT_OUTPUT_STREAM_INFO& outputInfo, std::string& error)
-        {
-            MFT_REGISTER_TYPE_INFO inputType{MFMediaType_Video, MFVideoFormat_H264};
-            MFT_REGISTER_TYPE_INFO outputType{MFMediaType_Video, MFVideoFormat_NV12};
-            IMFActivate** activations{};
-            UINT32 count{};
-            HRESULT result = MFTEnumEx(
-                MFT_CATEGORY_VIDEO_DECODER,
-                MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                &inputType,
-                &outputType,
-                &activations,
-                &count);
-            if (FAILED(result) || count == 0)
-            {
-                error = "Windows did not expose a compatible H.264 decoder";
-                return false;
-            }
-
-            const auto releaseActivations = [&]()
-            {
-                for (UINT32 index = 0; index < count; ++index)
-                {
-                    if (activations[index] != nullptr)
+                    const HRESULT opened=ui5->OpenSharedFence(handle,IID_PPV_ARGS(&renderDecodeFence));
+                    CloseHandle(handle);
+                    D3D11_TEXTURE2D_DESC probe{};
+                    probe.Width=probe.Height=128; probe.MipLevels=1;probe.ArraySize=2;probe.Format=DXGI_FORMAT_NV12;
+                    probe.SampleDesc.Count=1;probe.BindFlags=D3D11_BIND_DECODER|D3D11_BIND_SHADER_RESOURCE;
+                    probe.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+                    ComPtr<ID3D11Texture2D> texture,shared;ComPtr<IDXGIResource1> resource;
+                    if (SUCCEEDED(opened) && SUCCEEDED(other->CreateTexture2D(&probe,nullptr,&texture)) &&
+                        SUCCEEDED(texture.As(&resource)) &&
+                        SUCCEEDED(resource->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ,nullptr,&handle)))
                     {
-                        activations[index]->Release();
+                        const HRESULT sharedResult=ui5->OpenSharedResource1(handle,IID_PPV_ARGS(&shared));CloseHandle(handle);
+                        if (SUCCEEDED(sharedResult)) {device=other;context=otherContext;separateDevices=true;bindYuv=true;}
                     }
                 }
-                CoTaskMemFree(activations);
-            };
-
-            for (UINT32 index = 0; index < count; ++index)
-            {
-                ComPtr<IMFTransform> candidate;
-                result = activations[index]->ActivateObject(IID_PPV_ARGS(&candidate));
-                if (FAILED(result) || !candidate || !IsD3D11AwareSynchronousTransform(candidate.Get()))
-                {
-                    continue;
-                }
-
-                result = candidate->ProcessMessage(
-                    MFT_MESSAGE_SET_D3D_MANAGER,
-                    reinterpret_cast<ULONG_PTR>(deviceManager.Get()));
-                if (FAILED(result))
-                {
-                    continue;
-                }
-                PreferLowLatency(candidate.Get());
-                if (!SetInitialInputAndOutputTypes(candidate.Get(), error))
-                {
-                    candidate->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-                    continue;
-                }
-                result = candidate->GetOutputStreamInfo(0, &outputInfo);
-                if (FAILED(result))
-                {
-                    candidate->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-                    continue;
-                }
-                candidate->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-                candidate->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-                transform = std::move(candidate);
-                releaseActivations();
-                return true;
             }
-
-            releaseActivations();
-            if (error.empty())
+            if (!separateDevices)
             {
-                error = "No Windows H.264 decoder accepted Vanta's D3D11 hardware device";
+                device=renderDevice;context=renderContext;decodeFence.Reset();renderDecodeFence.Reset();renderFence.Reset();
+                decodeContext4.Reset();renderContext4.Reset();
+                ComPtr<ID3D10Multithread> protectedContext;
+                if (SUCCEEDED(device.As(&protectedContext))) protectedContext->SetMultithreadProtected(TRUE);
+                else if (SUCCEEDED(context.As(&protectedContext))) protectedContext->SetMultithreadProtected(TRUE);
+                else {error="D3D11 multithread protection is unavailable";return false;}
+                D3D11_TEXTURE2D_DESC probe{};probe.Width=probe.Height=128;probe.ArraySize=2;probe.MipLevels=1;
+                probe.Format=DXGI_FORMAT_NV12;probe.SampleDesc.Count=1;probe.BindFlags=D3D11_BIND_DECODER|D3D11_BIND_SHADER_RESOURCE;
+                ComPtr<ID3D11Texture2D> texture;bindYuv=SUCCEEDED(device->CreateTexture2D(&probe,nullptr,&texture));
             }
-            return false;
-        }
-
-        [[nodiscard]] bool EnsureVideoProcessor(const DXGI_FORMAT inputFormat, const int width, const int height, std::string& error)
-        {
-            std::lock_guard<std::mutex> lock(frameMutex);
-            if (processor && processorInputFormat == inputFormat && processorInputWidth == width && processorInputHeight == height)
-            {
-                return true;
-            }
-
-            for (auto& texture : presentationTextures) texture.Reset();
-            for (auto& view : presentationOutputViews) view.Reset();
-            for (auto& view : presentationShaderViews) view.Reset();
-            cpuReadbackTexture.Reset();
-            processor.Reset();
-            processorEnumerator.Reset();
-            latestPresentationTexture = kPresentationTextureCount;
-            nextPresentationTexture = 0;
-
-            D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
-            content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-            content.InputFrameRate.Numerator = static_cast<UINT>(std::max(1, configuredFps));
-            content.InputFrameRate.Denominator = 1;
-            content.InputWidth = static_cast<UINT>(width);
-            content.InputHeight = static_cast<UINT>(height);
-            content.OutputFrameRate = content.InputFrameRate;
-            content.OutputWidth = static_cast<UINT>(width);
-            content.OutputHeight = static_cast<UINT>(height);
-            content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
-
-            HRESULT result = videoDevice->CreateVideoProcessorEnumerator(&content, &processorEnumerator);
-            if (FAILED(result) || FAILED(videoDevice->CreateVideoProcessor(processorEnumerator.Get(), 0, &processor)))
-            {
-                error = "Could not create Vanta's GPU NV12-to-BGRA video processor";
-                return false;
-            }
-            videoContext->VideoProcessorSetStreamFrameFormat(processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-            videoContext->VideoProcessorSetStreamAutoProcessingMode(processor.Get(), 0, FALSE);
-
-            // The GameStream request explicitly negotiates SDR Rec.709 with
-            // limited-range YCbCr. Spell that out to the video processor so
-            // 1080p/4K frames are not treated as the legacy Rec.601 default
-            // or rendered with a washed-out range in ImGui's BGRA texture.
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace{};
-            inputColorSpace.Usage = 0; // playback
-            inputColorSpace.YCbCr_Matrix = 1; // Rec.709
-            inputColorSpace.YCbCr_xvYCC = 0;
-            inputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
-            videoContext->VideoProcessorSetStreamColorSpace(processor.Get(), 0, &inputColorSpace);
-
-            D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace{};
-            outputColorSpace.Usage = 0; // playback
-            outputColorSpace.RGB_Range = 0; // full-range BGRA texture
-            outputColorSpace.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
-            videoContext->VideoProcessorSetOutputColorSpace(processor.Get(), &outputColorSpace);
-
-            D3D11_TEXTURE2D_DESC textureDescription{};
-            textureDescription.Width = static_cast<UINT>(width);
-            textureDescription.Height = static_cast<UINT>(height);
-            textureDescription.MipLevels = 1;
-            textureDescription.ArraySize = 1;
-            textureDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            textureDescription.SampleDesc.Count = 1;
-            textureDescription.Usage = D3D11_USAGE_DEFAULT;
-            textureDescription.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDescription{};
-            outputDescription.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-            outputDescription.Texture2D.MipSlice = 0;
-            for (std::size_t index = 0; index < kPresentationTextureCount; ++index)
-            {
-                result = device->CreateTexture2D(&textureDescription, nullptr, &presentationTextures[index]);
-                if (FAILED(result) ||
-                    FAILED(videoDevice->CreateVideoProcessorOutputView(
-                        presentationTextures[index].Get(),
-                        processorEnumerator.Get(),
-                        &outputDescription,
-                        &presentationOutputViews[index])) ||
-                    FAILED(device->CreateShaderResourceView(
-                        presentationTextures[index].Get(),
-                        nullptr,
-                        &presentationShaderViews[index])))
-                {
-                    error = "Could not create Vanta's GPU presentation texture";
-                    for (auto& texture : presentationTextures) texture.Reset();
-                    for (auto& view : presentationOutputViews) view.Reset();
-                    for (auto& view : presentationShaderViews) view.Reset();
-                    processor.Reset();
-                    processorEnumerator.Reset();
-                    return false;
-                }
-            }
-
-            processorInputFormat = inputFormat;
-            processorInputWidth = width;
-            processorInputHeight = height;
+            if (FAILED(device.As(&videoDevice)) || FAILED(context.As(&videoContext)))
+            {error="The selected adapter has no D3D11 video interfaces";return false;}
+            ComPtr<ID3D11Device5> completionDevice;
+            if(FAILED(device.As(&completionDevice)) || FAILED(context.As(&readbackCompletionContext)) ||
+                FAILED(completionDevice->CreateFence(0,D3D11_FENCE_FLAG_NONE,IID_PPV_ARGS(&readbackCompletionFence))))
+            {readbackCompletionContext.Reset();readbackCompletionFence.Reset();}
+            std::string adapterName,synchronization;
+            {std::lock_guard lock(stateMutex);stats.synchronization=separateDevices ? "Separate devices, shared GPU fences" : "Protected single-device fallback";
+                adapterName=stats.adapter;synchronization=stats.synchronization;}
+            log::Info("Receiver adapter: %s; %s; YUV binding=%s",adapterName.c_str(),synchronization.c_str(),bindYuv?"yes":"no");
+            const char* shader=R"(Texture2DArray<float> Y:register(t0);Texture2DArray<float2> UV:register(t1);SamplerState S:register(s0);
+                struct Input{float4 position:SV_POSITION;float4 color:COLOR0;float2 uv:TEXCOORD0;};
+                float4 main(Input i):SV_Target{float y=(Y.Sample(S,float3(i.uv,0))*255-16)/219;
+                float2 c=(UV.Sample(S,float3(i.uv,0))*255-128)/224;
+                return float4(saturate(float3(y+1.5748*c.y,y-.187324*c.x-.468124*c.y,y+1.8556*c.x)),1)*i.color;})";
+            ComPtr<ID3DBlob> code,diagnostic;
+            if (bindYuv && SUCCEEDED(D3DCompile(shader,std::strlen(shader),nullptr,nullptr,nullptr,"main","ps_4_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&diagnostic)))
+                renderDevice->CreatePixelShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&yuvShader);
             return true;
         }
 
-        [[nodiscard]] bool PresentDecodedSample(IMFSample* sample, std::string& error)
+        bool OpenCodec(std::string& error)
         {
-            ComPtr<IMFMediaBuffer> mediaBuffer;
-            if (FAILED(sample->GetBufferByIndex(0, &mediaBuffer)))
-            {
-                error = "The Windows decoder output is missing a video buffer";
-                return false;
-            }
-            ComPtr<IMFDXGIBuffer> dxgiBuffer;
-            if (FAILED(mediaBuffer.As(&dxgiBuffer)))
-            {
-                error = "The Windows decoder did not return a GPU video buffer";
-                return false;
-            }
-            ComPtr<ID3D11Texture2D> sourceTexture;
-            UINT subresource{};
-            if (FAILED(dxgiBuffer->GetResource(IID_PPV_ARGS(&sourceTexture))) ||
-                FAILED(dxgiBuffer->GetSubresourceIndex(&subresource)))
-            {
-                error = "Could not access the decoded GPU video surface";
-                return false;
-            }
-            D3D11_TEXTURE2D_DESC sourceDescription{};
-            sourceTexture->GetDesc(&sourceDescription);
-            if (sourceDescription.Format != DXGI_FORMAT_NV12)
-            {
-                error = "The Windows hardware decoder returned an unsupported video surface format";
-                return false;
-            }
-            if (!EnsureVideoProcessor(sourceDescription.Format, static_cast<int>(sourceDescription.Width), static_cast<int>(sourceDescription.Height), error))
-            {
-                return false;
-            }
-
-            std::lock_guard<std::mutex> lock(frameMutex);
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDescription{};
-            inputDescription.FourCC = 0;
-            inputDescription.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-            inputDescription.Texture2D.MipSlice = 0;
-            inputDescription.Texture2D.ArraySlice = subresource;
-            ComPtr<ID3D11VideoProcessorInputView> inputView;
-            const HRESULT result = videoDevice->CreateVideoProcessorInputView(
-                sourceTexture.Get(), processorEnumerator.Get(), &inputDescription, &inputView);
-            if (FAILED(result))
-            {
-                error = "Could not create Vanta's GPU decoded-frame view";
-                return false;
-            }
-            const std::size_t target = nextPresentationTexture;
-            D3D11_VIDEO_PROCESSOR_STREAM stream{};
-            stream.Enable = TRUE;
-            stream.OutputIndex = 0;
-            stream.pInputSurface = inputView.Get();
-            if (FAILED(videoContext->VideoProcessorBlt(
-                    processor.Get(),
-                    presentationOutputViews[target].Get(),
-                    0,
-                    1,
-                    &stream)))
-            {
-                error = "Could not convert Vanta's decoded GPU frame for rendering";
-                return false;
-            }
-            latestPresentationTexture = target;
-            ++latestPresentationSequence;
-            nextPresentationTexture = (target + 1) % kPresentationTextureCount;
+            hardwareDevice=av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+            if (!hardwareDevice) {error="Cannot allocate FFmpeg D3D11 hardware context";return false;}
+            auto* hw=reinterpret_cast<AVHWDeviceContext*>(hardwareDevice->data);
+            auto* d3d=reinterpret_cast<AVD3D11VADeviceContext*>(hw->hwctx);
+            device.CopyTo(&d3d->device);context.CopyTo(&d3d->device_context);
+            d3d->lock=LockDevice;d3d->unlock=UnlockDevice;d3d->lock_ctx=this;
+            int result=av_hwdevice_ctx_init(hardwareDevice);
+            if (result<0) {error="D3D11VA initialization failed: "+AvError(result);return false;}
+            const AVCodec* decoder=avcodec_find_decoder(CodecId(selectedFormat));
+            if (!decoder) {error="This FFmpeg build does not contain the selected decoder";return false;}
+            codec=avcodec_alloc_context3(decoder);
+            if (!codec) {error="Cannot allocate the hardware decoder";return false;}
+            codec->hw_device_ctx=av_buffer_ref(hardwareDevice);codec->opaque=this;codec->get_format=ChooseFormat;
+            codec->width=stats.width;codec->height=stats.height;codec->pkt_timebase={1,1000000};
+            codec->flags|=AV_CODEC_FLAG_LOW_DELAY|AV_CODEC_FLAG_COPY_OPAQUE;
+            codec->apply_cropping=0; // Preserve decoder crop metadata for the visible rectangle.
+            codec->err_recognition=AV_EF_EXPLODE;codec->thread_count=1;codec->thread_type=0;codec->extra_hw_frames=9;
+            result=avcodec_open2(codec,decoder,nullptr);
+            if (result<0) {error="Cannot open hardware "+CodecName(selectedFormat)+": "+AvError(result);return false;}
             return true;
         }
 
-        [[nodiscard]] bool CopyLatestFrameToBgra(
-            const std::uint64_t afterSequence,
-            cv::Mat& output,
-            std::uint64_t& sequence)
-        {
-            std::lock_guard<std::mutex> lock(frameMutex);
-            if (latestPresentationTexture >= kPresentationTextureCount ||
-                latestPresentationSequence <= afterSequence ||
-                device == nullptr ||
-                deviceContext == nullptr)
-            {
-                return false;
-            }
-
-            ID3D11Texture2D* source = presentationTextures[latestPresentationTexture].Get();
-            if (source == nullptr)
-            {
-                return false;
-            }
-            D3D11_TEXTURE2D_DESC description{};
-            source->GetDesc(&description);
-            if (description.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
-                description.Width == 0 ||
-                description.Height == 0)
-            {
-                return false;
-            }
-
-            bool recreateReadbackTexture = cpuReadbackTexture == nullptr;
-            if (!recreateReadbackTexture)
-            {
-                D3D11_TEXTURE2D_DESC existing{};
-                cpuReadbackTexture->GetDesc(&existing);
-                recreateReadbackTexture =
-                    existing.Width != description.Width ||
-                    existing.Height != description.Height ||
-                    existing.Format != description.Format;
-            }
-            if (recreateReadbackTexture)
-            {
-                cpuReadbackTexture.Reset();
-                description.BindFlags = 0;
-                description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                description.Usage = D3D11_USAGE_STAGING;
-                description.MiscFlags = 0;
-                description.MipLevels = 1;
-                description.ArraySize = 1;
-                if (FAILED(device->CreateTexture2D(&description, nullptr, &cpuReadbackTexture)))
-                {
-                    return false;
-                }
-            }
-
-            deviceContext->CopyResource(cpuReadbackTexture.Get(), source);
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            if (FAILED(deviceContext->Map(cpuReadbackTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
-            {
-                return false;
-            }
-            const cv::Mat view(
-                static_cast<int>(description.Height),
-                static_cast<int>(description.Width),
-                CV_8UC4,
-                mapped.pData,
-                mapped.RowPitch);
-            cv::Mat copied;
-            try
-            {
-                copied = view.clone();
-            }
-            catch (...)
-            {
-                deviceContext->Unmap(cpuReadbackTexture.Get(), 0);
-                return false;
-            }
-            deviceContext->Unmap(cpuReadbackTexture.Get(), 0);
-            if (copied.empty())
-            {
-                return false;
-            }
-            output = std::move(copied);
-            sequence = latestPresentationSequence;
-            return true;
-        }
-
-        [[nodiscard]] bool CreateGpuOutputSample(
-            IMFTransform* transform,
-            ComPtr<IMFSample>& sample,
-            std::string& error)
-        {
-            if (transform == nullptr || device == nullptr)
-            {
-                error = "The Windows hardware decoder has no D3D11 output device";
-                return false;
-            }
-
-            ComPtr<IMFMediaType> outputType;
-            UINT32 width{};
-            UINT32 height{};
-            GUID subtype{};
-            if (FAILED(transform->GetOutputCurrentType(0, &outputType)) ||
-                outputType == nullptr ||
-                FAILED(outputType->GetGUID(MF_MT_SUBTYPE, &subtype)) ||
-                FAILED(MFGetAttributeSize(outputType.Get(), MF_MT_FRAME_SIZE, &width, &height)) ||
-                width == 0 || height == 0 || subtype != MFVideoFormat_NV12)
-            {
-                error = "The Windows hardware decoder did not expose an NV12 D3D11 output type";
-                return false;
-            }
-
-            D3D11_TEXTURE2D_DESC description{};
-            description.Width = width;
-            description.Height = height;
-            description.MipLevels = 1;
-            description.ArraySize = 1;
-            description.Format = DXGI_FORMAT_NV12;
-            description.SampleDesc.Count = 1;
-            description.Usage = D3D11_USAGE_DEFAULT;
-            description.BindFlags = D3D11_BIND_DECODER;
-
-            ComPtr<ID3D11Texture2D> texture;
-            ComPtr<IMFMediaBuffer> buffer;
-            const HRESULT result =
-                device->CreateTexture2D(&description, nullptr, &texture);
-            if (FAILED(result) ||
-                FAILED(MFCreateDXGISurfaceBuffer(
-                    __uuidof(ID3D11Texture2D),
-                    texture.Get(),
-                    0,
-                    FALSE,
-                    &buffer)) ||
-                FAILED(MFCreateSample(&sample)) ||
-                FAILED(sample->AddBuffer(buffer.Get())))
-            {
-                sample.Reset();
-                error = "Could not allocate a D3D11 output surface for the Windows H.264 decoder";
-                return false;
-            }
-            return true;
-        }
-
-        [[nodiscard]] bool DrainOutput(IMFTransform* transform, MFT_OUTPUT_STREAM_INFO& outputInfo, std::string& error)
+        bool ReceiveFrames()
         {
             for (;;)
             {
-                MFT_OUTPUT_DATA_BUFFER output{};
-                ComPtr<IMFSample> suppliedSample;
-                if ((outputInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0)
-                {
-                    if (!CreateGpuOutputSample(transform, suppliedSample, error))
-                    {
-                        return false;
-                    }
-                    output.pSample = suppliedSample.Get();
-                }
-
-                DWORD processStatus{};
-                const HRESULT result = transform->ProcessOutput(0, 1, &output, &processStatus);
-                if (output.pEvents != nullptr)
-                {
-                    output.pEvents->Release();
-                }
-                if (result == MF_E_TRANSFORM_NEED_MORE_INPUT)
-                {
-                    return true;
-                }
-                if (result == MF_E_TRANSFORM_STREAM_CHANGE)
-                {
-                    // MF_E_TRANSFORM_STREAM_CHANGE means the decoder learned
-                    // the real stream format from SPS/PPS. Reapplying the
-                    // input type here can reset that parsed keyframe, so only
-                    // renegotiate the output side as required by the MFT
-                    // contract.
-                    if (!SelectNv12OutputType(transform, error) || FAILED(transform->GetOutputStreamInfo(0, &outputInfo)))
-                    {
-                        if (error.empty()) error = "The Windows hardware decoder could not renegotiate its output format";
-                        return false;
-                    }
-                    continue;
-                }
-                if (FAILED(result))
-                {
-                    error = "The Windows hardware decoder could not produce a video frame: " + HResultMessage(result);
-                    return false;
-                }
-                if (output.pSample == nullptr)
-                {
-                    error = "The Windows hardware decoder produced an empty video frame";
-                    return false;
-                }
-
-                ComPtr<IMFSample> transformSample;
-                if (output.pSample != suppliedSample.Get())
-                {
-                    transformSample.Attach(output.pSample);
-                }
-                if (!PresentDecodedSample(output.pSample, error))
-                {
-                    return false;
-                }
-                {
-                    std::lock_guard<std::mutex> lock(stateMutex);
-                    ++decodedFrames;
-                    UpdateFrameRatesLocked();
-                    status = "Receiving H.264 through the GPU hardware decoder.";
-                }
-            }
-        }
-
-        [[nodiscard]] bool DecodeFrame(
-            IMFTransform* transform,
-            MFT_OUTPUT_STREAM_INFO& outputInfo,
-            const EncodedFrame& frame,
-            std::string& error)
-        {
-            ComPtr<IMFSample> inputSample;
-            ComPtr<IMFMediaBuffer> inputBuffer;
-            HRESULT result = MFCreateSample(&inputSample);
-            if (FAILED(result) || FAILED(MFCreateMemoryBuffer(static_cast<DWORD>(frame.data.size()), &inputBuffer)))
-            {
-                error = "Could not allocate a Media Foundation input sample";
-                return false;
-            }
-            BYTE* destination{};
-            DWORD maximumLength{};
-            const HRESULT lockResult = inputBuffer->Lock(&destination, &maximumLength, nullptr);
-            if (FAILED(lockResult))
-            {
-                error = "Could not write a compressed Sunshine video frame";
-                return false;
-            }
-            if (maximumLength < frame.data.size())
-            {
-                inputBuffer->Unlock();
-                error = "The Media Foundation input buffer was smaller than the Sunshine video frame";
-                return false;
-            }
-            std::memcpy(destination, frame.data.data(), frame.data.size());
-            inputBuffer->Unlock();
-            if (FAILED(inputBuffer->SetCurrentLength(static_cast<DWORD>(frame.data.size()))) ||
-                FAILED(inputSample->AddBuffer(inputBuffer.Get())))
-            {
-                error = "Could not prepare a compressed Sunshine video frame";
-                return false;
-            }
-            if (frame.frameType == FRAME_TYPE_IDR)
-            {
-                inputSample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
-            }
-            if (FAILED(inputSample->SetSampleTime(static_cast<LONGLONG>(frame.presentationTimeUs * 10ULL))) ||
-                FAILED(inputSample->SetSampleDuration(10000000LL / std::max(1, configuredFps))))
-            {
-                error = "Could not timestamp a compressed Sunshine video frame";
-                return false;
-            }
-
-            result = transform->ProcessInput(0, inputSample.Get(), 0);
-            if (result == MF_E_NOTACCEPTING)
-            {
-                if (!DrainOutput(transform, outputInfo, error))
-                {
-                    return false;
-                }
-                result = transform->ProcessInput(0, inputSample.Get(), 0);
-            }
-            if (FAILED(result))
-            {
-                error = "The Windows hardware decoder rejected a Sunshine video frame: " + HResultMessage(result);
-                return false;
-            }
-            return DrainOutput(transform, outputInfo, error);
-        }
-
-        void DecodeThreadMain()
-        {
-            const HRESULT apartmentResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            const bool apartmentInitialized = SUCCEEDED(apartmentResult);
-            ComPtr<IMFTransform> transform;
-            MFT_OUTPUT_STREAM_INFO outputInfo{};
-            std::string error;
-            const bool initialized = apartmentInitialized && CreateTransform(transform, outputInfo, error);
-            {
-                std::lock_guard<std::mutex> lock(stateMutex);
-                workerReady = initialized;
-                workerFailed = !initialized;
-                startupError = initialized ? std::string{} : (apartmentInitialized ? error : "Could not initialize the Media Foundation decoding thread");
-                status = initialized ? "H.264 hardware decoder ready." : startupError;
-            }
-            readyCondition.notify_all();
-            if (!initialized)
-            {
-                if (apartmentInitialized) CoUninitialize();
-                return;
-            }
-
-            // Some D3D11 video MFTs finish GPU work just after the immediate
-            // ProcessOutput call made by DecodeFrame(). Give them a few short
-            // output polls before sleeping for more network input. Without
-            // this, the final frame of a stream can remain held until another
-            // packet happens to arrive.
-            unsigned int pendingOutputPolls{};
-            for (;;)
-            {
-                EncodedFrame frame;
-                bool hasFrame{};
-                {
-                    std::unique_lock<std::mutex> lock(stateMutex);
-                    if (queue.empty() && pendingOutputPolls != 0)
-                    {
-                        queueCondition.wait_for(
-                            lock,
-                            std::chrono::milliseconds(1),
-                            [this]() { return workerStop || !queue.empty(); });
-                    }
-                    else
-                    {
-                        queueCondition.wait(lock, [this]() { return workerStop || !queue.empty(); });
-                    }
-                    if (workerStop)
-                    {
-                        break;
-                    }
-                    if (!queue.empty())
-                    {
-                        frame = std::move(queue.front());
-                        queue.pop_front();
-                        hasFrame = true;
-                    }
-                }
-
-                if (!hasFrame)
-                {
-                    --pendingOutputPolls;
-                    if (!DrainOutput(transform.Get(), outputInfo, error))
-                    {
-                        {
-                            std::lock_guard<std::mutex> lock(stateMutex);
-                            ++droppedFrames;
-                            status = error;
-                        }
-                        LiRequestIdrFrame();
-                        transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-                        pendingOutputPolls = 0;
-                    }
-                    continue;
-                }
-                if (!DecodeFrame(transform.Get(), outputInfo, frame, error))
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(stateMutex);
-                        ++droppedFrames;
-                        status = error;
-                    }
-                    // The queue is intentionally shallow for LAN latency. If
-                    // the decoder rejects an access unit, ask Sunshine for a
-                    // clean keyframe rather than continuing with broken refs.
-                    LiRequestIdrFrame();
-                    transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-                    pendingOutputPolls = 0;
-                }
+                if(stopped)return true;
+                AVFrame* frame=av_frame_alloc();
+                if (!frame) return false;
+                const int result=avcodec_receive_frame(codec,frame);
+                if (result==AVERROR(EAGAIN) || result==AVERROR_EOF) {av_frame_free(&frame);return true;}
+                if (result<0) {av_frame_free(&frame);return false;}
+                if (frame->format!=AV_PIX_FMT_D3D11 || !frame->data[0] || !frame->hw_frames_ctx)
+                {av_frame_free(&frame);Fail("Decoder output is not a hardware D3D11 surface; CPU fallback is disabled");return false;}
+                auto lease=std::make_shared<FrameLease>();lease->frame=frame;
+                lease->texture=reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);lease->slice=UINT(reinterpret_cast<std::uintptr_t>(frame->data[1]));
+                CapturedFrameMetadata opaque;const CapturedFrameMetadata* association{};
+                if(frame->opaque_ref && frame->opaque_ref->size==sizeof(opaque))
+                {std::memcpy(&opaque,frame->opaque_ref->data,sizeof(opaque));association=&opaque;}
+                if(!pendingMetadata.Take(frame->pts,association,lease->metadata))
+                {Fail("Hardware output has no matching access-unit metadata");return false;}
+                D3D11_TEXTURE2D_DESC description{};lease->texture->GetDesc(&description);
+                if (description.Format!=DXGI_FORMAT_NV12) {Fail("Hardware decoder returned a non-NV12 surface");return false;}
+                auto& metadata=lease->metadata;
+                metadata.sourceWidth=frame->width-int(frame->crop_left+frame->crop_right);
+                metadata.sourceHeight=frame->height-int(frame->crop_top+frame->crop_bottom);
+                metadata.cropWidth=metadata.sourceWidth;metadata.cropHeight=metadata.sourceHeight;
+                metadata.visibleX=int(frame->crop_left);metadata.visibleY=int(frame->crop_top);
+                metadata.textureWidth=int(description.Width);metadata.textureHeight=int(description.Height);
+                if (metadata.sourceWidth<=0 || metadata.sourceHeight<=0 || metadata.visibleX+metadata.sourceWidth>int(description.Width) ||
+                    metadata.visibleY+metadata.sourceHeight>int(description.Height)) {Fail("Invalid decoded visible rectangle");return false;}
+                metadata.timing.decodedUs=StreamNowUs();metadata.sequence=++nextSequence;
+                {std::lock_guard stateLock(stateMutex);metadata.sourcePeriodUs=1000000ULL/static_cast<unsigned>(std::max(1,stats.configuredFps));}
+                auto found=std::find_if(decodeCompletions.begin(),decodeCompletions.end(),[](const auto& completion){return completion.use_count()==1;});
+                if(found!=decodeCompletions.end())lease->completion=*found;
                 else
                 {
-                    pendingOutputPolls = 8;
+                    if(decodeCompletions.size()==32){Fail("Hardware surface completion leases exhausted");return false;}
+                    auto completion=std::make_shared<DecodeCompletion>();D3D11_QUERY_DESC query{D3D11_QUERY_EVENT,0};
+                    if(FAILED(device->CreateQuery(&query,&completion->query))){Fail("Cannot create hardware surface completion tracking");return false;}
+                    completion->event=std::make_unique<GpuWaitEvent>();if(!completion->event->value)completion->event.reset();
+                    decodeCompletions.push_back(completion);lease->completion=std::move(completion);
                 }
-
-                // Returning the allocation to the producer avoids a new
-                // multi-megabyte heap allocation for every GameStream frame.
-                // Keep only the few buffers that can be in flight in Vanta's
-                // intentionally shallow low-latency queue.
+                pendingGpuFrames.push_back(lease);gpuFramesInFlight=pendingGpuFrames.size();
                 {
-                    std::lock_guard<std::mutex> lock(stateMutex);
-                    if (!workerStop && !frame.data.empty() && reusableCompressedBuffers.size() < kMaximumQueuedFrames)
+                    std::lock_guard gpu(contextMutex);auto& completion=*lease->completion;
+                    context->End(completion.query.Get());
+                    completion.fence=separateDevices ? decodeFence : readbackCompletionFence;
+                    if(completion.fence)
                     {
-                        frame.data.clear();
-                        reusableCompressedBuffers.push_back(std::move(frame.data));
+                        completion.value=separateDevices ? ++nextDecodeFence : ++readbackFenceValue;
+                        auto* signalingContext=separateDevices ? decodeContext4.Get() : readbackCompletionContext.Get();
+                        if(FAILED(signalingContext->Signal(completion.fence.Get(),completion.value)))
+                        {Fail("Decoder GPU fence failed");return false;}
+                        if(separateDevices)lease->readyFence=completion.value;
+                        if(completion.event)
+                        {ResetEvent(completion.event->value);if(FAILED(completion.fence->SetEventOnCompletion(completion.value,completion.event->value)))completion.event.reset();}
                     }
+                    context->Flush();
+                }
+                decodeMetric.Add(double(metadata.timing.decodedUs-metadata.timing.assembledUs)/1000.0);
+                bool geometryChanged{};
+                std::shared_ptr<FrameLease> retired;
+                {
+                    std::lock_guard lock(stateMutex);
+                    if (stopped || stats.failed || metadata.session!=session) continue;
+                    geometryChanged=stats.latestMetadata.sourceWidth!=metadata.sourceWidth || stats.latestMetadata.sourceHeight!=metadata.sourceHeight ||
+                        stats.latestMetadata.textureWidth!=metadata.textureWidth || stats.latestMetadata.textureHeight!=metadata.textureHeight ||
+                        stats.latestMetadata.visibleX!=metadata.visibleX || stats.latestMetadata.visibleY!=metadata.visibleY;
+                    if(geometryChanged && stats.latestMetadata.sequence)++generation;
+                    metadata.generation=generation.load();
+                    if (latestFrame && latestFrame->metadata.sequence>lastIssuedSequence) ++stats.outputSkippedFrames;
+                    retired=std::move(latestFrame);latestFrame=lease;++stats.decodedFrames;stats.hardwareActive=true;
+                    recovery.OnOutput();
+                    stats.width=metadata.sourceWidth;stats.height=metadata.sourceHeight;
+                    stats.latestMetadata=metadata;
+                    stats.status=recovery.Active() ? "Waiting for a recovery IDR and verified hardware output" : "Hardware "+CodecName(selectedFormat)+" / D3D11VA";
+                    decodedTimes.push_back(metadata.timing.decodedUs);
+                }
+                frameCondition.notify_all();
+                if(frameEvent.value)SetEvent(frameEvent.value);
+                if(geometryChanged)log::Info("Decoded visible rectangle: %dx%d at (%d,%d); GPU allocation %dx%d; stream generation=%llu",
+                    metadata.sourceWidth,metadata.sourceHeight,metadata.visibleX,metadata.visibleY,metadata.textureWidth,metadata.textureHeight,
+                    static_cast<unsigned long long>(metadata.generation));
+            }
+        }
+
+        void Decode(std::stop_token stop)
+        {
+            const HRESULT apartment=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+            while (!stop.stop_requested())
+            {
+                ReapPreviews();
+                if(!ReapDecodedFrames())break;
+                while(pendingGpuFrames.size()>=3 && !stop.stop_requested() && !stopped)
+                {
+                    std::function<void()> requester;bool exhausted{};
+                    {std::lock_guard lock(stateMutex);const auto action=recovery.Poll(StreamNowUs());
+                        if(action==RecoveryAction::requestIdr){++stats.idrRequests;requester=requestIdrCallback;}
+                        exhausted=action==RecoveryAction::terminate;}
+                    if(exhausted){Fail("No recovery IDR produced hardware output after three retries");break;}
+                    if(requester)requester();
+                    const auto completion=pendingGpuFrames.front()->completion;
+                    if(completion->fence && completion->event)WaitForSingleObject(completion->event->value,2);
+                    else{std::unique_lock lock(stateMutex);queueCondition.wait_for(lock,stop,std::chrono::milliseconds(1),[&]{return stopped.load();});}
+                    if(!ReapDecodedFrames())break;
+                }
+                if(stop.stop_requested() || stopped)break;
+                EncodedPacket input;std::array<EncodedPacket,3> discarded;std::size_t discardCount{};
+                bool gotInput{},flush{};std::function<void()> requestIdr;
+                {
+                    std::unique_lock lock(stateMutex);
+                    queueCondition.wait_for(lock,stop,std::chrono::milliseconds(100),[&]{return stopped || stats.failed || !queue.empty() || recovery.NeedsFlush();});
+                    if (stop.stop_requested() || stopped || stats.failed) break;
+                    flush=recovery.TakeFlush();
+                    if(flush)while(!queue.empty() && queue.front().type!=FRAME_TYPE_IDR)
+                    {discarded[discardCount++]=std::move(queue.front());queue.pop_front();++stats.droppedFrames;}
+                    const auto action=recovery.Poll(StreamNowUs());
+                    if(action==RecoveryAction::terminate){lock.unlock();Fail("No recovery IDR arrived after three retries; reconnect the stream");break;}
+                    if(action==RecoveryAction::requestIdr){++stats.idrRequests;requestIdr=requestIdrCallback;}
+                    if (!queue.empty()) {input=std::move(queue.front());queue.pop_front();gotInput=true;if(input.type==FRAME_TYPE_IDR)recovery.OnKeyFrame();}
+                }
+                if (flush) {avcodec_flush_buffers(codec);pendingMetadata.clear();}
+                if (requestIdr) requestIdr();
+                if (!gotInput) continue;
+                AVPacket* packet=av_packet_alloc();
+                bool success=packet && (packet->buf=av_buffer_ref(input.buffer));
+                if (success)
+                {
+                    packet->data=packet->buf->data;packet->size=input.size;
+                    packet->pts=packet->dts=std::int64_t(input.metadata.presentationTimeUs);
+                    if (input.type==FRAME_TYPE_IDR) packet->flags|=AV_PKT_FLAG_KEY;
+                    packet->opaque_ref=av_buffer_alloc(sizeof(CapturedFrameMetadata));
+                    input.metadata.timing.submittedUs=StreamNowUs();
+                    compressedQueueMetric.Add(double(input.metadata.timing.submittedUs-input.metadata.timing.assembledUs)/1000.0);
+                    if (packet->opaque_ref) std::memcpy(packet->opaque_ref->data,&input.metadata,sizeof(input.metadata));
+                    int result=avcodec_send_packet(codec,packet);
+                    if (result==AVERROR(EAGAIN)) {success=ReceiveFrames();if(success)result=avcodec_send_packet(codec,packet);}
+                    success=success && result>=0;
+                    if (success) {pendingMetadata.push_back(input.metadata);success=ReceiveFrames();if(pendingMetadata.size()>32)success=false;}
+                    decodeSubmitMetric.Add(double(StreamNowUs()-input.metadata.timing.submittedUs)/1000.0);
+                }
+                av_packet_free(&packet);
+                if (!success)
+                {
+                    {std::lock_guard lock(stateMutex);++stats.decoderFailures;++stats.droppedFrames;}
+                    BeginRecovery();
                 }
             }
-
-            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-            if (apartmentInitialized) CoUninitialize();
+            if (SUCCEEDED(apartment)) CoUninitialize();
         }
+
+        bool IssueReadback(ReadbackSlot& slot,const std::shared_ptr<FrameLease>& frame,const cv::Rect& rectangle);
+        bool CompleteReadback(ReadbackSlot& slot,CpuFrameSnapshot& output);
+        void ReapPreviews();
+        bool ReapDecodedFrames();
+        bool MakePreview(const std::shared_ptr<FrameLease>& frame);
+        bool ConvertPreview(const std::shared_ptr<FrameLease>& frame);
+        void DrainGpu();
+        static void BindPreviewShader(const ImDrawList*,const ImDrawCmd* command);
+        static void UnbindPreviewShader(const ImDrawList*,const ImDrawCmd* command);
     };
 
-    HardwareVideoDecoder::HardwareVideoDecoder() : implementation_(std::make_unique<Implementation>()) {}
-    HardwareVideoDecoder::~HardwareVideoDecoder() { Shutdown(); }
-
-    bool HardwareVideoDecoder::Initialize(ID3D11Device* device, std::string& error)
+    bool HardwareVideoDecoder::Implementation::ReapDecodedFrames()
     {
-        auto& impl = *implementation_;
-        if (device == nullptr)
+        while(!pendingGpuFrames.empty())
         {
-            error = "Vanta's D3D11 device is not available";
-            return false;
-        }
-        if (impl.mediaFoundationStarted)
-        {
-            return true;
-        }
-        const HRESULT startupResult = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-        if (FAILED(startupResult))
-        {
-            error = "Could not start Windows Media Foundation: " + HResultMessage(startupResult);
-            return false;
-        }
-        impl.mediaFoundationStarted = true;
-        impl.device = device;
-        device->GetImmediateContext(&impl.deviceContext);
-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&impl.videoDevice))) ||
-            FAILED(impl.deviceContext.As(&impl.videoContext)))
-        {
-            error = "Vanta's D3D11 device does not expose its video interfaces";
-            Shutdown();
-            return false;
-        }
-        ComPtr<ID3D10Multithread> multithread;
-        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&multithread))))
-        {
-            multithread->SetMultithreadProtected(TRUE);
-        }
-        const HRESULT managerResult = MFCreateDXGIDeviceManager(&impl.deviceManagerToken, &impl.deviceManager);
-        if (FAILED(managerResult) || FAILED(impl.deviceManager->ResetDevice(device, impl.deviceManagerToken)))
-        {
-            error = "Could not create Media Foundation's D3D11 device manager";
-            Shutdown();
-            return false;
+            const auto completion=pendingGpuFrames.front()->completion;bool complete{};
+            if(completion->fence)
+            {const auto value=completion->fence->GetCompletedValue();if(value==UINT64_MAX){Fail("GPU device removed during decode");return false;}complete=value>=completion->value;}
+            else
+            {
+                HRESULT result{};{std::lock_guard gpu(contextMutex);result=context->GetData(completion->query.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH);}
+                if(FAILED(result)){Fail("GPU decode completion failed: "+HrError(result));return false;}complete=result==S_OK;
+            }
+            if(!complete)break;
+            gpuCompletionMetric.Add(double(StreamNowUs()-pendingGpuFrames.front()->metadata.timing.decodedUs)/1000.0);
+            pendingGpuFrames.pop_front();
+            gpuFramesInFlight=pendingGpuFrames.size();
         }
         return true;
     }
 
-    void HardwareVideoDecoder::Shutdown()
+    bool HardwareVideoDecoder::Implementation::IssueReadback(ReadbackSlot& slot,
+        const std::shared_ptr<FrameLease>& frame,const cv::Rect& rectangle)
     {
-        if (implementation_ == nullptr)
+        if (rectangle.empty()) return false;
+        const auto& metadata=frame->metadata;
+        const auto aligned=AlignNv12Region(rectangle,metadata);
+        int outputWidth=aligned.width,outputHeight=aligned.height;
+        if (slot.previewOnly)
         {
-            return;
+            const double scale=std::min({1.0,560.0/rectangle.width,315.0/rectangle.height});
+            outputWidth=std::max(1,int(rectangle.width*scale));outputHeight=std::max(1,int(rectangle.height*scale));
         }
-        auto& impl = *implementation_;
-        impl.StopDecodeThread();
-        impl.ClearPresentationResources();
-        impl.deviceManager.Reset();
-        impl.videoContext.Reset();
-        impl.videoDevice.Reset();
-        impl.deviceContext.Reset();
-        impl.device.Reset();
-        if (impl.mediaFoundationStarted)
+        std::lock_guard gpu(contextMutex);
+        D3D11_TEXTURE2D_DESC existing{};if(slot.bgra)slot.bgra->GetDesc(&existing);
+        if (!slot.bgra || int(existing.Width)!=outputWidth || int(existing.Height)!=outputHeight ||
+            slot.sourceWidth!=metadata.textureWidth || slot.sourceHeight!=metadata.textureHeight || slot.generation!=metadata.generation)
         {
-            MFShutdown();
-            impl.mediaFoundationStarted = false;
+            slot.bgra.Reset();slot.staging.Reset();slot.enumerator.Reset();slot.processor.Reset();slot.output.Reset();slot.completion.Reset();slot.inputViews.clear();
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+            content.InputFrameFormat=D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            content.InputWidth=metadata.textureWidth;content.InputHeight=metadata.textureHeight;
+            content.OutputWidth=outputWidth;content.OutputHeight=outputHeight;
+            content.InputFrameRate={UINT(std::max(1,stats.configuredFps)),1};content.OutputFrameRate=content.InputFrameRate;
+            content.Usage=D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            if (FAILED(videoDevice->CreateVideoProcessorEnumerator(&content,&slot.enumerator)) ||
+                FAILED(videoDevice->CreateVideoProcessor(slot.enumerator.Get(),0,&slot.processor))) return false;
+            D3D11_TEXTURE2D_DESC texture{};
+            texture.Width=outputWidth;texture.Height=outputHeight;texture.MipLevels=texture.ArraySize=1;
+            texture.Format=DXGI_FORMAT_B8G8R8A8_UNORM;texture.SampleDesc.Count=1;
+            texture.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+            if (slot.previewOnly && separateDevices) texture.MiscFlags=D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+            if (FAILED(device->CreateTexture2D(&texture,nullptr,&slot.bgra))) return false;
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output{};output.ViewDimension=D3D11_VPOV_DIMENSION_TEXTURE2D;
+            if (FAILED(videoDevice->CreateVideoProcessorOutputView(slot.bgra.Get(),slot.enumerator.Get(),&output,&slot.output))) return false;
+            if (!slot.previewOnly)
+            {
+                texture.BindFlags=texture.MiscFlags=0;texture.Usage=D3D11_USAGE_STAGING;texture.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+                if (FAILED(device->CreateTexture2D(&texture,nullptr,&slot.staging))) return false;
+            }
+            D3D11_QUERY_DESC query{D3D11_QUERY_EVENT,0};
+            if (FAILED(device->CreateQuery(&query,&slot.completion))) return false;
+            if(readbackCompletionFence)
+            {slot.completionEvent=std::make_unique<GpuWaitEvent>();if(!slot.completionEvent->value)slot.completionEvent.reset();}
+            videoContext->VideoProcessorSetStreamFrameFormat(slot.processor.Get(),0,D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            videoContext->VideoProcessorSetStreamAutoProcessingMode(slot.processor.Get(),0,FALSE);
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColor{};inputColor.YCbCr_Matrix=1;inputColor.Nominal_Range=D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+            D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColor{};outputColor.Nominal_Range=D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+            videoContext->VideoProcessorSetStreamColorSpace(slot.processor.Get(),0,&inputColor);
+            videoContext->VideoProcessorSetOutputColorSpace(slot.processor.Get(),&outputColor);
+            slot.sourceWidth=metadata.textureWidth;slot.sourceHeight=metadata.textureHeight;slot.generation=metadata.generation;
+        }
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input{};input.ViewDimension=D3D11_VPIV_DIMENSION_TEXTURE2D;
+        input.Texture2D.ArraySlice=frame->slice;
+        auto found=std::find_if(slot.inputViews.begin(),slot.inputViews.end(),[&](const auto& entry){return entry.texture==frame->texture.Get() && entry.slice==frame->slice;});
+        if(found==slot.inputViews.end())
+        {ReadbackSlot::InputView view;view.texture=frame->texture.Get();view.slice=frame->slice;
+            if(FAILED(videoDevice->CreateVideoProcessorInputView(frame->texture.Get(),slot.enumerator.Get(),&input,&view.view)))return false;
+            if(slot.inputViews.size()==96)slot.inputViews.clear();slot.inputViews.push_back(std::move(view));found=std::prev(slot.inputViews.end());}
+        const RECT source{slot.previewOnly ? rectangle.x+metadata.visibleX : aligned.x,
+            slot.previewOnly ? rectangle.y+metadata.visibleY : aligned.y,
+            slot.previewOnly ? rectangle.x+metadata.visibleX+rectangle.width : aligned.x+aligned.width,
+            slot.previewOnly ? rectangle.y+metadata.visibleY+rectangle.height : aligned.y+aligned.height};
+        const RECT destination{0,0,outputWidth,outputHeight};
+        videoContext->VideoProcessorSetStreamSourceRect(slot.processor.Get(),0,TRUE,&source);
+        videoContext->VideoProcessorSetStreamDestRect(slot.processor.Get(),0,TRUE,&destination);
+        videoContext->VideoProcessorSetOutputTargetRect(slot.processor.Get(),TRUE,&destination);
+        D3D11_VIDEO_PROCESSOR_STREAM stream{};stream.Enable=TRUE;stream.pInputSurface=found->view.Get();
+        slot.rectangle=rectangle;slot.aligned=aligned;slot.frame=frame;slot.busy=true;slot.issuedUs=StreamNowUs();
+        if (FAILED(videoContext->VideoProcessorBlt(slot.processor.Get(),slot.output.Get(),0,1,&stream))) return false;
+        if (!slot.previewOnly) context->CopyResource(slot.staging.Get(),slot.bgra.Get());
+        context->End(slot.completion.Get());
+        if(readbackCompletionFence && slot.completionEvent)
+        {
+            slot.completionValue=++readbackFenceValue;
+            ResetEvent(slot.completionEvent->value);
+            if(FAILED(readbackCompletionContext->Signal(readbackCompletionFence.Get(),slot.completionValue)) ||
+                FAILED(readbackCompletionFence->SetEventOnCompletion(slot.completionValue,slot.completionEvent->value)))return false;
+        }
+        context->Flush();
+        slot.rectangle=rectangle;slot.aligned=aligned;slot.frame=frame;slot.busy=true;
+        if(!slot.previewOnly){std::lock_guard lock(stateMutex);++stats.readbacksIssued;}
+        return true;
+    }
+
+    bool HardwareVideoDecoder::Implementation::CompleteReadback(ReadbackSlot& slot,CpuFrameSnapshot& output)
+    {
+        if (!slot.busy) return false;
+        HRESULT completed{};
+        {std::lock_guard gpu(contextMutex);completed=context->GetData(slot.completion.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH);}
+        if (completed==S_FALSE) return false;
+        if (FAILED(completed)) {Fail("GPU readback completion failed: "+HrError(completed));slot.busy=false;slot.frame.reset();return false;}
+        if (slot.frame->metadata.generation!=generation || stopped) {slot.busy=false;slot.frame.reset();return false;}
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        {std::lock_guard gpu(contextMutex);completed=context->Map(slot.staging.Get(),0,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&mapped);}
+        if (completed==DXGI_ERROR_WAS_STILL_DRAWING){std::lock_guard lock(stateMutex);++stats.nonblockingMapRetries;return false;}
+        if (FAILED(completed)) {Fail("GPU readback map failed: "+HrError(completed));slot.busy=false;slot.frame.reset();return false;}
+        const auto copyStarted=StreamNowUs();
+        cv::Mat* storage=cpuPool.Acquire();
+        if(!storage){std::lock_guard lock(stateMutex);++stats.cpuPoolExhaustions;}
+        bool copied{};
+        if (storage) try
+        {
+            storage->create(slot.rectangle.height,slot.rectangle.width,CV_8UC4);
+            const int offsetX=slot.rectangle.x+slot.frame->metadata.visibleX-slot.aligned.x;
+            const int offsetY=slot.rectangle.y+slot.frame->metadata.visibleY-slot.aligned.y;
+            const auto* source=static_cast<const unsigned char*>(mapped.pData)+std::size_t(offsetY)*mapped.RowPitch+offsetX*4;
+            for (int row=0;row<storage->rows;++row)
+                std::memcpy(storage->ptr(row),source+std::size_t(row)*mapped.RowPitch,std::size_t(storage->cols)*4);
+            output.bgra=*storage;output.metadata=slot.frame->metadata;
+            output.metadata.cropX=slot.rectangle.x;output.metadata.cropY=slot.rectangle.y;
+            output.metadata.cropWidth=slot.rectangle.width;output.metadata.cropHeight=slot.rectangle.height;
+            output.metadata.timing.readbackStartedUs=slot.issuedUs;
+            output.metadata.timing.readbackUs=StreamNowUs();
+            output.metadata.captureTimestampNanoseconds=std::int64_t(output.metadata.timing.readbackUs*1000);copied=true;
+        }
+        catch (const std::exception&) {copied=false;}
+        {std::lock_guard gpu(contextMutex);context->Unmap(slot.staging.Get(),0);}
+        slot.busy=false;slot.frame.reset();
+        if (copied)
+        {
+            cpuCopyMetric.Add(double(output.metadata.timing.readbackUs-copyStarted)/1000.0);
+            readbackMetric.Add(double(output.metadata.timing.readbackUs-output.metadata.timing.readbackStartedUs)/1000.0);
+            std::lock_guard lock(stateMutex);
+            ++stats.readbacksCompleted;
+            stats.readbackBytes+=std::uint64_t(output.bgra.cols)*output.bgra.rows*4;
+        }
+        return copied;
+    }
+
+    void HardwareVideoDecoder::Implementation::ReapPreviews()
+    {
+        std::lock_guard lock(previewMutex);
+        std::erase_if(retiredPreviews,[&](const std::shared_ptr<Preview>& preview)
+        {
+            bool done{};
+            if(preview->conversionOnly)
+            {std::lock_guard gpu(contextMutex);done=context->GetData(preview->convertedSlot->completion.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH)!=S_FALSE;}
+            else if (separateDevices) done=renderFence->GetCompletedValue()>=preview->fenceValue;
+            else
+            {
+                std::lock_guard gpu(contextMutex);
+                done=renderContext->GetData(preview->completion.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH)!=S_FALSE;
+            }
+            if (done && preview->convertedSlot) {preview->convertedSlot->busy=false;preview->convertedSlot->frame.reset();}
+            return done;
+        });
+    }
+
+    bool HardwareVideoDecoder::Implementation::ConvertPreview(const std::shared_ptr<FrameLease>& frame)
+    {
+        for (auto& slot:previewSlots) if (!slot.busy)
+        {
+            slot.previewOnly=true;
+            if (!IssueReadback(slot,frame,{0,0,frame->metadata.sourceWidth,frame->metadata.sourceHeight})) return false;
+            const auto abandon=[&]
+            {auto pending=std::make_shared<Preview>();pending->frame=frame;pending->convertedSlot=&slot;pending->conversionOnly=true;retiredPreviews.push_back(std::move(pending));return false;};
+            auto preview=std::make_shared<Preview>();preview->frame=frame;preview->convertedSlot=&slot;
+            ID3D11Texture2D* texture=slot.bgra.Get();
+            if (separateDevices)
+            {
+                ComPtr<IDXGIResource1> resource;ComPtr<ID3D11Device1> ui;HANDLE handle{};
+                if (FAILED(slot.bgra.As(&resource)) || FAILED(renderDevice.As(&ui)) ||
+                    FAILED(resource->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ,nullptr,&handle))) return abandon();
+                const HRESULT result=ui->OpenSharedResource1(handle,IID_PPV_ARGS(&preview->opened));CloseHandle(handle);
+                if (FAILED(result)) return abandon();
+                texture=preview->opened.Get();
+                std::lock_guard gpu(contextMutex);const auto value=++nextDecodeFence;
+                if(FAILED(decodeContext4->Signal(decodeFence.Get(),value)))return abandon();context->Flush();
+                if(FAILED(renderContext4->Wait(renderDecodeFence.Get(),value)))return abandon();
+            }
+            if (FAILED(renderDevice->CreateShaderResourceView(texture,nullptr,&preview->bgraView))) return abandon();
+            activePreview=preview;
+            return true;
+        }
+        return false;
+    }
+
+    bool HardwareVideoDecoder::Implementation::MakePreview(const std::shared_ptr<FrameLease>& frame)
+    {
+        if (!bindYuv || !yuvShader) return ConvertPreview(frame);
+        auto preview=std::make_shared<Preview>();preview->frame=frame;
+        ID3D11Texture2D* texture=frame->texture.Get();
+        if (separateDevices)
+        {
+            ComPtr<IDXGIResource1> resource;ComPtr<ID3D11Device1> ui;HANDLE handle{};
+            if (FAILED(frame->texture.As(&resource)) || FAILED(renderDevice.As(&ui)) ||
+                FAILED(resource->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ,nullptr,&handle))) return ConvertPreview(frame);
+            const HRESULT result=ui->OpenSharedResource1(handle,IID_PPV_ARGS(&preview->opened));CloseHandle(handle);
+            if (FAILED(result)) return ConvertPreview(frame);
+            texture=preview->opened.Get();
+            if(FAILED(renderContext4->Wait(renderDecodeFence.Get(),frame->readyFence)))return false;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC description{};
+        description.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        description.Texture2DArray.MipLevels=1;description.Texture2DArray.ArraySize=1;
+        description.Texture2DArray.FirstArraySlice=frame->slice;description.Format=DXGI_FORMAT_R8_UNORM;
+        if (FAILED(renderDevice->CreateShaderResourceView(texture,&description,&preview->y)))
+        {bindYuv=false;return ConvertPreview(frame);}
+        description.Format=DXGI_FORMAT_R8G8_UNORM;
+        if (FAILED(renderDevice->CreateShaderResourceView(texture,&description,&preview->uv)))
+        {bindYuv=false;return ConvertPreview(frame);}
+        activePreview=std::move(preview);return true;
+    }
+
+    void HardwareVideoDecoder::Implementation::BindPreviewShader(const ImDrawList*,const ImDrawCmd* command)
+    {
+        auto& self=*static_cast<Implementation*>(command->UserCallbackData);
+        if (!self.activePreview) return;
+        ID3D11ShaderResourceView* chroma=self.activePreview->uv.Get();
+        self.renderContext->PSSetShaderResources(1,1,&chroma);
+        self.renderContext->PSSetShader(self.yuvShader.Get(),nullptr,0);
+    }
+    void HardwareVideoDecoder::Implementation::UnbindPreviewShader(const ImDrawList*,const ImDrawCmd* command)
+    {auto& self=*static_cast<Implementation*>(command->UserCallbackData);ID3D11ShaderResourceView* empty{};self.renderContext->PSSetShaderResources(1,1,&empty);}
+
+    HardwareVideoDecoder::HardwareVideoDecoder():implementation_(std::make_unique<Implementation>()){}
+    HardwareVideoDecoder::~HardwareVideoDecoder(){Shutdown();}
+
+    void HardwareVideoDecoder::Implementation::DrainGpu()
+    {
+        // No publication/queue lock is held while waiting. Decode/capture are stopped.
+        for(auto* gpuContext:{context.Get(),renderContext.Get()})
+        {
+            if(!gpuContext)continue;
+            ComPtr<ID3D11Device> owner;gpuContext->GetDevice(&owner);ComPtr<ID3D11Query> query;
+            D3D11_QUERY_DESC description{D3D11_QUERY_EVENT,0};if(FAILED(owner->CreateQuery(&description,&query)))continue;
+            {std::lock_guard gpu(contextMutex);gpuContext->End(query.Get());gpuContext->Flush();}
+            const auto deadline=StreamNowUs()+2000000;HRESULT complete=S_FALSE;
+            do
+            {
+                {std::lock_guard gpu(contextMutex);complete=gpuContext->GetData(query.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH);}
+                if(complete!=S_FALSE)break;
+                Sleep(1);
+            }while(StreamNowUs()<deadline);
+            if(complete==S_FALSE || FAILED(complete))
+                log::Warning("GPU drain %s: context=%s device-status=0x%08lx decode-fence=%llu/%llu render-fence=%llu/%llu readback-fence=%llu/%llu",
+                    complete==S_FALSE?"timed out during stream teardown":"failed during stream teardown",
+                    gpuContext==context.Get()?"decode/readback":"UI rendering",static_cast<unsigned long>(owner->GetDeviceRemovedReason()),
+                    static_cast<unsigned long long>(decodeFence?decodeFence->GetCompletedValue():0),static_cast<unsigned long long>(nextDecodeFence),
+                    static_cast<unsigned long long>(renderFence?renderFence->GetCompletedValue():0),static_cast<unsigned long long>(nextRenderFence),
+                    static_cast<unsigned long long>(readbackCompletionFence?readbackCompletionFence->GetCompletedValue():0),static_cast<unsigned long long>(readbackFenceValue));
         }
     }
 
-    int HardwareVideoDecoder::Configure(const int videoFormat, const int width, const int height, const int redrawRate, std::string& error)
+    bool HardwareVideoDecoder::HasHardwareDecoder(int format)
     {
-        auto& impl = *implementation_;
-        if (!impl.mediaFoundationStarted || impl.device == nullptr)
-        {
-            error = "Vanta's Media Foundation hardware decoder is not initialized";
-            return -1;
-        }
-        if (videoFormat != VIDEO_FORMAT_H264)
-        {
-            error = "Vanta's first native decoder supports H.264 only; select H.264 in Sunshine";
-            return -1;
-        }
-        if (width <= 0 || height <= 0 || redrawRate <= 0)
-        {
-            error = "Sunshine sent invalid H.264 stream dimensions";
-            return -1;
-        }
-
-        impl.StopDecodeThread();
-        impl.ClearPresentationResources();
-        {
-            std::lock_guard<std::mutex> lock(impl.stateMutex);
-            impl.selectedFormat = videoFormat;
-            impl.configuredWidth = width;
-            impl.configuredHeight = height;
-            impl.configuredFps = redrawRate;
-            impl.ResetFrameRatesLocked();
-            impl.workerStop = false;
-            impl.workerReady = false;
-            impl.workerFailed = false;
-            impl.acceptingFrames = false;
-            impl.startupError.clear();
-            impl.status = "Starting the H.264 hardware decoder...";
-        }
-        impl.decodeThread = std::thread(&Implementation::DecodeThreadMain, &impl);
-
-        std::unique_lock<std::mutex> lock(impl.stateMutex);
-        if (!impl.readyCondition.wait_for(lock, std::chrono::seconds(10), [&impl]() { return impl.workerReady || impl.workerFailed; }))
-        {
-            impl.workerStop = true;
-            lock.unlock();
-            impl.queueCondition.notify_all();
-            impl.StopDecodeThread();
-            error = "Timed out while starting Windows' H.264 hardware decoder";
-            return -1;
-        }
-        if (impl.workerFailed)
-        {
-            error = impl.startupError;
-            lock.unlock();
-            impl.StopDecodeThread();
-            return -1;
-        }
-        return 0;
+        if(format!=VIDEO_FORMAT_H264 && format!=VIDEO_FORMAT_H265 && format!=VIDEO_FORMAT_AV1_MAIN8)return false;
+        const auto* decoder=avcodec_find_decoder(CodecId(format));if(!decoder)return false;
+        for(int index=0;;++index)
+        {const auto* config=avcodec_get_hw_config(decoder,index);if(!config)break;
+            if(config->device_type==AV_HWDEVICE_TYPE_D3D11VA && config->pix_fmt==AV_PIX_FMT_D3D11 &&
+                (config->methods&(AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX|AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX)))return true;}
+        return false;
     }
 
-    void HardwareVideoDecoder::Start()
+    std::vector<VideoAdapterInfo> HardwareVideoDecoder::EnumerateAdapters()
     {
-        auto& impl = *implementation_;
-        std::lock_guard<std::mutex> lock(impl.stateMutex);
-        if (impl.workerReady && !impl.workerStop)
+        std::vector<VideoAdapterInfo> adapters;ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return adapters;
+        for (UINT index=0;;++index)
         {
-            impl.acceptingFrames = true;
-            impl.status = "Waiting for Sunshine H.264 video frames...";
+            ComPtr<IDXGIAdapter1> adapter;if(factory->EnumAdapters1(index,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+            if(!adapter)continue;DXGI_ADAPTER_DESC1 description{};adapter->GetDesc1(&description);
+            if((description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE) || description.VendorId==0x1414)continue;
+            ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
+            if(!MakeDevice(adapter.Get(),&device,&context))continue;
+            LARGE_INTEGER driver{};adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice),&driver);
+            std::ostringstream version;version<<HIWORD(driver.HighPart)<<'.'<<LOWORD(driver.HighPart)<<'.'<<HIWORD(driver.LowPart)<<'.'<<LOWORD(driver.LowPart);
+            std::string displays;
+            for(UINT outputIndex=0;;++outputIndex)
+            {ComPtr<IDXGIOutput> output;if(adapter->EnumOutputs(outputIndex,&output)==DXGI_ERROR_NOT_FOUND)break;
+                DXGI_OUTPUT_DESC display{};if(output && SUCCEEDED(output->GetDesc(&display)) && display.AttachedToDesktop)
+                {if(!displays.empty())displays+=", ";displays+=Utf8(display.DeviceName);}}
+            adapters.push_back({AdapterId(description.AdapterLuid),Utf8(description.Description),version.str(),DeviceFormats(device.Get(),2560,1440),description.VendorId==0x10de,displays});
         }
+        std::stable_sort(adapters.begin(),adapters.end(),[](const auto& a,const auto& b){return a.nvidia>b.nvidia;});
+        return adapters;
     }
 
+    bool HardwareVideoDecoder::CreateRenderDevice(const std::string& preference,ID3D11Device** device,
+        ID3D11DeviceContext** context,std::string& error)
+    {
+        const auto adapters=EnumerateAdapters();
+        for(const auto& adapter:adapters)
+            log::Info("Video adapter %s [%s], driver %s; 1440p H.264=%s HEVC=%s AV1=%s; attached displays: %s",adapter.name.c_str(),adapter.id.c_str(),adapter.driver.c_str(),
+                (adapter.supportedFormats&VIDEO_FORMAT_H264)?"yes":"no",(adapter.supportedFormats&VIDEO_FORMAT_H265)?"yes":"no",
+                (adapter.supportedFormats&VIDEO_FORMAT_AV1_MAIN8)?"yes":"no",adapter.displays.empty()?"none (presentation may cross the desktop compositor)":adapter.displays.c_str());
+        ComPtr<IDXGIFactory1> factory;if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))){error="DXGI is unavailable";return false;}
+        for(const auto& selected:adapters)
+        {
+            if(preference!="auto" && preference!=selected.id)continue;
+            if(!selected.supportedFormats)continue;
+            for(UINT index=0;;++index)
+            {
+                ComPtr<IDXGIAdapter1> adapter;if(factory->EnumAdapters1(index,&adapter)==DXGI_ERROR_NOT_FOUND)break;
+                if(!adapter)continue;DXGI_ADAPTER_DESC1 description{};adapter->GetDesc1(&description);
+                if(AdapterId(description.AdapterLuid)==selected.id && MakeDevice(adapter.Get(),device,context))return true;
+            }
+        }
+        error=preference=="auto" ? "No D3D11 hardware video adapter is available" : "The selected video adapter is unavailable; select Auto and restart";
+        return false;
+    }
+
+    bool HardwareVideoDecoder::Initialize(ID3D11Device* device,std::string& error)
+    {
+        if(!device){error="The rendering device is unavailable";return false;}
+        auto& self=*implementation_;std::lock_guard lifecycle(self.lifecycleMutex);if(self.device)return true;
+        return self.SetupDevices(device,error);
+    }
+
+    int HardwareVideoDecoder::SupportedFormats(int width,int height) const
+    {const auto& self=*implementation_;return DeviceFormats(self.device.Get(),width,height);}
+
+    int HardwareVideoDecoder::Configure(int format,int width,int height,int fps,std::string& error)
+    {
+        auto& self=*implementation_;
+        std::lock_guard lifecycle(self.lifecycleMutex);
+        if(!self.device || width<=0 || height<=0 || fps<1 || !(SupportedFormats(width,height)&format))
+        {error="The selected adapter does not support this hardware codec/resolution";return -1;}
+        Stop();self.decodeThread.request_stop();self.queueCondition.notify_all();if(self.decodeThread.joinable())self.decodeThread.join();
+        std::scoped_lock consumers(self.readbackMutex,self.previewMutex);
+        self.DrainGpu();
+        self.activePreview.reset();self.retiredPreviews.clear();self.previewSlots={};
+        avcodec_free_context(&self.codec);av_buffer_unref(&self.hardwareDevice);
+        self.pendingMetadata.clear();self.slots={};self.pendingGpuFrames.clear();self.gpuFramesInFlight=0;self.decodeCompletions.clear();self.latestCpuSnapshot={};self.cpuPool.Clear();self.lastIssuedSequence=0;self.lastIssuedRegion={};self.lastPublishedSequence=0;
+        self.reassemblyMetric.Clear();self.decodeMetric.Clear();self.readbackMetric.Clear();self.publicationMetric.Clear();self.hostMetric.Clear();
+        self.compressedQueueMetric.Clear();self.decodeSubmitMetric.Clear();self.gpuCompletionMetric.Clear();self.cpuCopyMetric.Clear();self.dispatchMetric.Clear();self.lastSlotPressureSequence=0;
+        {
+            std::lock_guard lock(self.stateMutex);const auto adapter=self.stats.adapter,synchronization=self.stats.synchronization;
+            self.stats={};self.stats.adapter=adapter;self.stats.synchronization=synchronization;
+            self.stats.width=width;self.stats.height=height;self.stats.configuredFps=fps;self.stats.codec=CodecName(format);
+            self.stats.generation=++self.generation;self.stats.status="Waiting for verified hardware output";
+            self.selectedFormat=format;self.queue.clear();self.latestFrame.reset();self.haveFrameNumber=false;
+            self.receivedTimes.clear();self.decodedTimes.clear();self.publishedTimes.clear();self.recovery.Reset();
+        }
+        if(!self.OpenCodec(error)){self.Fail(error);return -1;}
+        self.stopped=false;
+        self.decodeThread=std::jthread([&self](std::stop_token stop)
+        {try{self.Decode(stop);}catch(const std::exception& error){self.Fail(std::string("Decoder worker exception: ")+error.what());}
+            catch(...){self.Fail("Decoder worker failed unexpectedly");}});return 0;
+    }
+    void HardwareVideoDecoder::Start(){implementation_->accepting=true;}
+    void HardwareVideoDecoder::SetIdrRequester(std::function<void()> requester)
+    {std::lock_guard lock(implementation_->stateMutex);implementation_->requestIdrCallback=std::move(requester);}
     void HardwareVideoDecoder::Stop()
     {
-        auto& impl = *implementation_;
-        std::lock_guard<std::mutex> lock(impl.stateMutex);
-        impl.acceptingFrames = false;
-        impl.queue.clear();
-        if (!impl.workerStop)
-        {
-            impl.status = "Sunshine video stream stopped.";
-        }
+        auto& self=*implementation_;std::lock_guard lifecycle(self.lifecycleMutex);
+        self.accepting=false;
+        std::shared_ptr<FrameLease> retired;
+        {std::lock_guard lock(self.stateMutex);self.stopped=true;++self.generation;++self.session;self.queue.clear();retired=std::move(self.latestFrame);self.stats.hardwareActive=false;}
+        self.queueCondition.notify_all();self.frameCondition.notify_all();if(self.frameEvent.value)SetEvent(self.frameEvent.value);
+        self.decodeThread.request_stop();
+        if(self.decodeThread.joinable() && self.decodeThread.get_id()!=std::this_thread::get_id())self.decodeThread.join();
+    }
+    void HardwareVideoDecoder::Shutdown()
+    {
+        auto& self=*implementation_;std::lock_guard lifecycle(self.lifecycleMutex);Stop();self.decodeThread.request_stop();self.queueCondition.notify_all();
+        if(self.decodeThread.joinable())self.decodeThread.join();
+        std::scoped_lock lock(self.readbackMutex,self.previewMutex);
+        self.DrainGpu();
+        self.activePreview.reset();self.retiredPreviews.clear();self.previewSlots={};self.slots={};self.latestCpuSnapshot={};self.cpuPool.Clear();
+        self.pendingGpuFrames.clear();self.gpuFramesInFlight=0;self.decodeCompletions.clear();self.yuvShader.Reset();self.previewDrawn=false;
+        avcodec_free_context(&self.codec);av_buffer_unref(&self.hardwareDevice);self.pendingMetadata.clear();
+        {std::lock_guard pool(self.packetPoolMutex);for(auto& entry:self.packetPools)av_buffer_pool_uninit(&entry);}
+        self.renderFence.Reset();self.renderDecodeFence.Reset();self.decodeFence.Reset();self.decodeContext4.Reset();self.renderContext4.Reset();
+        self.readbackCompletionFence.Reset();self.readbackCompletionContext.Reset();
+        self.videoContext.Reset();self.videoDevice.Reset();self.context.Reset();self.device.Reset();self.renderContext.Reset();self.renderDevice.Reset();
+        self.separateDevices=self.bindYuv=false;
     }
 
-    int HardwareVideoDecoder::Submit(PDECODE_UNIT decodeUnit)
+    int HardwareVideoDecoder::Submit(PDECODE_UNIT unit)
     {
-        auto& impl = *implementation_;
-        if (decodeUnit == nullptr || decodeUnit->bufferList == nullptr || decodeUnit->fullLength <= 0 ||
-            static_cast<std::size_t>(decodeUnit->fullLength) > kMaximumCompressedFrameBytes)
+        auto& self=*implementation_;
+        if(!unit || !unit->bufferList || unit->fullLength<=0 || std::size_t(unit->fullLength)>kMaximumFrameBytes)return self.RejectAccessUnit();
+        EncodedPacket packet;
         {
-            return DR_NEED_IDR;
+            std::lock_guard lock(self.stateMutex);
+            if(!self.accepting || self.stopped || self.stats.failed)return DR_OK;
+            ++self.stats.receivedFrames;self.stats.lastReceivedUs=StreamNowUs();self.receivedTimes.push_back({self.stats.lastReceivedUs,unit->fullLength});
+            const auto number=std::uint32_t(unit->frameNumber),distance=number-self.lastFrameNumber;
+            if(self.haveFrameNumber && distance>0 && distance<0x80000000U)self.stats.transportLostFrames+=distance-1;
+            self.lastFrameNumber=number;self.haveFrameNumber=true;
+            if(self.recovery.WaitingForKeyFrame() && unit->frameType!=FRAME_TYPE_IDR){++self.stats.droppedFrames;return DR_OK;}
+            if(self.queue.size()>=kQueueLimit)
+            {
+                ++self.stats.overloadDrops;++self.stats.droppedFrames;
+                self.recovery.Begin();
+                self.stats.status="Compressed queue overloaded; waiting for recovery IDR";
+                self.queueCondition.notify_one();return DR_OK; // Decoder thread owns the coalesced IDR request.
+            }
+            if(unit->frameType==FRAME_TYPE_IDR)self.recovery.OnKeyFrame();
+            packet.metadata.generation=self.generation;
+            packet.metadata.session=self.session;
         }
-
-        EncodedFrame frame;
-        frame.presentationTimeUs = decodeUnit->presentationTimeUs;
-        frame.frameType = decodeUnit->frameType;
-
-        {
-            std::lock_guard<std::mutex> lock(impl.stateMutex);
-            if (!impl.acceptingFrames || !impl.workerReady || impl.workerStop)
-            {
-                ++impl.droppedFrames;
-                return DR_NEED_IDR;
-            }
-            ++impl.receivedFrames;
-            impl.UpdateFrameRatesLocked();
-            if (impl.queue.size() >= kMaximumQueuedFrames)
-            {
-                ++impl.droppedFrames;
-                return DR_NEED_IDR;
-            }
-            if (!impl.reusableCompressedBuffers.empty())
-            {
-                frame.data = std::move(impl.reusableCompressedBuffers.back());
-                impl.reusableCompressedBuffers.pop_back();
-            }
-        }
-
-        const auto recycleFrameBuffer = [&impl](std::vector<unsigned char>&& buffer)
-        {
-            if (buffer.empty())
-            {
-                return;
-            }
-            buffer.clear();
-            std::lock_guard<std::mutex> lock(impl.stateMutex);
-            if (!impl.workerStop && impl.reusableCompressedBuffers.size() < kMaximumQueuedFrames)
-            {
-                impl.reusableCompressedBuffers.push_back(std::move(buffer));
-            }
-        };
-
+        packet.type=unit->frameType;packet.metadata.frameNumber=unit->frameNumber;packet.metadata.presentationTimeUs=unit->presentationTimeUs;
+        packet.metadata.timing.receivedUs=unit->receiveTimeUs ? unit->receiveTimeUs : StreamNowUs();
+        packet.metadata.timing.assembledUs=std::max(packet.metadata.timing.receivedUs,unit->enqueueTimeUs);
+        packet.metadata.timing.hostProcessingTenthsMs=unit->frameHostProcessingLatency;
+        self.reassemblyMetric.Add(double(packet.metadata.timing.assembledUs-packet.metadata.timing.receivedUs)/1000.0);
+        if(unit->frameHostProcessingLatency)self.hostMetric.Add(unit->frameHostProcessingLatency/10.0);
         try
         {
-            frame.data.clear();
-            frame.data.reserve(static_cast<std::size_t>(decodeUnit->fullLength));
-            for (PLENTRY entry = decodeUnit->bufferList; entry != nullptr; entry = entry->next)
+            packet.buffer=self.PacketBuffer(std::size_t(unit->fullLength)+AV_INPUT_BUFFER_PADDING_SIZE);
+            if(!packet.buffer)return self.RejectAccessUnit();
+            packet.size=unit->fullLength;std::size_t offset{};
+            for(auto* entry=unit->bufferList;entry;entry=entry->next)
             {
-                if (entry->data == nullptr || entry->length <= 0 ||
-                    frame.data.size() + static_cast<std::size_t>(entry->length) > kMaximumCompressedFrameBytes)
-                {
-                    recycleFrameBuffer(std::move(frame.data));
-                    return DR_NEED_IDR;
-                }
-                frame.data.insert(
-                    frame.data.end(),
-                    reinterpret_cast<const unsigned char*>(entry->data),
-                    reinterpret_cast<const unsigned char*>(entry->data) + entry->length);
+                if(!entry->data || entry->length<=0 || offset+std::size_t(entry->length)>std::size_t(unit->fullLength))return self.RejectAccessUnit();
+                std::memcpy(packet.buffer->data+offset,entry->data,entry->length);offset+=entry->length;
             }
+            if(offset!=std::size_t(unit->fullLength))return self.RejectAccessUnit();
+            std::memset(packet.buffer->data+offset,0,AV_INPUT_BUFFER_PADDING_SIZE);
         }
-        catch (const std::bad_alloc&)
+        catch(const std::bad_alloc&){return self.RejectAccessUnit();}
         {
-            recycleFrameBuffer(std::move(frame.data));
-            std::lock_guard<std::mutex> lock(impl.stateMutex);
-            ++impl.droppedFrames;
-            return DR_NEED_IDR;
+            std::lock_guard lock(self.stateMutex);
+            if(self.stopped || packet.metadata.session!=self.session)return DR_OK;
+            if(!self.queue.push_back(std::move(packet)))
+            {++self.stats.overloadDrops;self.recovery.Begin();self.queueCondition.notify_one();return DR_OK;}
+            ++self.stats.submittedFrames;
         }
-        if (frame.data.size() != static_cast<std::size_t>(decodeUnit->fullLength))
-        {
-            recycleFrameBuffer(std::move(frame.data));
-            return DR_NEED_IDR;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(impl.stateMutex);
-            if (!impl.acceptingFrames || !impl.workerReady || impl.workerStop || impl.queue.size() >= kMaximumQueuedFrames)
-            {
-                ++impl.droppedFrames;
-                const bool canRecycle = !impl.workerStop && impl.reusableCompressedBuffers.size() < kMaximumQueuedFrames;
-                if (canRecycle)
-                {
-                    frame.data.clear();
-                    impl.reusableCompressedBuffers.push_back(std::move(frame.data));
-                }
-                return DR_NEED_IDR;
-            }
-            impl.queue.push_back(std::move(frame));
-            ++impl.submittedFrames;
-        }
-        impl.queueCondition.notify_one();
-        return DR_OK;
+        self.queueCondition.notify_one();return DR_OK;
     }
 
-    ID3D11ShaderResourceView* HardwareVideoDecoder::AcquireFrameView() const
+    bool HardwareVideoDecoder::Readback(const FrameReadbackRequest& request,CpuFrameSnapshot& output,std::stop_token stop)
     {
-        const auto& impl = *implementation_;
-        std::lock_guard<std::mutex> lock(impl.frameMutex);
-        if (impl.latestPresentationTexture >= kPresentationTextureCount)
+        auto& self=*implementation_;std::unique_lock readback(self.readbackMutex);
+        output={};output.metadata.generation=self.generation.load();
+        if(request.regions.empty())return false;
+        std::stop_callback cancel(stop,[&]{if(self.frameEvent.value)SetEvent(self.frameEvent.value);});
+        if(self.stopped || !self.context)
         {
-            return nullptr;
+            if(!stop.stop_requested())
+            {if(self.frameEvent.value)WaitForSingleObject(self.frameEvent.value,20);
+                else{std::unique_lock lock(self.stateMutex);self.frameCondition.wait_for(lock,stop,std::chrono::milliseconds(20),[&]{return !self.stopped;});}}
+            output.metadata.generation=self.generation.load();return false;
         }
-        ID3D11ShaderResourceView* view = impl.presentationShaderViews[impl.latestPresentationTexture].Get();
-        if (view != nullptr)
+        const auto deadline=StreamNowUs()+20000;
+        do
         {
-            view->AddRef();
-        }
-        return view;
+            if(stop.stop_requested() || self.stopped || !self.context)return false;
+            Implementation::ReadbackSlot* newest{};
+            for(auto& slot:self.slots)if(slot.busy)
+            {
+                HRESULT ready{};{std::lock_guard gpu(self.contextMutex);ready=self.context->GetData(slot.completion.Get(),nullptr,0,D3D11_ASYNC_GETDATA_DONOTFLUSH);}
+                if(FAILED(ready)){self.Fail("GPU completion failed: "+HrError(ready));return false;}
+                if(ready!=S_OK)continue;
+                const auto wanted=MergeFrameRegions(request.regions,slot.frame->metadata.sourceWidth,slot.frame->metadata.sourceHeight);
+                if(slot.frame->metadata.generation!=self.generation || slot.frame->metadata.sequence<=request.afterSequence || (wanted&slot.rectangle)!=wanted)
+                {slot.busy=false;slot.frame.reset();{std::lock_guard lock(self.stateMutex);++self.stats.readbackSuperseded;}continue;}
+                if(!newest || slot.frame->metadata.sequence>newest->frame->metadata.sequence)
+                {if(newest){newest->busy=false;newest->frame.reset();std::lock_guard lock(self.stateMutex);++self.stats.readbackSuperseded;}newest=&slot;}
+                else{slot.busy=false;slot.frame.reset();std::lock_guard lock(self.stateMutex);++self.stats.readbackSuperseded;}
+            }
+            if(newest)self.CompleteReadback(*newest,output);
+            if(!output.bgra.empty())self.latestCpuSnapshot=output;
+            std::shared_ptr<FrameLease> latest;
+            {std::lock_guard lock(self.stateMutex);latest=self.latestFrame;}
+            if(latest && latest->metadata.sequence>request.afterSequence)
+            {
+                const auto region=MergeFrameRegions(request.regions,latest->metadata.sourceWidth,latest->metadata.sourceHeight);
+                if(region.empty())
+                {if(self.frameEvent.value && !stop.stop_requested())WaitForSingleObject(self.frameEvent.value,20);return false;}
+                const auto& cached=self.latestCpuSnapshot;
+                const cv::Rect cachedRegion(cached.metadata.cropX,cached.metadata.cropY,cached.bgra.cols,cached.bgra.rows);
+                if((output.bgra.empty() || cached.metadata.sequence>output.metadata.sequence) && cached.metadata.generation==self.generation && cached.metadata.sequence==latest->metadata.sequence && (cachedRegion&region)==region)
+                    output=cached;
+                const bool pending=std::any_of(self.slots.begin(),self.slots.end(),[&](const auto& slot)
+                    {return slot.busy && slot.frame->metadata.sequence==latest->metadata.sequence && (slot.rectangle&region)==region;});
+                if((output.bgra.empty() || output.metadata.sequence<latest->metadata.sequence) && !pending)
+                {
+                    bool issued{};
+                    for(auto& slot:self.slots)if(!slot.busy)
+                {
+                    if(!self.IssueReadback(slot,latest,region)){self.Fail("Cannot issue native GPU ROI readback");return false;}
+                    self.lastIssuedSequence=latest->metadata.sequence;self.lastIssuedRegion=region;issued=true;break;
+                }
+                    if(!issued && self.lastSlotPressureSequence!=latest->metadata.sequence)
+                    {self.lastSlotPressureSequence=latest->metadata.sequence;std::lock_guard lock(self.stateMutex);++self.stats.readbackSlotPressure;}
+                }
+            }
+            if(!output.bgra.empty())return output.metadata.generation==self.generation;
+            std::array<HANDLE,4> waits{};DWORD count{};bool pollingFallback{};
+            if(self.frameEvent.value)waits[count++]=self.frameEvent.value;
+            for(const auto& slot:self.slots)if(slot.busy)
+            {if(slot.completionEvent)waits[count++]=slot.completionEvent->value;else pollingFallback=true;}
+            const auto waitNow=StreamNowUs();const auto remaining=deadline>waitNow ? (deadline-waitNow+999)/1000 : 0;
+            if(count)WaitForMultipleObjects(count,waits.data(),FALSE,DWORD(pollingFallback ? std::min<std::uint64_t>(remaining,1) : remaining));
+            else {std::unique_lock lock(self.stateMutex);self.frameCondition.wait_for(lock,stop,std::chrono::milliseconds(1),[&]{return self.stopped || self.stats.failed;});}
+            {std::lock_guard lock(self.stateMutex);if(self.stats.failed)return false;}
+        } while(StreamNowUs()<deadline);
+        return false;
+    }
+    void HardwareVideoDecoder::WakeWaiters(){implementation_->frameCondition.notify_all();}
+    std::uint64_t HardwareVideoDecoder::CurrentGeneration() const{return implementation_->generation.load();}
+    void HardwareVideoDecoder::RecordPublication(const CapturedFrameMetadata& metadata)
+    {
+        auto& self=*implementation_;
+        if(metadata.generation!=self.generation || !metadata.timing.publishedUs || self.stopped)return;
+        {std::lock_guard lock(self.stateMutex);
+            if(metadata.generation!=self.generation || self.stopped || metadata.sequence<=self.lastPublishedSequence)return;
+            self.lastPublishedSequence=metadata.sequence;
+            ++self.stats.publishedFrames;self.stats.lastPublishedUs=metadata.timing.publishedUs;self.publishedTimes.push_back(metadata.timing.publishedUs);}
+        self.publicationMetric.Add(double(metadata.timing.publishedUs-metadata.timing.receivedUs)/1000.0);
+        if(metadata.timing.readbackUs && metadata.timing.publishedUs>=metadata.timing.readbackUs)
+            self.dispatchMetric.Add(double(metadata.timing.publishedUs-metadata.timing.readbackUs)/1000.0);
     }
 
-    bool HardwareVideoDecoder::CopyLatestFrameToBgra(
-        const std::uint64_t afterSequence,
-        cv::Mat& output,
-        std::uint64_t& sequence)
+    void HardwareVideoDecoder::DrawPreview(ImDrawList* list,const ImVec2& position,const ImVec2& size)
     {
-        return implementation_->CopyLatestFrameToBgra(afterSequence, output, sequence);
+        auto& self=*implementation_;self.ReapPreviews();
+        std::shared_ptr<FrameLease> frame;{std::lock_guard lock(self.stateMutex);frame=self.latestFrame;}
+        if(!frame || frame->metadata.generation!=self.generation)return;
+        std::lock_guard lock(self.previewMutex);
+        if((!self.activePreview || self.activePreview->frame->metadata.generation!=self.generation ||
+            (self.activePreview->frame->metadata.sequence!=frame->metadata.sequence && StreamNowUs()-self.previewUs>=16667)) && self.retiredPreviews.size()<6)
+        {
+            if(self.activePreview)
+            {
+                if(self.activePreview->submitted)self.retiredPreviews.push_back(self.activePreview);
+                else if(self.activePreview->convertedSlot){self.activePreview->convertedSlot->busy=false;self.activePreview->convertedSlot->frame.reset();}
+                self.activePreview.reset();
+            }
+            if(self.MakePreview(frame))self.previewUs=StreamNowUs();
+        }
+        if(!self.activePreview || self.activePreview->frame->metadata.generation!=self.generation)return;
+        self.previewDrawn=true;
+        const ImVec2 end(position.x+size.x,position.y+size.y);
+        if(self.activePreview->y)
+        {
+            const auto& m=self.activePreview->frame->metadata;
+            const ImVec2 uv0(float(m.visibleX)/m.textureWidth,float(m.visibleY)/m.textureHeight);
+            const ImVec2 uv1(float(m.visibleX+m.sourceWidth)/m.textureWidth,float(m.visibleY+m.sourceHeight)/m.textureHeight);
+            list->AddCallback(Implementation::BindPreviewShader,&self);
+            list->AddImage(reinterpret_cast<ImTextureID>(self.activePreview->y.Get()),position,end,uv0,uv1);
+            list->AddCallback(Implementation::UnbindPreviewShader,&self);
+            list->AddCallback(ImDrawCallback_ResetRenderState,nullptr);
+        }
+        else list->AddImage(reinterpret_cast<ImTextureID>(self.activePreview->bgraView.Get()),position,end);
+    }
+    void HardwareVideoDecoder::FinishPreviewFrame()
+    {
+        auto& self=*implementation_;std::lock_guard lock(self.previewMutex);
+        if(!self.activePreview)return;
+        if(!std::exchange(self.previewDrawn,false))
+        {self.retiredPreviews.push_back(std::move(self.activePreview));return;}
+        if(self.separateDevices)
+        {
+            self.activePreview->fenceValue=++self.nextRenderFence;
+            if(FAILED(self.renderContext4->Signal(self.renderFence.Get(),self.activePreview->fenceValue)))return;
+        }
+        else
+        {
+            D3D11_QUERY_DESC description{D3D11_QUERY_EVENT,0};
+            if(!self.activePreview->completion && FAILED(self.renderDevice->CreateQuery(&description,&self.activePreview->completion)))return;
+            self.renderContext->End(self.activePreview->completion.Get());
+        }
+        self.renderContext->Flush();self.activePreview->submitted=true;
+    }
+    bool HardwareVideoDecoder::CopyLatestFrameToBgra(std::uint64_t after,cv::Mat& output,std::uint64_t& sequence)
+    {
+        CpuFrameSnapshot snapshot;FrameRegionRequest region;region.kind=FrameRegionKind::fullSource;
+        if(!Readback({after,{region}},snapshot,{}))return false;
+        output=snapshot.bgra;sequence=snapshot.metadata.sequence;return true;
     }
 
     DecodedVideoStats HardwareVideoDecoder::GetStats() const
     {
-        auto& impl = *implementation_;
-        std::lock_guard<std::mutex> lock(impl.stateMutex);
-        impl.UpdateFrameRatesLocked();
-        return DecodedVideoStats{
-            impl.configuredWidth,
-            impl.configuredHeight,
-            impl.configuredFps,
-            impl.receivedFramesPerSecond,
-            impl.decodedFramesPerSecond,
-            impl.receivedFrames,
-            impl.submittedFrames,
-            impl.decodedFrames,
-            impl.droppedFrames,
-            impl.workerReady && !impl.workerFailed,
-            impl.status};
+        auto& self=*implementation_;DecodedVideoStats result;
+        std::lock_guard aggregate(self.aggregateMutex);const auto aggregationNow=StreamNowUs();
+        {std::lock_guard lock(self.stateMutex);
+            if(aggregationNow<self.nextAggregateUs && self.cachedStats.generation==self.generation &&
+                self.cachedStats.failed==self.stats.failed && self.cachedStats.hardwareActive==self.stats.hardwareActive)return self.cachedStats;}
+        {
+            std::lock_guard lock(self.stateMutex);const auto now=StreamNowUs();
+            while(!self.receivedTimes.empty() && now-self.receivedTimes.front().first>1000000)self.receivedTimes.pop_front();
+            while(!self.decodedTimes.empty() && now-self.decodedTimes.front()>1000000)self.decodedTimes.pop_front();
+            while(!self.publishedTimes.empty() && now-self.publishedTimes.front()>1000000)self.publishedTimes.pop_front();
+            result=self.stats;result.sampledUs=aggregationNow;result.generation=self.generation.load();result.session=self.session.load();result.queueDepth=self.queue.size();result.gpuFramesInFlight=self.gpuFramesInFlight.load();result.receivedFramesPerSecond=double(self.receivedTimes.size());
+            result.decodedFramesPerSecond=double(self.decodedTimes.size());result.publishedFramesPerSecond=double(self.publishedTimes.size());
+            for(const auto& item:self.receivedTimes)result.encodedMegabitsPerSecond+=item.second*8.0/1000000.0;
+        }
+        result.reassembly=self.reassemblyMetric.Get();result.decode=self.decodeMetric.Get();result.readback=self.readbackMetric.Get();
+        result.publication=self.publicationMetric.Get();result.hostProcessing=self.hostMetric.Get();
+        result.compressedQueue=self.compressedQueueMetric.Get();result.decodeSubmit=self.decodeSubmitMetric.Get();result.gpuCompletionObserved=self.gpuCompletionMetric.Get();
+        result.cpuCopy=self.cpuCopyMetric.Get();result.publicationDispatch=self.dispatchMetric.Get();
+        result.network=SampleReceiverNetworkTraffic();self.cachedStats=result;self.nextAggregateUs=aggregationNow+1000000;return result;
+    }
+    bool HardwareVideoDecoder::SaveDiagnostics(const SunshineStreamConfig& config,const std::string& captureJson,std::string& result,const std::string& consumerCsv) const
+    {
+        const auto snapshot=GetStats();std::array<wchar_t,32768> executable{};
+        GetModuleFileNameW(nullptr,executable.data(),DWORD(executable.size()));
+        const auto root=std::filesystem::path(executable.data()).parent_path();
+        SYSTEMTIME time{};GetLocalTime(&time);wchar_t name[96]{};
+        swprintf_s(name,L"vanta-stream-%04u%02u%02u-%02u%02u%02u-%lu",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond,GetCurrentProcessId());
+        const auto jsonPath=root/(std::wstring(name)+L".json"),csvPath=root/(std::wstring(name)+L".csv");
+        std::ofstream json(jsonPath),csv(csvPath);
+        if(!json || !csv){result="Cannot write diagnostics beside vanta.exe";return false;}
+        json<<"{\n\"hardware\":"<<StreamHardwareReport()<<",\n\"requested\":{\"width\":"<<config.width<<",\"height\":"<<config.height
+            <<",\"fps\":"<<config.fps<<",\"bitrate_budget_kbps\":"<<config.bitrateKbps<<",\"codec_preference\":"<<int(config.codec)
+            <<",\"adapter_preference\":"<<JsonString(config.adapter)<<"},\n\"active\":{\"codec\":"<<JsonString(snapshot.codec)
+            <<",\"adapter\":"<<JsonString(snapshot.adapter)<<",\"synchronization\":"<<JsonString(snapshot.synchronization)
+            <<",\"status\":"<<JsonString(snapshot.status)<<",\"received_fps\":"<<snapshot.receivedFramesPerSecond<<",\"decoded_fps\":"<<snapshot.decodedFramesPerSecond
+            <<",\"cpu_published_fps\":"<<snapshot.publishedFramesPerSecond<<",\"encoded_payload_mbps\":"<<snapshot.encodedMegabitsPerSecond
+            <<",\"observed_ethernet_rx_mbps\":"<<snapshot.network.receiveMbps<<",\"observed_ethernet_tx_mbps\":"<<snapshot.network.transmitMbps
+            <<",\"observed_traffic_available\":"<<(snapshot.network.available?"true":"false")<<",\"observed_traffic_scope\":\"all traffic across active Ethernet interfaces\""
+            <<",\"transport_frame_gaps\":"<<snapshot.transportLostFrames<<",\"compressed_overload_events\":"<<snapshot.overloadDrops<<",\"decoder_failures\":"<<snapshot.decoderFailures
+            <<",\"output_skipped\":"<<snapshot.outputSkippedFrames<<",\"idr_requests\":"<<snapshot.idrRequests<<",\"readback_bytes\":"<<snapshot.readbackBytes
+            <<",\"generation\":"<<snapshot.generation<<",\"queue_depth\":"<<snapshot.queueDepth<<",\"visible_width\":"<<snapshot.latestMetadata.sourceWidth
+            <<",\"gpu_frames_in_flight\":"<<snapshot.gpuFramesInFlight
+            <<",\"visible_height\":"<<snapshot.latestMetadata.sourceHeight<<",\"visible_x\":"<<snapshot.latestMetadata.visibleX<<",\"visible_y\":"<<snapshot.latestMetadata.visibleY
+            <<",\"texture_width\":"<<snapshot.latestMetadata.textureWidth<<",\"texture_height\":"<<snapshot.latestMetadata.textureHeight
+            <<",\"last_frame_number\":"<<snapshot.latestMetadata.frameNumber<<",\"last_presentation_us\":"<<snapshot.latestMetadata.presentationTimeUs
+            <<"},\n\"timing_scope\":\"receiver local, 10 seconds; host processing is optional and separate; no complete host-to-display latency\",\n\"capture\":"<<(captureJson.empty()?"{}":captureJson)<<"\n}\n";
+        csv<<"stage,median_ms,p95_ms,p99_ms,samples\n";
+        for(const auto& metric:std::array<std::pair<const char*,TimingSummary>,5>{{{"reassembly",snapshot.reassembly},{"decode_and_queue",snapshot.decode},
+            {"gpu_readback",snapshot.readback},{"receiver_arrival_to_publication",snapshot.publication},{"host_processing",snapshot.hostProcessing}}})
+            csv<<metric.first<<','<<metric.second.medianMs<<','<<metric.second.p95Ms<<','<<metric.second.p99Ms<<','<<metric.second.samples<<'\n';
+        csv<<consumerCsv;
+        if(!json.good() || !csv.good()){result="Writing diagnostics failed";return false;}
+        result="Saved "+Utf8(jsonPath.c_str())+" and CSV timing summaries";return true;
     }
 }

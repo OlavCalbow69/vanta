@@ -1,0 +1,214 @@
+use super::opcode::{
+    CLIP_PKT_TRIG_HDR, INJ_MOTION_CURSOR, INJ_MOTION_PAN, INJ_MOTION_WHEEL, OPT_BEARING, OPT_EMIT,
+    OPT_IMPERFECT, OPT_MOVE_RIDE, OPT_NAME, OPT_RENDER, OPT_SPREAD, PATCH_APPLY, PATCH_CLEAR,
+};
+use crate::types::{Direction, Setup};
+
+/// `MOVE` cursor (§3.1): `[motion=0][dx i16 LE][dy i16 LE][flags u8]`, no clamp (firmware clamps with carry).
+pub fn move_cursor_payload(dx: i16, dy: i16, flags: u8) -> [u8; 6] {
+    let dx = dx.to_le_bytes();
+    let dy = dy.to_le_bytes();
+    [INJ_MOTION_CURSOR, dx[0], dx[1], dy[0], dy[1], flags]
+}
+
+/// `MOVE` wheel (§3.1): `[motion=1][dz i16 LE][flags u8]`, no clamp (firmware paces across frames with carry).
+pub fn move_wheel_payload(dz: i16, flags: u8) -> [u8; 4] {
+    let d = dz.to_le_bytes();
+    [INJ_MOTION_WHEEL, d[0], d[1], flags]
+}
+
+/// `MOVE` AC Pan (§3.1): `[motion=2][dpan i16 LE][flags u8]`, no clamp (firmware paces across frames with carry).
+pub fn move_pan_payload(dpan: i16, flags: u8) -> [u8; 4] {
+    let d = dpan.to_le_bytes();
+    [INJ_MOTION_PAN, d[0], d[1], flags]
+}
+
+/// `INJECT` (§3.2): `[class u8][id u16 LE][action u8]`; class 0 button / 1 key / 2 media; tri-state action.
+pub fn inject_payload(class: u8, id: u16, action: u8) -> [u8; 4] {
+    let u = id.to_le_bytes();
+    [class, u[0], u[1], action]
+}
+
+/// `QUERY` (§3.5): `[what u8]`; 0 = VERSION, 1 = HEALTH.
+pub fn query_payload(what: u8) -> [u8; 1] {
+    [what]
+}
+
+/// `LED` (§3.7): `[target u8][mode u8][level u8]`.
+pub fn led_payload(target: u8, mode: u8, level: u8) -> [u8; 3] {
+    [target, mode, level]
+}
+
+/// `LOCK` (§3.8): `[class u8][usage u16 LE][direction u8][scale i16 LE]`; scale 0 blocks, 100 passes, >100 amplifies.
+pub fn lock_payload(class: u8, usage: u16, direction: u8, scale: i16) -> [u8; 6] {
+    let u = usage.to_le_bytes();
+    let s = scale.to_le_bytes();
+    [class, u[0], u[1], direction, s[0], s[1]]
+}
+
+/// `CATCH` (§3.9): `[class u8][id u16 LE][dir u8][state u8][snaplen u8]`; add or remove one
+/// subscription entry. A blanket `state = 0` (every class, every id) clears the whole table.
+pub fn catch_payload(class: u8, id: u16, direction: u8, state: u8, snaplen: u8) -> [u8; 6] {
+    let i = id.to_le_bytes();
+    [class, i[0], i[1], direction, state, snaplen]
+}
+
+/// `OPTION(IMPERFECT)` (§3.10): `[id=0][allow u8]`; 1 = opt into cloning over-capacity devices, 0 = faithful-only.
+pub fn imperfect_payload(allow: bool) -> [u8; 2] {
+    [OPT_IMPERFECT, allow as u8]
+}
+
+/// `OPTION(BEARING)` (§3.12): `[id=4][window u16 LE ms][mode u8]`; 0 = the relative directions never engage.
+pub fn bearing_payload(window_ms: u16, mode: u8) -> [u8; 4] {
+    let w = window_ms.to_le_bytes();
+    [OPT_BEARING, w[0], w[1], mode]
+}
+
+/// `OPTION(MOVE_RIDE)` (§3.10): `[id=1][timeout u16 LE ms]`; 0 = off, N = ride window in milliseconds.
+pub fn move_ride_payload(timeout_ms: u16) -> [u8; 3] {
+    let t = timeout_ms.to_le_bytes();
+    [OPT_MOVE_RIDE, t[0], t[1]]
+}
+
+/// `OPTION(EMIT)` (§3.10): `[id=2][mode u8][rate_hz u16 LE][force_hz u16 LE]`; mode 0 learnt / 1 bInterval / 2 fixed.
+pub fn emit_pace_payload(mode: u8, hz: u16, force_hz: u16) -> [u8; 6] {
+    let h = hz.to_le_bytes();
+    let f = force_hz.to_le_bytes();
+    [OPT_EMIT, mode, h[0], h[1], f[0], f[1]]
+}
+
+/// `OPTION(RENDER)` (§3.10): `[id=5][mode u8][full u8]`; mode 0 off / 1 stock / 2 de-spiked / 3 unsmoothed.
+pub fn render_payload(mode: u8, full: bool) -> [u8; 3] {
+    [OPT_RENDER, mode, full as u8]
+}
+/// `OPTION(SPREAD)` (§3.10): `[id=6][percent u16 LE]`; percent of the learnt command interval.
+pub fn spread_payload(percent: u16) -> [u8; 3] {
+    let p = percent.to_le_bytes();
+    [OPT_SPREAD, p[0], p[1]]
+}
+/// `CLIP_CTRL` engine verb (§3.11): `[op]` (`CLIP_OP_*`).
+pub fn clip_op_payload(op: u8) -> [u8; 1] {
+    [op]
+}
+
+/// `CLIP_SET` (§3.11): `[id u8][value u8]`; an OPTION-shaped clip scalar setting (`CLIP_SET_*`).
+pub fn clip_set_payload(id: u8, value: u8) -> [u8; 2] {
+    [id, value]
+}
+
+/// `CLIP_TRIGGER` (§3.11): `[class u8][id u16 LE][edge u8][action u8][flags u8]`; add/remove one binding.
+pub fn clip_trigger_payload(class: u8, id: u16, edge: u8, action: u8, flags: u8) -> [u8; 6] {
+    let u = id.to_le_bytes();
+    [class, u[0], u[1], edge, action, flags]
+}
+
+/// `CLIP_TRIGGER` with a traffic class, which makes the binding a packet trigger:
+/// `[class u8][id u16 LE][dir u8][action u8][flags u8][slen u8][mlen u8][match mlen][mask mlen]`.
+/// `match_bytes` and `mask` are one length, at most `PKT_MATCH_MAX`.
+#[allow(clippy::too_many_arguments)]
+pub fn clip_packet_trigger_payload(
+    class: u8,
+    id: u16,
+    dir: u8,
+    action: u8,
+    flags: u8,
+    slen: u8,
+    match_bytes: &[u8],
+    mask: &[u8],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CLIP_PKT_TRIG_HDR + match_bytes.len() + mask.len());
+    v.extend_from_slice(&clip_trigger_payload(class, id, dir, action, flags));
+    v.push(slen);
+    v.push(match_bytes.len() as u8);
+    v.extend_from_slice(match_bytes);
+    v.extend_from_slice(mask);
+    v
+}
+
+/// `OPTION(NAME)` set value: the id byte followed by the name's ASCII bytes; empty `name` clears to the default.
+pub fn name_payload(name: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + name.len());
+    v.push(OPT_NAME);
+    v.extend_from_slice(name.as_bytes());
+    v
+}
+
+/// `RAW` (§3.14): `[ep_num u8][dir u8][bytes…]`; put `bytes` verbatim on cloned endpoint `ep` in
+/// `direction` (IN toward the game PC, OUT to the real device). `ep` is masked to its low nibble,
+/// the bare endpoint number the box reassembles into an address.
+pub fn raw_payload(ep: u8, direction: Direction, bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(2 + bytes.len());
+    v.push(ep & 0x0f);
+    v.push(direction.as_u8());
+    v.extend_from_slice(bytes);
+    v
+}
+
+/// `TRANSFER` (§3.14): `[ep u8][setup 8][OUT data…]`; one control transfer against the real device.
+pub fn transfer_payload(ep: u8, setup: Setup, out: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 8 + out.len());
+    v.push(ep);
+    v.extend_from_slice(&setup.to_bytes());
+    v.extend_from_slice(out);
+    v
+}
+
+/// `REWRITE` (§3.14): `[cls u8][id u16 LE][dir u8][state u8][action u8][off u16 LE][mlen u8][match][mask][payload]`.
+/// `state` 1 adds/overwrites, 0 removes; `match` and `mask` must be the same length (the caller ensures it).
+#[allow(clippy::too_many_arguments)]
+pub fn rewrite_payload(
+    class: u8,
+    id: u16,
+    direction: u8,
+    state: u8,
+    action: u8,
+    offset: u16,
+    match_bytes: &[u8],
+    mask: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mlen = match_bytes.len();
+    let mut v = Vec::with_capacity(9 + 2 * mlen + payload.len());
+    v.push(class);
+    v.extend_from_slice(&id.to_le_bytes());
+    v.push(direction);
+    v.push(state);
+    v.push(action);
+    v.extend_from_slice(&offset.to_le_bytes());
+    v.push(mlen as u8);
+    v.extend_from_slice(match_bytes);
+    v.extend_from_slice(mask);
+    v.extend_from_slice(payload);
+    v
+}
+
+/// `PATCH` (§3.14): `[section u8][cfg u8][index u8][offset u16 LE][bytes…]`; a zero-length `bytes`
+/// removes the patch at that key.
+pub fn patch_payload(section: u8, cfg: u8, index: u8, offset: u16, bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(5 + bytes.len());
+    v.push(section);
+    v.push(cfg);
+    v.push(index);
+    v.extend_from_slice(&offset.to_le_bytes());
+    v.extend_from_slice(bytes);
+    v
+}
+
+/// `TRANSFORM` (§3.15): `[op u8][sclass u8][sid u16 LE][dclass u8][did u16 LE][state u8]`. `state` 1
+/// adds/overwrites the entry keyed by `(sclass, sid, dclass, did)`, 0 removes it; the whole table
+/// clears with `sclass = dclass = 0xFF`, both ids `0xFFFF`, `state = 0`.
+pub fn transform_payload(op: u8, sclass: u8, sid: u16, dclass: u8, did: u16, state: u8) -> [u8; 8] {
+    let sid = sid.to_le_bytes();
+    let did = did.to_le_bytes();
+    [op, sclass, sid[0], sid[1], dclass, did[0], did[1], state]
+}
+
+/// `PATCH` APPLY (§3.14): the single `section = 0xFE` byte; re-present the clone with the stored set.
+pub fn patch_apply_payload() -> [u8; 1] {
+    [PATCH_APPLY]
+}
+
+/// `PATCH` CLEAR (§3.14): the single `section = 0xFF` byte; erase the real device's stored set.
+pub fn patch_clear_payload() -> [u8; 1] {
+    [PATCH_CLEAR]
+}

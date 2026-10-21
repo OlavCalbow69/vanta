@@ -42,6 +42,7 @@ namespace vanta::sunshine
         int fps{120};
         int bitrateKbps{80000};
         int packetSize{1392};
+        int supportedVideoFormats{0x0001};
         // Ask Sunshine to use the requested stream mode. This is Moonlight's
         // normal default for Sunshine and lets a host/virtual display match
         // the requested dimensions and refresh rate.
@@ -61,6 +62,7 @@ namespace vanta::sunshine
         int appId{};
         std::string appTitle;
         std::string rtspSessionUrl;
+        int supportedVideoFormats{};
     };
 
     // Implements the GameStream/Sunshine pairing sequence used by Moonlight

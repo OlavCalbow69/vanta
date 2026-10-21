@@ -9,7 +9,7 @@
 #include <winrt/base.h>
 
 #include "capture_controller.hpp"
-#include "bomb_timer_controller.hpp"
+#include "python_bot_controller.hpp"
 #include "logger.hpp"
 #include "makcu_controller.hpp"
 #include "pretty_menu.hpp"
@@ -233,192 +233,60 @@ namespace
         return result;
     }
 
-    JsonObject CaptureToJson(
-        const vanta::CaptureConfig& config)
+    JsonObject CaptureToJson(const vanta::CaptureConfig& config)
     {
         JsonObject result;
-        PutNumber(
-            result,
-            L"backend",
-            config.backendIndex);
-        PutNumber(
-            result,
-            L"source",
-            config.sourceIndex);
-        PutNumber(
-            result,
-            L"region",
-            config.regionIndex);
-        PutNumber(
-            result,
-            L"region_size",
-            config.regionSize);
-        PutBoolean(
-            result,
-            L"draw_outline",
-            config.drawOutline);
-        result.Insert(
-            L"outline_color",
-            ColorToJson(config.outlineColor));
-        PutBoolean(
-            result,
-            L"apply_filter",
-            config.applyFilter);
-        PutBoolean(
-            result,
-            L"binary_mask",
-            config.binaryMask);
-        PutNumber(
-            result,
-            L"color_target",
-            config.colorTargetIndex);
-        PutString(
-            result,
-            L"monitor_device",
-            config.monitorDevice);
-        PutString(
-            result,
-            L"window_executable",
-            config.windowExecutable);
-        PutString(
-            result,
-            L"window_class",
-            config.windowClass);
-        PutString(
-            result,
-            L"window_title",
-            config.windowTitle);
+        PutString(result,L"source","sunshine");
+        PutNumber(result,L"region",config.regionIndex);
+        PutNumber(result,L"region_size",config.regionSize);
+        PutBoolean(result,L"draw_outline",config.drawOutline);
+        result.Insert(L"outline_color",ColorToJson(config.outlineColor));
+        PutBoolean(result,L"apply_filter",config.applyFilter);
+        PutBoolean(result,L"binary_mask",config.binaryMask);
+        PutNumber(result,L"color_target",config.colorTargetIndex);
         return result;
     }
 
     vanta::CaptureConfig CaptureFromJson(
-        const JsonObject& object,
-        const vanta::CaptureConfig& defaults)
+        const JsonObject& object,const vanta::CaptureConfig& defaults)
     {
-        vanta::CaptureConfig result = defaults;
-        result.backendIndex =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"backend",
-                    result.backendIndex));
-        result.sourceIndex =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"source",
-                    result.sourceIndex));
-        result.regionIndex =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"region",
-                    result.regionIndex));
-        result.regionSize =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"region_size",
-                    result.regionSize));
-        result.drawOutline =
-            Boolean(
-                object,
-                L"draw_outline",
-                result.drawOutline);
-        result.outlineColor =
-            ColorFromJson(
-                Child(
-                    object,
-                    L"outline_color"),
-                result.outlineColor);
-        result.applyFilter =
-            Boolean(
-                object,
-                L"apply_filter",
-                result.applyFilter);
-        result.binaryMask =
-            Boolean(
-                object,
-                L"binary_mask",
-                result.binaryMask);
-        result.colorTargetIndex =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"color_target",
-                    result.colorTargetIndex));
-        result.monitorDevice =
-            String(
-                object,
-                L"monitor_device",
-                result.monitorDevice);
-        result.windowExecutable =
-            String(
-                object,
-                L"window_executable",
-                result.windowExecutable);
-        result.windowClass =
-            String(
-                object,
-                L"window_class",
-                result.windowClass);
-        result.windowTitle =
-            String(
-                object,
-                L"window_title",
-                result.windowTitle);
+        vanta::CaptureConfig result=defaults;
+        // Legacy source/backend IDs and local window identities are ignored.
+        // Retain ROI and preview tuning, but never reopen a local capture path.
+        result.regionIndex=static_cast<int>(Number(object,L"region",result.regionIndex));
+        result.regionSize=static_cast<int>(Number(object,L"region_size",result.regionSize));
+        result.drawOutline=Boolean(object,L"draw_outline",result.drawOutline);
+        result.outlineColor=ColorFromJson(Child(object,L"outline_color"),result.outlineColor);
+        result.applyFilter=Boolean(object,L"apply_filter",result.applyFilter);
+        result.binaryMask=Boolean(object,L"binary_mask",result.binaryMask);
+        result.colorTargetIndex=static_cast<int>(Number(object,L"color_target",result.colorTargetIndex));
         return result;
     }
 
-    JsonObject MouseOutputToJson(
-        const vanta::MouseOutputConfig& config)
+    JsonObject MouseOutputToJson(const vanta::MouseOutputConfig& config)
     {
         JsonObject result;
-        PutNumber(
-            result,
-            L"backend",
-            config.backendIndex);
-        PutString(
-            result,
-            L"makcu_port",
-            config.makcuPort);
-        PutBoolean(
-            result,
-            L"high_performance",
-            config.highPerformanceMode);
-        PutBoolean(
-            result,
-            L"auto_detect_and_connect",
-            config.autoDetectAndConnect);
+        PutString(result,L"backend",config.backend==vanta::InputBackend::medius?"medius":"makcu");
+        PutString(result,L"makcu_port",config.makcuPort);
+        PutBoolean(result,L"high_performance",config.highPerformanceMode);
+        PutBoolean(result,L"auto_detect_and_connect",config.autoDetectAndConnect);
+        PutBoolean(result,L"lock_movement_while_correcting",config.lockMovementWhileCorrecting);
+        PutBoolean(result,L"lock_generated_click",config.lockGeneratedClick);
+        PutBoolean(result,L"reserve_activation_side_buttons",config.reserveActivationSideButtons);
         return result;
     }
 
     vanta::MouseOutputConfig MouseOutputFromJson(
-        const JsonObject& object,
-        const vanta::MouseOutputConfig& defaults)
+        const JsonObject& object,const vanta::MouseOutputConfig& defaults)
     {
-        vanta::MouseOutputConfig result = defaults;
-        result.backendIndex =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"backend",
-                    result.backendIndex));
-        result.makcuPort =
-            String(
-                object,
-                L"makcu_port",
-                result.makcuPort);
-        result.highPerformanceMode =
-            Boolean(
-                object,
-                L"high_performance",
-                result.highPerformanceMode);
-        result.autoDetectAndConnect =
-            Boolean(
-                object,
-                L"auto_detect_and_connect",
-                result.autoDetectAndConnect);
+        vanta::MouseOutputConfig result=defaults;
+        result.backend=String(object,L"backend","makcu")=="medius"?vanta::InputBackend::medius:vanta::InputBackend::makcu;
+        result.makcuPort=String(object,L"makcu_port",result.makcuPort);
+        result.highPerformanceMode=Boolean(object,L"high_performance",result.highPerformanceMode);
+        result.autoDetectAndConnect=Boolean(object,L"auto_detect_and_connect",result.autoDetectAndConnect);
+        result.lockMovementWhileCorrecting=Boolean(object,L"lock_movement_while_correcting",result.lockMovementWhileCorrecting);
+        result.lockGeneratedClick=Boolean(object,L"lock_generated_click",result.lockGeneratedClick);
+        result.reserveActivationSideButtons=Boolean(object,L"reserve_activation_side_buttons",result.reserveActivationSideButtons);
         return result;
     }
 
@@ -458,162 +326,6 @@ namespace
             object,
             L"silent_automatic_installation",
             result.silentAutomaticInstallation);
-        return result;
-    }
-
-    JsonObject BombTimerToJson(
-        const vanta::BombTimerConfig& config)
-    {
-        JsonObject result;
-        PutBoolean(result, L"enabled", config.enabled);
-        result.Insert(
-            L"target_color",
-            ColorToJson(config.targetColor));
-        PutNumber(
-            result,
-            L"color_tolerance",
-            config.colorTolerance);
-        PutNumber(result, L"region_left", config.regionLeft);
-        PutNumber(result, L"region_top", config.regionTop);
-        PutNumber(result, L"region_width", config.regionWidth);
-        PutNumber(result, L"region_height", config.regionHeight);
-        PutNumber(
-            result,
-            L"required_matching_pixels",
-            config.requiredMatchingPixels);
-        PutNumber(
-            result,
-            L"required_consecutive_frames",
-            config.requiredConsecutiveFrames);
-        result.Insert(
-            L"safe_color",
-            ColorToJson(config.safeColor));
-        result.Insert(
-            L"warning_color",
-            ColorToJson(config.warningColor));
-        PutNumber(
-            result,
-            L"widget_opacity",
-            config.widgetOpacity);
-        PutNumber(
-            result,
-            L"widget_style",
-            config.widgetStyle);
-        PutNumber(
-            result,
-            L"widget_font",
-            config.widgetFont);
-        PutBoolean(
-            result,
-            L"has_widget_position",
-            config.hasWidgetPosition);
-        PutNumber(
-            result,
-            L"widget_x",
-            config.widgetPositionX);
-        PutNumber(
-            result,
-            L"widget_y",
-            config.widgetPositionY);
-        return result;
-    }
-
-    vanta::BombTimerConfig BombTimerFromJson(
-        const JsonObject& object,
-        const vanta::BombTimerConfig& defaults)
-    {
-        vanta::BombTimerConfig result = defaults;
-        result.enabled =
-            Boolean(object, L"enabled", result.enabled);
-        result.targetColor =
-            ColorFromJson(
-                Child(object, L"target_color"),
-                result.targetColor);
-        result.colorTolerance =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"color_tolerance",
-                    result.colorTolerance));
-        result.regionLeft =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"region_left",
-                    result.regionLeft));
-        result.regionTop =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"region_top",
-                    result.regionTop));
-        result.regionWidth =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"region_width",
-                    result.regionWidth));
-        result.regionHeight =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"region_height",
-                    result.regionHeight));
-        result.requiredMatchingPixels =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"required_matching_pixels",
-                    result.requiredMatchingPixels));
-        result.requiredConsecutiveFrames =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"required_consecutive_frames",
-                    result.requiredConsecutiveFrames));
-        result.safeColor =
-            ColorFromJson(
-                Child(object, L"safe_color"),
-                result.safeColor);
-        result.warningColor =
-            ColorFromJson(
-                Child(object, L"warning_color"),
-                result.warningColor);
-        result.widgetOpacity =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"widget_opacity",
-                    result.widgetOpacity));
-        result.widgetStyle =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"widget_style",
-                    result.widgetStyle));
-        result.widgetFont =
-            static_cast<int>(
-                Number(
-                    object,
-                    L"widget_font",
-                    result.widgetFont));
-        result.hasWidgetPosition =
-            Boolean(
-                object,
-                L"has_widget_position",
-                result.hasWidgetPosition);
-        result.widgetPositionX =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"widget_x",
-                    result.widgetPositionX));
-        result.widgetPositionY =
-            static_cast<float>(
-                Number(
-                    object,
-                    L"widget_y",
-                    result.widgetPositionY));
         return result;
     }
 
@@ -863,17 +575,31 @@ namespace
         PutNumber(object,L"width",c.width); PutNumber(object,L"height",c.height);
         PutNumber(object,L"fps",c.fps); PutNumber(object,L"bitrate_kbps",c.bitrateKbps);
         PutBoolean(object,L"request_display_mode",c.requestDisplayMode);
+        constexpr const char* codecs[]{"auto","h264","hevc","av1"};
+        PutString(object,L"codec",codecs[std::clamp(int(c.codec),0,3)]);
+        PutString(object,L"adapter",c.adapter);
         return object;
     }
 
-    vanta::SunshineStreamConfig SunshineFromJson(const JsonObject& object)
+    vanta::SunshineStreamConfig SunshineFromJson(const JsonObject& object,bool legacy)
     {
         vanta::SunshineStreamConfig c;
+        if(legacy){c.fps=120;c.codec=vanta::CodecPreference::H264;}
         c.width=static_cast<int>(std::clamp(Number(object,L"width",c.width),64.0,16384.0));
         c.height=static_cast<int>(std::clamp(Number(object,L"height",c.height),64.0,16384.0));
         c.fps=static_cast<int>(std::clamp(Number(object,L"fps",c.fps),1.0,1000.0));
         c.bitrateKbps=static_cast<int>(std::clamp(Number(object,L"bitrate_kbps",c.bitrateKbps),1000.0,500000.0));
         c.requestDisplayMode=Boolean(object,L"request_display_mode",c.requestDisplayMode);
+        if(!legacy)
+        {
+            const auto codec=String(object,L"codec","auto");
+            if(codec=="auto")c.codec=vanta::CodecPreference::Auto;
+            else if(codec=="h264")c.codec=vanta::CodecPreference::H264;
+            else if(codec=="hevc")c.codec=vanta::CodecPreference::HEVC;
+            else if(codec=="av1")c.codec=vanta::CodecPreference::AV1;
+            else throw std::runtime_error("Unsupported stream codec preference");
+            c.adapter=String(object,L"adapter","auto");
+        }
         return c;
     }
 
@@ -1212,9 +938,8 @@ namespace
         root.Insert(
             L"updates",
             UpdateToJson(config.updates));
-        root.Insert(
-            L"bomb_timer",
-            BombTimerToJson(config.bombTimer));
+        if (!config.pythonConfigJson.empty())
+            root.Insert(L"python",JsonObject::Parse(winrt::to_hstring(config.pythonConfigJson)));
         root.Insert(
             L"menu",
             MenuToJson(config.menu));
@@ -1256,7 +981,8 @@ namespace
                 return false;
             }
             result = defaults;
-            if (schema >= 7) result.sunshine=SunshineFromJson(Child(root,L"sunshine"));
+            if(schema<10){result.sunshine.fps=120;result.sunshine.codec=vanta::CodecPreference::H264;}
+            if (schema >= 7) result.sunshine=SunshineFromJson(Child(root,L"sunshine"),schema<10);
             result.capture =
                 CaptureFromJson(
                     Child(root, L"capture"),
@@ -1269,10 +995,12 @@ namespace
                 UpdateFromJson(
                     Child(root, L"updates"),
                     defaults.updates);
-            result.bombTimer =
-                BombTimerFromJson(
-                    Child(root, L"bomb_timer"),
-                    defaults.bombTimer);
+            if (schema>=9 && root.HasKey(L"python"))
+            {
+                result.pythonConfigJson=winrt::to_string(Child(root,L"python").Stringify());
+                vanta::PythonBotConfig python;
+                if (!vanta::ParsePythonBotConfig(result.pythonConfigJson,python,error)) return false;
+            }
             result.menu =
                 MenuFromJson(
                     Child(root, L"menu"),
@@ -1312,6 +1040,8 @@ namespace
         root.Insert(
             L"test_move",
             TestMoveToJson(profile.testMove));
+        if (!profile.pythonConfigJson.empty())
+            root.Insert(L"python",JsonObject::Parse(winrt::to_hstring(profile.pythonConfigJson)));
         return
             winrt::to_string(root.Stringify()) +
             "\n";
@@ -1360,6 +1090,13 @@ namespace
                     Child(root, L"test_move"),
                     result.testMove,
                     schema);
+            result.pythonConfigJson.clear();
+            if (schema>=9 && root.HasKey(L"python"))
+            {
+                result.pythonConfigJson=winrt::to_string(Child(root,L"python").Stringify());
+                vanta::PythonBotConfig python;
+                if (!vanta::ParsePythonBotConfig(result.pythonConfigJson,python,error)) return false;
+            }
             return true;
         }
         catch (const winrt::hresult_error& exception)
@@ -1584,12 +1321,6 @@ namespace vanta
 {
     bool RunConfigurationSelfTest()
     {
-        if (!RunBombTimerSelfTest())
-        {
-            vanta::log::Error(
-                "Bomb Timer self-test failed");
-            return false;
-        }
         bool apartmentInitialized = false;
         try
         {
@@ -1666,33 +1397,15 @@ namespace vanta
         }
 
         LocalConfig local;
-        local.capture.backendIndex = 1;
-        local.capture.sourceIndex = 2;
         local.capture.regionIndex = 1;
         local.capture.regionSize = 512;
-        local.capture.monitorDevice =
-            "\\\\.\\DISPLAY2";
-        local.capture.windowExecutable =
-            "C:\\Tests\\Target.exe";
-        local.capture.windowClass =
-            "VantaConfigSelfTestWindow";
-        local.capture.windowTitle =
-            "Configuration Test";
         local.capture.colorTargetIndex = 1;
-        local.mouseOutput.backendIndex = 1;
         local.mouseOutput.makcuPort = "COM42";
         local.mouseOutput.autoDetectAndConnect = false;
         local.updates.automaticChecks = false;
         local.updates.automaticDownloads = false;
         local.updates.silentAutomaticInstallation = false;
-        local.bombTimer.enabled = true;
-        local.bombTimer.colorTolerance = 24;
-        local.bombTimer.regionLeft = 0.42F;
-        local.bombTimer.requiredMatchingPixels = 7;
-        local.bombTimer.widgetOpacity = 0.66F;
-        local.bombTimer.hasWidgetPosition = true;
-        local.bombTimer.widgetPositionX = 123.0F;
-        local.bombTimer.widgetPositionY = 456.0F;
+        local.pythonConfigJson=DefaultPythonBotJson();
         local.menu.notifications = false;
         local.menu.compactMode = true;
         local.menu.hasGeometry = true;
@@ -1745,6 +1458,7 @@ namespace vanta
 
         SharedProfile profile;
         profile.name = "Self Test";
+        profile.pythonConfigJson=DefaultPythonBotJson();
         profile.testClick.enabled = true;
         profile.testClick.holdButton =
             MouseButtonBinding::x1;
@@ -1857,13 +1571,42 @@ namespace vanta
             detectorDecoded.testMove.detector.aimPointMode!=AimPointMode::maskTop)
             return finish(false);
         LocalConfig streamConfig,streamDecoded;
+        LocalConfig lockConfig,lockDecoded;
+        lockConfig.mouseOutput.lockMovementWhileCorrecting=false;
+        lockConfig.mouseOutput.lockGeneratedClick=false;
+        lockConfig.mouseOutput.reserveActivationSideButtons=false;
+        if(!DeserializeLocal(SerializeLocal(lockConfig),LocalConfig{},lockDecoded,parseError) ||
+            lockDecoded.mouseOutput.lockMovementWhileCorrecting || lockDecoded.mouseOutput.lockGeneratedClick ||
+            lockDecoded.mouseOutput.reserveActivationSideButtons ||
+            !LocalConfig{}.mouseOutput.lockMovementWhileCorrecting || !LocalConfig{}.mouseOutput.lockGeneratedClick ||
+            !LocalConfig{}.mouseOutput.reserveActivationSideButtons)return finish(false);
+        LocalConfig motionConfig,motionDecoded;
+        motionConfig.mouseOutput.backend=InputBackend::medius;
+        if(!DeserializeLocal(SerializeLocal(motionConfig),LocalConfig{},motionDecoded,parseError) ||
+            SerializeLocal(motionConfig)!=SerializeLocal(motionDecoded) ||
+            LocalConfig{}.mouseOutput.backend!=InputBackend::makcu || motionDecoded.mouseOutput.backend!=InputBackend::medius)return finish(false);
+        auto obsoleteOutput=MouseOutputToJson(motionConfig.mouseOutput);
+        PutNumber(obsoleteOutput,L"python_pipeline",2);PutNumber(obsoleteOutput,L"testmove_pipeline",1);
+        PutString(obsoleteOutput,L"renderer_profile","obsolete.json");PutNumber(obsoleteOutput,L"radians_per_count_x",0.0004);
+        const auto nativeOutput=MouseOutputToJson(MouseOutputFromJson(obsoleteOutput,{}));
+        if(nativeOutput.HasKey(L"python_pipeline") || nativeOutput.HasKey(L"renderer_profile") ||
+            nativeOutput.HasKey(L"radians_per_count_x") || String(nativeOutput,L"backend","")!="medius")return finish(false);
         streamConfig.sunshine={1920,1080,144,95000,false};
         if (!DeserializeLocal(SerializeLocal(streamConfig),LocalConfig{},streamDecoded,parseError) ||
             streamConfig.sunshine!=streamDecoded.sunshine ||
             LocalConfig{}.sunshine.width!=2560 || LocalConfig{}.sunshine.height!=1440 ||
-            LocalConfig{}.sunshine.fps!=120 || LocalConfig{}.sunshine.bitrateKbps!=150000)
+            LocalConfig{}.sunshine.fps!=240 || LocalConfig{}.sunshine.bitrateKbps!=150000 || LocalConfig{}.sunshine.codec!=CodecPreference::Auto)
             return finish(false);
         SharedProfile legacyProfile;
+        LocalConfig oldNine;
+        const std::string schemaNine=R"({"kind":"vanta-local-config","schema_version":9,"sunshine":{"width":1918,"height":1087,"fps":144,"bitrate_kbps":98000,"request_display_mode":false}})";
+        if(!DeserializeLocal(schemaNine,LocalConfig{},oldNine,parseError) || oldNine.sunshine.codec!=CodecPreference::H264 ||
+            oldNine.sunshine.width!=1918 || oldNine.sunshine.height!=1087 || oldNine.sunshine.fps!=144 || oldNine.sunshine.bitrateKbps!=98000)
+            return finish(false);
+        const auto ninePath=testDirectory/L"schema-nine.json";
+        if(!AtomicWrite(ninePath,schemaNine,changed) || !BackupBeforeSchemaUpgrade(ninePath,LocalConfig::schemaVersion))return finish(false);
+        auto nineBackup=ninePath;nineBackup+=L".schema-9.bak";std::string originalNine;
+        if(!ReadText(nineBackup,originalNine) || originalNine!=schemaNine)return finish(false);
         if (!DeserializeProfile(
                 "{\"kind\":\"vanta-test-profile\","
                 "\"schema_version\":1,"
@@ -1898,6 +1641,63 @@ namespace vanta
             return finish(false);
         }
 
+        LocalConfig migratedLocal;
+        const std::string oldBackends=R"({"kind":"vanta-local-config","schema_version":7,"capture":{"source":0,"backend":1,"region":1,"region_size":384,"color_target":3,"apply_filter":true,"monitor_device":"legacy","window_title":"legacy"},"mouse_output":{"backend":1,"makcu_port":"COM42","auto_detect_and_connect":false},"sunshine":{"width":1920,"height":1080,"fps":144,"bitrate_kbps":90000}})";
+        if (!DeserializeLocal(oldBackends,LocalConfig{},migratedLocal,parseError) ||
+            migratedLocal.capture.regionSize!=384 || migratedLocal.capture.colorTargetIndex!=3 ||
+            !migratedLocal.capture.applyFilter || migratedLocal.mouseOutput.makcuPort!="COM42" ||
+            migratedLocal.mouseOutput.autoDetectAndConnect ||
+            migratedLocal.sunshine.width!=1920 || migratedLocal.sunshine.fps!=144)
+            return finish(false);
+        // Destroy Windows JSON objects before finish() uninitializes COM.
+        const bool canonicalBackends=[&]()
+        {
+            const auto migratedJson=JsonObject::Parse(winrt::to_hstring(SerializeLocal(migratedLocal)));
+            return String(Child(migratedJson,L"capture"),L"source","")=="sunshine" &&
+                String(Child(migratedJson,L"mouse_output"),L"backend","")=="makcu" &&
+                !Child(migratedJson,L"capture").HasKey(L"window_title") &&
+                !Child(migratedJson,L"capture").HasKey(L"monitor_device") &&
+                !Child(migratedJson,L"capture").HasKey(L"backend");
+        }();
+        if (!canonicalBackends)
+            return finish(false);
+        // Schema 8 migration retains detector tuning, discards the removed
+        // timer, and seeds Python from the supplied config without arming it.
+        LocalConfig pythonDefaults;
+        pythonDefaults.pythonConfigJson=DefaultPythonBotJson();
+        LocalConfig schemaEight;
+        SharedProfile profileEight;
+        const std::string oldEight=R"({"kind":"vanta-local-config","schema_version":8,"bomb_timer":{"enabled":true},"capture":{"region_size":384},"mouse_output":{"makcu_port":"COM9"}})";
+        if (!DeserializeLocal(oldEight,pythonDefaults,schemaEight,parseError) ||
+            schemaEight.capture.regionSize!=384 || schemaEight.mouseOutput.makcuPort!="COM9" ||
+            !schemaEight.mouseOutput.lockMovementWhileCorrecting || !schemaEight.mouseOutput.lockGeneratedClick ||
+            !schemaEight.mouseOutput.reserveActivationSideButtons ||
+            schemaEight.pythonConfigJson!=pythonDefaults.pythonConfigJson ||
+            SerializeLocal(schemaEight).find("bomb_timer")!=std::string::npos ||
+            !DeserializeProfile(R"({"kind":"vanta-test-profile","schema_version":8,"test_move":{"detector":{"enabled":true,"offset_x":-2.5}}})",
+                profileEight,parseError) || !profileEight.testMove.detector.enabled ||
+            profileEight.testMove.detector.offsetX!=-2.5 || !profileEight.pythonConfigJson.empty())
+            return finish(false);
+        LocalConfig invalidPython;
+        if (DeserializeLocal(R"({"kind":"vanta-local-config","schema_version":9,"python":{"fov_radius":0}})",
+            pythonDefaults,invalidPython,parseError)) return finish(false);
+        const auto eightPath=testDirectory/L"schema-eight.json";
+        if (!AtomicWrite(eightPath,oldEight,changed) ||
+            !BackupBeforeSchemaUpgrade(eightPath,LocalConfig::schemaVersion)) return finish(false);
+        auto eightBackup=eightPath;
+        eightBackup+=L".schema-8.bak";
+        std::string preservedEight;
+        if (!ReadText(eightBackup,preservedEight) || preservedEight!=oldEight) return finish(false);
+        const auto legacyLocalPath=testDirectory/L"legacy-local.json";
+        if (!AtomicWrite(legacyLocalPath,oldBackends,changed) ||
+            !BackupBeforeSchemaUpgrade(legacyLocalPath,LocalConfig::schemaVersion))
+            return finish(false);
+        auto localBackup=legacyLocalPath;
+        localBackup+=L".schema-7.bak";
+        std::string originalLocal;
+        if (!ReadText(localBackup,originalLocal) || originalLocal!=oldBackends)
+            return finish(false);
+
         const auto oldProfilePath=testDirectory/L"legacy-profile.json";
         const std::string oldProfile="{\"kind\":\"vanta-test-profile\",\"schema_version\":7}";
         if (!AtomicWrite(oldProfilePath,oldProfile,changed) ||
@@ -1928,7 +1728,7 @@ namespace vanta
             'D', 'e', 'f', 'a', 'u', 'l', 't', '\0'};
         std::uint64_t captureRevision{};
         std::uint64_t mouseRevision{};
-        std::uint64_t bombTimerRevision{};
+        std::uint64_t pythonBotRevision{};
         std::uint64_t updateRevision{};
         std::uint64_t menuRevision{};
         std::uint64_t sunshineRevision{};
@@ -2113,7 +1913,8 @@ namespace vanta
         void RenderPanel(
             HWND owner,
             TestClickController& testClick,
-            TestMoveController& testMove)
+            TestMoveController& testMove,
+            PythonBotController& pythonBot)
         {
             const float bodyHeight = std::max(
                 190.0F,
@@ -2146,10 +1947,10 @@ namespace vanta
                 "Local settings: %ls",
                 localPath.c_str());
             ImGui::TextWrapped(
-                "Machine-local capture, input, Bomb Timer, menu and "
+                "Machine-local capture, input, Python, menu and "
                 "style/update settings "
                 "save automatically. Test profiles include both Test "
-                "enable states.");
+                "enable states and Python settings (Python never auto-arms).");
             custom::Separator();
 
             ImGui::Text(
@@ -2200,6 +2001,7 @@ namespace vanta
                     testClick.GetConfig();
                 profile.testMove =
                     testMove.GetConfig();
+                profile.pythonConfigJson=pythonBot.GetConfigJson();
                 SaveProfile(profile);
             }
             ImGui::SameLine();
@@ -2218,16 +2020,27 @@ namespace vanta
                         ProfilePath(name),
                         profile))
                 {
-                    testClick.ApplyConfig(
-                        profile.testClick);
-                    testMove.ApplyConfig(
-                        profile.testMove);
-                    status =
-                        "Loaded profile " +
-                        profile.name;
-                    vanta::log::Info(
-                        "Test profile loaded: %s",
-                        profile.name.c_str());
+                    std::string pythonError;
+                    const bool pythonApplied=profile.pythonConfigJson.empty() ||
+                        pythonBot.ApplyConfigJson(profile.pythonConfigJson,pythonError);
+                    if (!pythonApplied)
+                    {
+                        status="Python profile rejected: "+pythonError;
+                    }
+                    else
+                    {
+                        pythonBot.SetEnabled(false);
+                        testClick.ApplyConfig(
+                            profile.testClick);
+                        testMove.ApplyConfig(
+                            profile.testMove);
+                        status =
+                            "Loaded profile " +
+                            profile.name;
+                        vanta::log::Info(
+                            "Test profile loaded: %s",
+                            profile.name.c_str());
+                    }
                 }
             }
             ImGui::SameLine();
@@ -2502,7 +2315,7 @@ namespace vanta
     void ConfigManager::PrimeRevisions(
         const CaptureController& capture,
         const MakcuController& mouseOutput,
-        const BombTimerController& bombTimer,
+        const PythonBotController& pythonBot,
         const UpdateController& updates,
         const StreamReceiverController& sunshine)
     {
@@ -2511,8 +2324,8 @@ namespace vanta
             capture.SettingsRevision();
         impl.mouseRevision =
             mouseOutput.SettingsRevision();
-        impl.bombTimerRevision =
-            bombTimer.SettingsRevision();
+        impl.pythonBotRevision =
+            pythonBot.SettingsRevision();
         impl.updateRevision =
             updates.SettingsRevision();
         impl.menuRevision =
@@ -2523,7 +2336,7 @@ namespace vanta
     void ConfigManager::AutoSaveLocal(
         const CaptureController& capture,
         const MakcuController& mouseOutput,
-        const BombTimerController& bombTimer,
+        const PythonBotController& pythonBot,
         const UpdateController& updates,
         const StreamReceiverController& sunshine)
     {
@@ -2536,8 +2349,8 @@ namespace vanta
             capture.SettingsRevision();
         const std::uint64_t mouseRevision =
             mouseOutput.SettingsRevision();
-        const std::uint64_t bombTimerRevision =
-            bombTimer.SettingsRevision();
+        const std::uint64_t pythonBotRevision =
+            pythonBot.SettingsRevision();
         const std::uint64_t updateRevision =
             updates.SettingsRevision();
         const std::uint64_t menuRevision =
@@ -2546,8 +2359,8 @@ namespace vanta
                 impl.captureRevision &&
             mouseRevision ==
                 impl.mouseRevision &&
-            bombTimerRevision ==
-                impl.bombTimerRevision &&
+            pythonBotRevision ==
+                impl.pythonBotRevision &&
             updateRevision ==
                 impl.updateRevision &&
             menuRevision ==
@@ -2562,8 +2375,7 @@ namespace vanta
             capture.GetConfig();
         current.mouseOutput =
             mouseOutput.GetConfig();
-        current.bombTimer =
-            bombTimer.GetConfig();
+        current.pythonConfigJson = pythonBot.GetConfigJson();
         current.updates =
             updates.GetConfig();
         current.menu =
@@ -2574,8 +2386,8 @@ namespace vanta
                 captureRevision;
             impl.mouseRevision =
                 mouseRevision;
-            impl.bombTimerRevision =
-                bombTimerRevision;
+            impl.pythonBotRevision =
+                pythonBotRevision;
             impl.updateRevision =
                 updateRevision;
             impl.menuRevision =
@@ -2587,12 +2399,14 @@ namespace vanta
     void ConfigManager::RenderPanel(
         HWND owner,
         TestClickController& testClick,
-        TestMoveController& testMove)
+        TestMoveController& testMove,
+        PythonBotController& pythonBot)
     {
         implementation_->RenderPanel(
             owner,
             testClick,
-            testMove);
+            testMove,
+            pythonBot);
     }
 
     void ConfigManager::Shutdown()

@@ -121,6 +121,8 @@ namespace makcu {
         std::atomic<bool> m_isOpen;
         mutable std::mutex m_mutex;
         mutable std::mutex m_nativeHandleMutex;
+        mutable std::mutex m_errorMutex;
+        mutable std::string m_lastError;
 
 #ifdef _WIN32
         HANDLE m_handle;
@@ -170,12 +172,12 @@ namespace makcu {
         void platformClose();
         bool platformConfigurePort();
         void platformUpdateTimeouts();
-        void platformUpdateTimeoutsUnlocked();
+        bool platformUpdateTimeoutsUnlocked();
         ssize_t platformWrite(const void* data, size_t length);
         ssize_t platformRead(void* buffer, size_t maxBytes);
         size_t platformBytesAvailable() const;
         bool platformFlush();
-        std::string getLastPlatformError();
+        void recordPlatformError(const char* operation) const;
 
         // Disable copy
         SerialPort(const SerialPort&) = delete;

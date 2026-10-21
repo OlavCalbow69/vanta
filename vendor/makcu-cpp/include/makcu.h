@@ -276,6 +276,10 @@ namespace makcu {
 
         BatchCommandBuilder createBatch();
 
+        // A single caller must serialize uncorrelated V4 text queries. The
+        // normal listener continues decoding physical buttons while waiting.
+        [[nodiscard]] std::string queryText(const std::string& command, uint32_t timeoutMs);
+
         // Legacy raw command interface (not recommended for performance)
         [[deprecated("Use typed Device methods (mouseMove/click/lock/etc.) instead of raw commands.")]]
         [[nodiscard]] bool sendRawCommand(const std::string& command) const;

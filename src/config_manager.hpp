@@ -12,7 +12,7 @@ namespace vanta
     bool RunConfigurationSelfTest();
 
     class CaptureController;
-    class BombTimerController;
+    class PythonBotController;
     class MakcuController;
     class TestClickController;
     class TestMoveController;
@@ -35,19 +35,20 @@ namespace vanta
         void PrimeRevisions(
             const CaptureController& capture,
             const MakcuController& mouseOutput,
-            const BombTimerController& bombTimer,
+            const PythonBotController& pythonBot,
             const UpdateController& updates,
             const StreamReceiverController& sunshine);
         void AutoSaveLocal(
             const CaptureController& capture,
             const MakcuController& mouseOutput,
-            const BombTimerController& bombTimer,
+            const PythonBotController& pythonBot,
             const UpdateController& updates,
             const StreamReceiverController& sunshine);
         void RenderPanel(
             HWND owner,
             TestClickController& testClick,
-            TestMoveController& testMove);
+            TestMoveController& testMove,
+            PythonBotController& pythonBot);
         void Shutdown();
 
     private:

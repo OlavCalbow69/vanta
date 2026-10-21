@@ -1,0 +1,562 @@
+"""Enumerations mirroring the medius_capi wire values."""
+
+from __future__ import annotations
+
+from enum import IntEnum
+
+
+class ImageState(IntEnum):
+    """The bootloader's state for the image a chip is running (§4.16)."""
+
+    NEW = 0
+    PENDING_VERIFY = 1
+    VALID = 2
+    INVALID = 3
+    ABORTED = 4
+    UNKNOWN = 0xFF
+
+
+class UpdateTarget(IntEnum):
+    """Which chip a firmware update addresses (§3.13)."""
+
+    DEVICE = 0
+    HOST = 1
+
+
+class Status(IntEnum):
+    OK = 0
+    ERR_IO = 1
+    ERR_NOT_FOUND = 2
+    ERR_NO_REPLY = 3
+    ERR_BAD_PROTO_VER = 4
+    ERR_QUERY_TIMEOUT = 5
+    ERR_DISCONNECTED = 6
+    ERR_FRAME_TOO_LONG = 7
+    ERR_UPDATE = 8
+    ERR_INVALID_ARG = 9
+    ERR_PANIC = 10
+    ERR_UNKNOWN = 11
+    ERR_CATCH_TABLE_FULL = 12
+    ERR_EMPTY_SUBSCRIPTION = 13
+    ERR_CAPTURE_NOT_APPLICABLE = 14
+    ERR_NOT_AN_INPUT_FILTER = 15
+    ERR_WILDCARD_NOT_INPUT = 16
+    ERR_HALF_EDGE_INPUT_FILTER = 17
+    ERR_RESERVED_ID = 18
+    ERR_RELATIVE_DIRECTION = 19
+    ERR_LOCK_SCALE_RANGE = 20
+    ERR_LOCK_SCALE_USAGE = 21
+    ERR_IMPERFECT_REQUIRED = 22
+    ERR_REWRITE_MASK_LENGTH = 23
+    ERR_REWRITE_ACTION_CLASS = 24
+    ERR_REWRITE_PAYLOAD_TOO_LARGE = 25
+    ERR_REWRITE_TABLE_FULL = 26
+    ERR_TRANSFORM_OP_FIELDS = 27
+    ERR_TRANSFORM_TABLE_FULL = 28
+    ERR_RAW_DIRECTION = 29
+    ERR_CLIP_FRAME_COUNT = 30
+    ERR_CLIP_FRAME_TOO_LONG = 31
+    ERR_CLIP_TRANSFER_DATA = 32
+    ERR_CLIP_PACKET_TRIGGER = 33
+    ERR_REWRITE_MATCH_TOO_LONG = 34
+    ERR_REWRITE_POOL_FULL = 35
+
+
+class DeviceKind(IntEnum):
+    """The cloned device's primary kind, from its HID report descriptors and Boot declarations
+    (UNKNOWN also with nothing cloned)."""
+
+    UNKNOWN = 0
+    KEYBOARD = 1
+    MOUSE = 2
+
+
+class Button(IntEnum):
+    LEFT = 0
+    RIGHT = 1
+    MIDDLE = 2
+    SIDE1 = 3
+    SIDE2 = 4
+
+
+class Action(IntEnum):
+    SOFT_RELEASE = 0
+    PRESS = 1
+    FORCE_RELEASE = 2
+
+
+class MoveTiming(IntEnum):
+    """Whether a delta obeys movement riding or bypasses it."""
+
+    RIDE = 0
+    NOW = 1
+
+
+class PendingMotion(IntEnum):
+    """What a move does to the motion already held for a ride."""
+
+    KEEP = 0
+    FLUSH = 1
+    DISCARD = 2
+
+
+class ClipState(IntEnum):
+    """Box-side clip lifecycle state (`ClipStatus.state`)."""
+
+    IDLE = 0
+    PLAYING = 1
+    PAUSED = 2
+    FAULTED = 3
+
+
+#: Most edges per clip frame.
+CLIP_EDGES_MAX = 8
+#: Most raw reports per clip frame.
+CLIP_RAW_MAX = 8
+#: Most bytes a clip frame encodes to: one CLIP_APPEND payload.
+CLIP_ENTRY_MAX = 512
+#: Most packet triggers the box holds, beside its input triggers.
+CLIP_PKT_TRIG_MAX = 8
+#: Match bytes the box holds across all packet triggers.
+CLIP_PKT_MATCH_POOL = 112
+#: Most match bytes one packet trigger compares.
+PKT_MATCH_MAX = 16
+
+
+class Edge(IntEnum):
+    """Which edge of a trigger usage fires its `ClipTrigger`."""
+
+    BOTH = 0
+    PRESS = 1
+    RELEASE = 2
+
+
+class ClipAction(IntEnum):
+    """The clip action a `ClipTrigger` or `ClipPacketTrigger` drives."""
+
+    START = 0
+    STOP = 1
+    PAUSE = 2
+    RESUME = 3
+    RESTART = 4
+    TOGGLE = 5
+
+
+class RebootTarget(IntEnum):
+    DEVICE_DOWNLOAD = 0
+    HOST_DOWNLOAD = 1
+    DEVICE_RUN = 2
+    HOST_RUN = 3
+
+
+class EmitMode(IntEnum):
+    LEARNED = 0
+    INTERVAL = 1
+    FIXED = 2
+
+
+class RenderMode(IntEnum):
+    """Motion render texture: OFF is the paced fill; the others render the learned native report
+    texture and differ only in the path smoother."""
+
+    OFF = 0
+    STOCK = 1
+    DESPIKED = 2
+    UNSMOOTHED = 3
+
+
+class LedTarget(IntEnum):
+    DEVICE = 0
+    HOST = 1
+    BOTH = 2
+
+
+class LedMode(IntEnum):
+    AUTO = 0
+    OFF = 1
+    SOLID = 2
+    BLINK = 3
+
+
+class Direction(IntEnum):
+    """The direction byte LOCK, CLIP and CATCH all carry.
+
+    Members are named for axes; `PRESS`/`RELEASE` and `IN`/`OUT` alias the same two values for
+    momentary usages and traffic. The class picks the reading.
+
+    `WITH` and `AGAINST` name a sign relative to the bearing (the direction the box is injecting):
+    their sign follows the injection, not the axis. Axes only, and inert until a bearing is live
+    (`Device.set_bearing`).
+    """
+
+    BOTH = 0
+    POSITIVE = 1
+    NEGATIVE = 2
+    WITH = 3
+    AGAINST = 4
+
+    @property
+    def is_relative(self) -> bool:
+        """Whether this direction is measured against the bearing rather than a fixed sign."""
+        return self in (Direction.WITH, Direction.AGAINST)
+
+
+#: A momentary usage going down (`Direction.POSITIVE`).
+Direction.PRESS = Direction.POSITIVE
+#: A momentary usage coming up (`Direction.NEGATIVE`).
+Direction.RELEASE = Direction.NEGATIVE
+#: Traffic from the device to the PC (`Direction.POSITIVE`).
+Direction.IN = Direction.POSITIVE
+#: Traffic from the PC to the device (`Direction.NEGATIVE`).
+Direction.OUT = Direction.NEGATIVE
+
+
+class BearingMode(IntEnum):
+    """How the box reads whether native motion runs with or against injected motion."""
+
+    #: Each axis compares its sign against its bearing.
+    PER_AXIS = 0
+    #: Projects the native delta onto the injected XY vector. One relative scale governs both axes:
+    #: the lower of X's and Y's, which is also what reads back.
+    VECTOR = 1
+
+
+#: LOCK scale: keep none of the native value.
+LOCK_SCALE_BLOCK = 0
+#: LOCK scale: keep all of it, the unweighed default.
+LOCK_SCALE_PASS = 100
+#: LOCK scale ceiling: 2.55x.
+LOCK_SCALE_MAX = 255
+#: LOCK scale floor. A negative scale weighs the native value and reverses what it keeps (-100
+#: inverts). Axes only.
+LOCK_SCALE_MIN = -255
+#: Bearing window before any host sets one, in ms.
+BEARING_WINDOW_DEFAULT_MS = 20
+
+
+class Axis(IntEnum):
+    """A relative axis; values are the wire axis ids in CATCH and LOCK entries."""
+
+    X = 0
+    Y = 1
+    WHEEL = 2
+    #: AC Pan (horizontal scroll), a full peer of the wheel.
+    PAN = 3
+
+
+class LockTargetKind(IntEnum):
+    X = 0
+    Y = 1
+    WHEEL = 2
+    PAN = 3
+    USAGE = 4
+
+
+class Blanket(IntEnum):
+    # ABI ordinals of the Rust MediusBlanket, not the CLIP_LOCK_* wire bits.
+    AIM = 0
+    WHEEL = 1
+    BUTTONS = 2
+    KEYS = 3
+    MEDIA = 4
+
+
+class LogLevel(IntEnum):
+    ERROR = 0
+    WARN = 1
+    INFO = 2
+    DEBUG = 3
+    VERBOSE = 4
+
+
+class CatchEventKind(IntEnum):
+    MOTION = 0
+    USAGES = 1
+    TRAFFIC = 2
+
+
+class CatchClass(IntEnum):
+    """What a `CatchFilter` addresses. 0-3 are the LOCK and INJECT classes; 4-11 are byte-oriented
+    traffic."""
+
+    BUTTON = 0
+    KEY = 1
+    MEDIA = 2
+    AXIS = 3
+    HID_IN = 4
+    HID_OUT = 5
+    VENDOR_INTERRUPT = 6
+    VENDOR_BULK = 7
+    CONTROL = 8
+    EMIT = 9
+    BUS = 10
+    CLIP_TRANSFER = 11
+
+    def is_input(self) -> bool:
+        """A parsed-input class: it arrives decoded with no packet, so capture does not apply."""
+        return self <= CatchClass.AXIS
+
+    def is_traffic(self) -> bool:
+        """One of the eight byte-oriented traffic classes."""
+        return not self.is_input()
+
+
+class TrafficClass(IntEnum):
+    """The byte-oriented half of the catch address space, for the `traffic` constructors."""
+
+    HID_IN = 4
+    HID_OUT = 5
+    VENDOR_INTERRUPT = 6
+    VENDOR_BULK = 7
+    CONTROL = 8
+    EMIT = 9
+    BUS = 10
+    CLIP_TRANSFER = 11
+
+
+class InputKind(IntEnum):
+    """Which arm of an `InputEvent` is populated."""
+
+    PRESS = 0
+    RELEASE = 1
+    MOTION = 2
+
+
+class ClockDomain(IntEnum):
+    """Which chip's clock stamped an event. The chips boot independently: never subtract across
+    domains."""
+
+    HOST_CHIP = 0
+    DEVICE_CHIP = 1
+
+
+class ControlStatus(IntEnum):
+    """The handshake the game PC received for a control transaction. `STALLED` covers a STALL from
+    the real device, a request a rule refused, and above endpoint 0 a request that failed; `NAKED`
+    is endpoint 0 only."""
+
+    OK = 0
+    STALLED = 1
+    NAKED = 2
+    #: A handshake value this build does not know; `TrafficEvent.flags` bits 0-1 hold it.
+    OTHER = 3
+
+
+class RewriteClass(IntEnum):
+    """A traffic class a rewrite rule addresses (§3.14).
+
+    The write-direction CATCH classes the box rewrites. `ANY` is the wire wildcard:
+    `PASS`/`PATCH`/`REPLACE` only, applied at every surface a packet crosses, so a native report can
+    hit it at `HID_IN` and again at `EMIT`.
+    """
+
+    HID_IN = 4
+    HID_OUT = 5
+    VENDOR_INTERRUPT = 6
+    VENDOR_BULK = 7
+    CONTROL = 8
+    EMIT = 9
+    ANY = 0xFF
+
+
+class RewriteAction(IntEnum):
+    """What the top-ranked matching rewrite rule does to the packet (§3.14).
+
+    A report class may `PASS`, `DROP`, `PATCH` or `REPLACE`. The control class adds `ANSWER`, `STALL`,
+    `NAK` and the two reply rewrites, which the box refuses on any other class. On `CONTROL`, `PATCH`
+    and `REPLACE` act on an OUT request's data stage only.
+    """
+
+    PASS = 0
+    DROP = 1
+    PATCH = 2
+    REPLACE = 3
+    ANSWER = 4
+    STALL = 5
+    NAK = 6
+    REPLY_PATCH = 7
+    REPLY_REPLACE = 8
+
+
+class PatchSection(IntEnum):
+    """Which descriptor a patch overwrites (§3.14)."""
+
+    DEVICE = 0
+    CONFIG = 1
+    REPORT = 2
+    STRING = 3
+    BOS = 4
+
+
+class TransferStatus(IntEnum):
+    """How a control transfer ended (§3.14).
+
+    A non-`OK` status is a protocol outcome, not a link error. An unnamed wire byte is a status this
+    build does not know, kept as its integer value without raising.
+    """
+
+    OK = 0x00
+    REFUSED = 0xFC
+    STALL = 0xFD
+    NAK = 0xFE
+    NO_DEVICE = 0xFF
+
+    @property
+    def is_ok(self) -> bool:
+        return self == TransferStatus.OK
+
+
+class TransformOp(IntEnum):
+    """What a `Transform` does to its fields (§3.15).
+
+    `SWAP` exchanges two axes; `REMAP` moves a source field into a destination (axis→axis or
+    button→button in one report, or button→key / button→media across classes). To weigh or reverse a
+    field, use `Device.scale`.
+    """
+
+    REMAP = 0
+    SWAP = 1
+
+
+class BusEventKind(IntEnum):
+    """What a `CatchClass.BUS` event describes."""
+
+    RESET = 0
+    SUSPEND = 1
+    RESUME = 2
+    CONFIGURED = 3
+    DECONFIGURED = 4
+    SET_INTERFACE = 5
+    DEVICE_ATTACHED = 6
+    DEVICE_DETACHED = 7
+    CLONE_UP = 8
+    CLONE_DOWN = 9
+
+
+class MotionKind(IntEnum):
+    CURSOR = 0
+    WHEEL = 1
+    #: AC Pan (horizontal scroll).
+    PAN = 2
+
+
+class Class(IntEnum):
+    BUTTON = 0
+    KEY = 1
+    MEDIA = 2
+
+
+class FrameType(IntEnum):
+    MOVE = 1
+    INJECT = 3
+    RESET = 4
+    QUERY = 5
+    RESP = 6
+    REBOOT_DL = 7
+    LOG = 8
+    LED = 9
+    LOCK = 10
+    CATCH = 11
+    MOTION_EVENT = 12
+    USAGE_EVENT = 15
+    TRAFFIC_EVENT = 22
+    OPTION = 17
+    CLIP_APPEND = 18
+    CLIP_CTRL = 19
+    CLIP_SET = 20
+    CLIP_TRIGGER = 21
+    UPDATE = 23
+    UPDATE_RESP = 24
+    RAW = 25
+    TRANSFER = 26
+    TRANSFER_RESP = 27
+    REWRITE = 28
+    PATCH = 29
+    TRANSFORM = 30
+
+
+class Key(IntEnum):
+    A = 4
+    B = 5
+    C = 6
+    D = 7
+    E = 8
+    F = 9
+    G = 10
+    H = 11
+    I = 12
+    J = 13
+    K = 14
+    L = 15
+    M = 16
+    N = 17
+    O = 18
+    P = 19
+    Q = 20
+    R = 21
+    S = 22
+    T = 23
+    U = 24
+    V = 25
+    W = 26
+    X = 27
+    Y = 28
+    Z = 29
+    N1 = 30
+    N2 = 31
+    N3 = 32
+    N4 = 33
+    N5 = 34
+    N6 = 35
+    N7 = 36
+    N8 = 37
+    N9 = 38
+    N0 = 39
+    ENTER = 40
+    ESCAPE = 41
+    BACKSPACE = 42
+    TAB = 43
+    SPACE = 44
+    CAPS_LOCK = 57
+    F1 = 58
+    F2 = 59
+    F3 = 60
+    F4 = 61
+    F5 = 62
+    F6 = 63
+    F7 = 64
+    F8 = 65
+    F9 = 66
+    F10 = 67
+    F11 = 68
+    F12 = 69
+    INSERT = 73
+    HOME = 74
+    PAGE_UP = 75
+    DELETE = 76
+    END = 77
+    PAGE_DOWN = 78
+    RIGHT = 79
+    LEFT = 80
+    DOWN = 81
+    UP = 82
+    LEFT_CTRL = 224
+    LEFT_SHIFT = 225
+    LEFT_ALT = 226
+    LEFT_GUI = 227
+    RIGHT_CTRL = 228
+    RIGHT_SHIFT = 229
+    RIGHT_ALT = 230
+    RIGHT_GUI = 231
+
+
+class MediaKey(IntEnum):
+    PLAY = 176
+    PAUSE = 177
+    NEXT_TRACK = 181
+    PREV_TRACK = 182
+    STOP = 183
+    PLAY_PAUSE = 205
+    MUTE = 226
+    VOLUME_UP = 233
+    VOLUME_DOWN = 234

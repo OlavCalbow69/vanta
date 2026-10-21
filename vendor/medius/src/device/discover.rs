@@ -1,0 +1,141 @@
+//! Multi-box discovery: list connected boxes and open one by identity or clone kind.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::protocol::PROTO_VER;
+use crate::transport::Transport;
+use crate::types::{DeviceInfo, DeviceKind, PortInfo, Version};
+
+use super::Device;
+
+/// Discovered box: serial port, firmware version, and the real device it clones.
+#[derive(Debug, Clone)]
+pub struct BoxInfo {
+    /// Control serial port (path, USB ids, serial).
+    pub port: PortInfo,
+    /// Firmware version, control protocol, and base MAC.
+    pub version: Version,
+    /// Cloned device's identity, kind and product. `None` if [`proto_ver`](Version::proto_ver)
+    /// isn't [`PROTO_VER`](crate::PROTO_VER): this build then reads only the version, and opening
+    /// the box gives [`Error::BadProtoVer`]. Update the box's firmware from the dashboard at
+    /// <https://medius.k4tech.net/dashboard>.
+    pub device: Option<DeviceInfo>,
+}
+
+impl BoxInfo {
+    /// Stable box id: the device-chip MAC as 12 lowercase hex digits.
+    pub fn id(&self) -> String {
+        self.version.mac_hex()
+    }
+
+    /// CH343 control-adapter serial, if it serves one.
+    pub fn serial(&self) -> Option<&str> {
+        self.port.serial.as_deref()
+    }
+
+    /// Box name from `RESP(VERSION)`, the readable partner to [`id`](Self::id).
+    pub fn name(&self) -> &str {
+        &self.version.name
+    }
+}
+
+fn probe(port: &PortInfo) -> Option<BoxInfo> {
+    let serial = crate::transport::serial::SerialTransport::open(Path::new(&port.path)).ok()?;
+    probe_transport(port, Arc::new(serial))
+}
+
+// A box on another protocol is listed by its version alone, so a box needing an update still shows.
+pub(crate) fn probe_transport(port: &PortInfo, transport: Arc<dyn Transport>) -> Option<BoxInfo> {
+    let device = Device::from_transport(transport);
+    let version = device.read_version().ok()?;
+    let info = if version.proto_ver == PROTO_VER {
+        Some(device.device_info().ok()?)
+    } else {
+        None
+    };
+    Some(BoxInfo {
+        port: port.clone(),
+        version,
+        device: info,
+    })
+}
+
+// A box this build cannot speak to is refused with the protocol it reported, never skipped.
+fn openable(b: &BoxInfo) -> Result<&BoxInfo> {
+    match b.device {
+        Some(_) => Ok(b),
+        None => Err(Error::BadProtoVer {
+            got: b.version.proto_ver,
+        }),
+    }
+}
+
+pub(crate) fn pick_by_id<'a>(boxes: &'a [BoxInfo], id: &str) -> Result<&'a BoxInfo> {
+    let want: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let found = boxes
+        .iter()
+        .find(|b| {
+            b.id() == want
+                || b.serial()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(id) || s.eq_ignore_ascii_case(&want))
+        })
+        .ok_or(Error::NotFound)?;
+    openable(found)
+}
+
+// A box this build speaks to comes first; one on another protocol only when nothing else matches.
+pub(crate) fn pick_where(boxes: &[BoxInfo], pred: impl Fn(&BoxInfo) -> bool) -> Result<&BoxInfo> {
+    let found = boxes
+        .iter()
+        .find(|b| b.device.is_some() && pred(b))
+        .or_else(|| boxes.iter().find(|b| pred(b)))
+        .ok_or(Error::NotFound)?;
+    openable(found)
+}
+
+// Whether a box may clone `kind`. A box on another protocol reports no clone, so it may.
+pub(crate) fn may_clone(kind: DeviceKind) -> impl Fn(&BoxInfo) -> bool {
+    move |b| b.device.as_ref().is_none_or(|d| d.kind == kind)
+}
+
+impl Device {
+    /// Every connected box, with its version and cloned-device info. A box on another control
+    /// protocol is listed with [`device`](BoxInfo::device) `None`.
+    pub fn list() -> Vec<BoxInfo> {
+        crate::transport::scan::find_medius()
+            .iter()
+            .filter_map(probe)
+            .collect()
+    }
+
+    /// Open the box whose device-chip MAC or CH343 serial matches `id`. [`Error::BadProtoVer`] if
+    /// that box speaks another control protocol, [`Error::NotFound`] if no box matches.
+    pub fn open_by_id(id: &str) -> Result<Device> {
+        Device::open(&pick_by_id(&Device::list(), id)?.port.path)
+    }
+
+    /// Open the first box cloning a mouse ([`DeviceKind::Mouse`]). With no such box, a box on
+    /// another control protocol (which reports no clone) gives [`Error::BadProtoVer`].
+    pub fn find_mouse_box() -> Result<Device> {
+        Device::find_where(may_clone(DeviceKind::Mouse))
+    }
+
+    /// Open the first box cloning a keyboard ([`DeviceKind::Keyboard`]). With no such box, a box on
+    /// another control protocol (which reports no clone) gives [`Error::BadProtoVer`].
+    pub fn find_keyboard_box() -> Result<Device> {
+        Device::find_where(may_clone(DeviceKind::Keyboard))
+    }
+
+    /// Open the first box satisfying `pred`, preferring one this build speaks to. A box on another
+    /// control protocol ([`device`](BoxInfo::device) `None`) is chosen only if no other box
+    /// satisfies `pred`, and gives [`Error::BadProtoVer`]. [`Error::NotFound`] if no box matches.
+    pub fn find_where(pred: impl Fn(&BoxInfo) -> bool) -> Result<Device> {
+        Device::open(&pick_where(&Device::list(), pred)?.port.path)
+    }
+}

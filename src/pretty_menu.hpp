@@ -10,7 +10,7 @@ struct ID3D11ShaderResourceView;
 namespace vanta
 {
     class CaptureController;
-    class BombTimerController;
+    class PythonBotController;
     class ConfigManager;
     class MakcuController;
     class TestClickController;
@@ -30,7 +30,7 @@ namespace vanta::menu
         const char* surfaceDescription,
         HWND overlayWindow,
         CaptureController& capture,
-        BombTimerController& bombTimer,
+        PythonBotController& pythonBot,
         ConfigManager& configManager,
         MakcuController& makcu,
         TestClickController& testClick,

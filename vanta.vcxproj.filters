@@ -9,8 +9,15 @@
     <Filter Include="Resources"><UniqueIdentifier>{0E29C4C0-B5A4-4DBE-AE9A-ED3A22BF95C5}</UniqueIdentifier></Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\bomb_timer_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\main.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\input_locks.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\input_recovery.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\stream_frame.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\capture_fixture.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\preview_mask.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\python_bot.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\python_bot_config.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\python_bot_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\capture_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\config_manager.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\color_targets.cpp"><Filter>Source</Filter></ClCompile>
@@ -21,10 +28,10 @@
     <ClCompile Include="src\makcu_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\overlay_app.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\pretty_menu.cpp"><Filter>Source</Filter></ClCompile>
-    <ClCompile Include="src\rp2040_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\hardware_video_decoder.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\sunshine_pairing.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\stream_receiver_controller.cpp"><Filter>Source</Filter></ClCompile>
+    <ClCompile Include="src\stream_diagnostics.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\testclick_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\testmove_controller.cpp"><Filter>Source</Filter></ClCompile>
     <ClCompile Include="src\update_controller.cpp"><Filter>Source</Filter></ClCompile>
@@ -42,8 +49,13 @@
     <ClCompile Include="vendor\imgui\custom\custom_widgets.cpp"><Filter>Vendor\ImGui\Custom</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\bomb_timer_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\stream_frame.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\preview_mask.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\app_settings.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\input_locks.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\input_recovery.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\python_bot.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\python_bot_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\config_manager.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\color_targets.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\target_detection.hpp"><Filter>Source</Filter></ClInclude>
@@ -53,10 +65,10 @@
     <ClInclude Include="src\capture_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\overlay_app.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\pretty_menu.hpp"><Filter>Source</Filter></ClInclude>
-    <ClInclude Include="src\rp2040_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\hardware_video_decoder.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\sunshine_pairing.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\stream_receiver_controller.hpp"><Filter>Source</Filter></ClInclude>
+    <ClInclude Include="src\stream_diagnostics.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testclick_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\testmove_controller.hpp"><Filter>Source</Filter></ClInclude>
     <ClInclude Include="src\update_controller.hpp"><Filter>Source</Filter></ClInclude>
@@ -93,5 +105,11 @@
     <None Include="vendor\opencv\README.md.txt"><Filter>Vendor\OpenCV</Filter></None>
     <None Include="vendor\opencv\lib\x64\opencv_world500.lib"><Filter>Vendor\OpenCV</Filter></None>
     <None Include="vendor\opencv\bin\x64\opencv_world500.dll"><Filter>Vendor\OpenCV</Filter></None>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\input_backend_utils.cpp" />
+    <ClCompile Include="src\medius_backend.cpp" />
+    <ClInclude Include="src\input_backend_utils.hpp" />
+    <ClInclude Include="src\medius_backend.hpp" />
   </ItemGroup>
 </Project>

@@ -1,0 +1,52 @@
+//! Opens a box, reads its version and health, and exercises the core commands.
+
+use medius::{Button, Device};
+
+fn main() -> medius::Result<()> {
+    let device = match std::env::args().nth(1) {
+        Some(path) => Device::open(path)?,
+        None => Device::find()?,
+    };
+
+    let version = device.query_version()?;
+    let health = device.query_health()?;
+    println!("connected: {version}");
+    println!(
+        "health: link_up={} mouse_attached={} clone_configured={} injection_active={} rate_confident={} lock_on={} catch_on={}",
+        health.link_up,
+        health.mouse_attached,
+        health.clone_configured,
+        health.injection_active,
+        health.rate_confident,
+        health.lock_on,
+        health.catch_on,
+    );
+
+    let info = device.device_info()?;
+    let caps = device.caps()?;
+    let rate = device.query_rate()?;
+    println!(
+        "device: {info} ({}, composite={})",
+        info.kind,
+        caps.is_composite()
+    );
+    println!(
+        "caps: {} buttons, x={} y={} wheel={}",
+        caps.mouse.n_buttons, caps.mouse.has_x, caps.mouse.has_y, caps.mouse.has_wheel,
+    );
+    println!(
+        "rate: {:?} Hz (confident={})",
+        rate.native_hz(),
+        rate.confident
+    );
+
+    device.move_rel(40, 0)?;
+
+    device.press(Button::LEFT)?;
+    device.release(Button::LEFT)?;
+
+    device.reset()?;
+
+    println!("counters: {:?}", device.counters());
+    Ok(())
+}

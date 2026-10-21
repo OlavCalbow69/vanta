@@ -1,0 +1,42 @@
+//! Decoded `RESP(RATE)`: the live native report rate (§4.5).
+
+use crate::protocol::opcode::{RATE_CHANGE_DRIVEN, RATE_CONFIDENT};
+
+/// Native report rate measured off the live report stream, and the clone's poll period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rate {
+    /// Measured native report period in µs (`0` = not learned yet, or a change-driven input).
+    pub native_period_us: u16,
+    /// Clone's poll period in µs: the `bInterval` of the active input's endpoint.
+    pub poll_period_us: u16,
+    /// The estimator window is full, so `native_period_us` can be trusted (mirrors HEALTH
+    /// `rate_confident`).
+    pub confident: bool,
+    /// The active input is change-driven (keyboard/media): no continuous cadence, so only
+    /// `poll_period_us` applies.
+    pub change_driven: bool,
+}
+
+impl Rate {
+    /// Native report rate in Hz; `None` with no continuous cadence.
+    pub fn native_hz(&self) -> Option<f32> {
+        if self.native_period_us == 0 {
+            None
+        } else {
+            Some(1_000_000.0 / f32::from(self.native_period_us))
+        }
+    }
+
+    /// `[what][native_period_us u16][poll_period_us u16][flags u8]` (§4.5).
+    pub(crate) fn from_payload(p: &[u8]) -> Option<Self> {
+        if p.len() < 6 {
+            return None;
+        }
+        Some(Rate {
+            native_period_us: u16::from_le_bytes([p[1], p[2]]),
+            poll_period_us: u16::from_le_bytes([p[3], p[4]]),
+            confident: p[5] & RATE_CONFIDENT != 0,
+            change_driven: p[5] & RATE_CHANGE_DRIVEN != 0,
+        })
+    }
+}

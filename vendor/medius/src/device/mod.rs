@@ -1,0 +1,56 @@
+pub(crate) mod admin;
+#[cfg(feature = "async")]
+pub(crate) mod asyncv;
+pub(crate) mod catch;
+pub(crate) mod clip;
+pub(crate) mod closer;
+pub(crate) mod connect;
+pub(crate) mod discover;
+pub(crate) mod inject;
+pub(crate) mod input;
+pub(crate) mod led;
+pub(crate) mod lock;
+pub(crate) mod logs;
+pub(crate) mod movement;
+pub(crate) mod options;
+pub(crate) mod patch;
+pub(crate) mod query;
+pub(crate) mod raw;
+pub(crate) mod rewrite;
+pub(crate) mod transform;
+pub(crate) mod update;
+
+use std::sync::Arc;
+
+use crate::link::Link;
+use crate::transport::Transport;
+use crate::types::CountersSnapshot;
+
+/// Control handle for one medius box.
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub(crate) link: Link,
+}
+
+impl Device {
+    pub(crate) fn from_transport(transport: Arc<dyn Transport>) -> Device {
+        Device {
+            link: Link::from_transport(transport),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_transport_with_cadence(
+        transport: Arc<dyn Transport>,
+        keepalive_cadence: std::time::Duration,
+    ) -> Device {
+        Device {
+            link: Link::from_transport_with_cadence(transport, keepalive_cadence),
+        }
+    }
+
+    /// Snapshot of the always-on counters.
+    pub fn counters(&self) -> CountersSnapshot {
+        self.link.counters()
+    }
+}

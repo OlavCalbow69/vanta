@@ -9,9 +9,15 @@
 
 namespace makcu::protocol
 {
+    inline bool IsCommandEcho(std::string_view reply)
+    {
+        // A prior silent mutation may be echoed after a new query was queued.
+        // V4 scalar query results are numbers; identity is km.MAKCU, not a call.
+        return reply.starts_with("km.") && reply.ends_with(')') && reply.find('(')!=std::string_view::npos;
+    }
     inline bool IsEchoOrPrompt(std::string_view reply, std::string_view command)
     {
-        return reply.empty() || reply==command || reply==">>>" || reply==">>> ";
+        return reply.empty() || reply==command || reply==">>>" || reply==">>> " || IsCommandEcho(reply);
     }
     // One incremental parser for text, km.+mask streams, and V4 MAK_API
     // frames. Byte/chunk boundaries never carry protocol meaning.

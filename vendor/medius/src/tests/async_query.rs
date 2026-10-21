@@ -1,0 +1,292 @@
+#![cfg(all(feature = "async", feature = "mock"))]
+
+use futures::executor::block_on;
+
+use crate::{Device, Error, LogLevel, MockBox};
+
+#[test]
+fn async_query_times_out_on_a_silent_box() {
+    let device = Device::with_mock(MockBox::new().silent()).into_async();
+    let err = block_on(device.query_version()).unwrap_err();
+    assert!(matches!(err, Error::QueryTimeout), "got {err:?}");
+}
+
+#[test]
+fn async_logs_recv_async_yields_pushed_lines() {
+    let mock = MockBox::new();
+    let device = Device::with_mock(mock.clone()).into_async();
+    let logs = device.logs();
+    mock.push_log(LogLevel::Warn, "overheating");
+    let line = block_on(logs.recv_async()).unwrap();
+    assert_eq!(
+        (line.level, line.text.as_str()),
+        (LogLevel::Warn, "overheating")
+    );
+}
+
+#[test]
+fn async_raw_sends_without_reading_the_opt_in() {
+    use crate::protocol::FrameType;
+    use crate::types::Direction;
+
+    let mock = MockBox::new(); // opt-in off: the box drops the frame, the crate still sends it
+    let device = Device::with_mock(mock.clone()).into_async();
+    block_on(device.raw(1, Direction::IN, &[0x00, 0x01])).unwrap();
+    assert!(mock.saw(FrameType::Raw));
+    assert!(!mock.saw(FrameType::Query));
+}
+
+#[test]
+fn async_movement_verbs_send_the_same_frames_as_the_sync_ones() {
+    use crate::protocol::FrameType;
+    use crate::{Motion, MoveTiming, PendingMotion};
+
+    let moves = |f: &dyn Fn(&crate::AsyncDevice)| -> Vec<Vec<u8>> {
+        let mock = MockBox::new();
+        let device = Device::with_mock(mock.clone()).into_async();
+        f(&device);
+        mock.recorded_frames()
+            .into_iter()
+            .filter(|fr| fr.ty == FrameType::Move)
+            .map(|fr| fr.payload)
+            .collect()
+    };
+    // The async surface delegates; pin that each verb is sent with its flags.
+    assert_eq!(
+        moves(&|d| {
+            d.move_rel_now(7, -2).unwrap();
+            d.wheel_now(3).unwrap();
+            d.pan_now(6).unwrap();
+            d.flush_motion().unwrap();
+            d.discard_motion().unwrap();
+            d.move_axis(Motion::Wheel(1), MoveTiming::Now, PendingMotion::Flush)
+                .unwrap();
+            d.move_axis(Motion::Pan(4), MoveTiming::Ride, PendingMotion::Flush)
+                .unwrap();
+        }),
+        vec![
+            vec![0, 7, 0, 0xFE, 0xFF, 0x01],
+            vec![1, 3, 0, 0x01],
+            vec![2, 6, 0, 0x01],
+            vec![0, 0, 0, 0, 0, 0x02],
+            vec![0, 0, 0, 0, 0, 0x04],
+            vec![1, 1, 0, 0x03],
+            vec![2, 4, 0, 0x02],
+        ]
+    );
+}
+
+#[test]
+fn async_caps_caches_the_declared_button_count_for_the_blanket() {
+    use crate::protocol::FrameType;
+    use crate::types::MouseCaps;
+    use crate::{Blanket, Direction};
+
+    let mock = MockBox::new().with_mouse_caps(MouseCaps {
+        n_buttons: 16,
+        has_x: true,
+        has_y: true,
+        has_wheel: true,
+        pan: false,
+        has_report_id: false,
+        n_hid: 1,
+    });
+    let device = Device::with_mock(mock.clone()).into_async();
+    // The async caps() caches the declared count the same way the sync one does.
+    assert_eq!(block_on(device.caps()).unwrap().mouse.n_buttons, 16);
+    device.lock_all(Blanket::Buttons, Direction::Both).unwrap();
+    mock.clear_recorded();
+    device.reapply().unwrap();
+    let ids: Vec<u16> = mock
+        .recorded_frames()
+        .iter()
+        .filter(|f| f.ty == FrameType::Lock)
+        .map(|f| u16::from_le_bytes([f.payload[1], f.payload[2]]))
+        .collect();
+    assert_eq!(ids, (0..16).collect::<Vec<u16>>());
+}
+
+#[test]
+fn async_clip_set_ride_sends_the_ride_id() {
+    use crate::protocol::FrameType;
+
+    let mock = MockBox::new();
+    let device = Device::with_mock(mock.clone()).into_async();
+    device.clip().set_ride(true).unwrap();
+    let sent: Vec<Vec<u8>> = mock
+        .recorded_frames()
+        .into_iter()
+        .filter(|f| f.ty == FrameType::ClipSet)
+        .map(|f| f.payload)
+        .collect();
+    assert_eq!(sent, vec![vec![3, 1]]);
+}
+
+#[test]
+fn async_packet_trigger_calls_send_the_same_frames_as_the_sync_ones() {
+    use crate::protocol::FrameType;
+    use crate::{ClipAction, ClipPacketTrigger, Direction, TrafficClass};
+
+    let trigger = ClipPacketTrigger::new(TrafficClass::HidIn, 2, Direction::IN, ClipAction::Start)
+        .matching([0x07, 0x20], [0xFF, 0x20])
+        .once_per_run(1);
+    let sent = |mock: &MockBox| -> Vec<Vec<u8>> {
+        mock.recorded_frames()
+            .into_iter()
+            .filter(|f| f.ty == FrameType::ClipTrigger)
+            .map(|f| f.payload)
+            .collect()
+    };
+    let sync_mock = MockBox::new();
+    let sync = Device::with_mock(sync_mock.clone()).clip();
+    sync.bind_packet(&trigger).unwrap();
+    sync.unbind_packet(&trigger).unwrap();
+
+    let mock = MockBox::new();
+    let device = Device::with_mock(mock.clone()).into_async();
+    let clip = device.clip();
+    clip.bind_packet(&trigger).unwrap();
+    let read = block_on(clip.query_config()).unwrap().packet_triggers;
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].trigger, trigger);
+    clip.unbind_packet(&trigger).unwrap();
+    assert!(
+        block_on(clip.query_config())
+            .unwrap()
+            .packet_triggers
+            .is_empty()
+    );
+    assert_eq!(sent(&mock), sent(&sync_mock));
+    assert_eq!(sent(&mock).len(), 2);
+}
+
+#[test]
+fn async_scale_verbs_send_the_same_frames_as_the_sync_ones() {
+    use crate::protocol::FrameType;
+    use crate::protocol::opcode::{
+        LOCK_CLS_AXIS, LOCK_CLS_MEDIA, LOCK_DIR_AGAINST, LOCK_DIR_BOTH, LOCK_DIR_WITH,
+    };
+    use crate::{Axis, Blanket, Direction, MediaKey};
+
+    let mock = MockBox::new();
+    let device = Device::with_mock(mock.clone()).into_async();
+    device.scale(Axis::X, Direction::Against, 40).unwrap();
+    device
+        .scale_axis(Axis::Wheel, Direction::With, 130)
+        .unwrap();
+    device.scale_all(Blanket::Aim, Direction::Both, 50).unwrap();
+    device.lock(MediaKey::MUTE, Direction::PRESS).unwrap();
+    let sent: Vec<Vec<u8>> = mock
+        .recorded_frames()
+        .into_iter()
+        .filter(|f| f.ty == FrameType::Lock)
+        .map(|f| f.payload)
+        .collect();
+    assert_eq!(
+        sent,
+        vec![
+            vec![LOCK_CLS_AXIS, 0, 0, LOCK_DIR_AGAINST, 40, 0],
+            vec![LOCK_CLS_AXIS, 2, 0, LOCK_DIR_WITH, 130, 0],
+            vec![LOCK_CLS_AXIS, 0, 0, LOCK_DIR_BOTH, 50, 0],
+            vec![LOCK_CLS_AXIS, 1, 0, LOCK_DIR_BOTH, 50, 0],
+            vec![LOCK_CLS_MEDIA, 0xE2, 0x00, LOCK_DIR_BOTH, 0, 0],
+        ]
+    );
+}
+
+#[test]
+fn async_refuses_a_relative_direction_the_box_would_drop() {
+    use crate::{Blanket, Button, Direction};
+    let device = Device::with_mock(MockBox::new()).into_async();
+    assert!(matches!(
+        device.lock(Button::LEFT, Direction::With),
+        Err(Error::RelativeDirection { .. })
+    ));
+    assert!(matches!(
+        device.scale_all(Blanket::Keys, Direction::Against, 40),
+        Err(Error::RelativeDirection { .. })
+    ));
+    assert!(
+        device
+            .scale_axis(crate::Axis::Y, Direction::With, 60)
+            .is_ok()
+    );
+}
+
+#[test]
+fn async_bearing_round_trips_through_the_mock() {
+    use crate::protocol::FrameType;
+    use crate::types::{Bearing, BearingMode};
+    use std::time::Duration;
+
+    let mock = MockBox::new();
+    let device = Device::with_mock(mock.clone()).into_async();
+    device
+        .set_bearing(Some(Duration::from_millis(35)), BearingMode::Vector)
+        .unwrap();
+    let sent: Vec<Vec<u8>> = mock
+        .recorded_frames()
+        .into_iter()
+        .filter(|f| f.ty == FrameType::Option)
+        .map(|f| f.payload)
+        .collect();
+    assert_eq!(sent, vec![vec![4, 35, 0, 1]]);
+    assert_eq!(
+        block_on(device.query_bearing()).unwrap(),
+        Bearing {
+            window: Some(Duration::from_millis(35)),
+            mode: BearingMode::Vector,
+        }
+    );
+}
+
+#[test]
+fn async_render_round_trips_through_the_mock() {
+    use crate::protocol::FrameType;
+    use crate::types::{RenderMode, RenderStatus};
+
+    let mock = MockBox::new().with_render(RenderMode::Unsmoothed, true);
+    let device = Device::with_mock(mock.clone()).into_async();
+    device.set_render(RenderMode::Unsmoothed, true).unwrap();
+    let sent: Vec<Vec<u8>> = mock
+        .recorded_frames()
+        .into_iter()
+        .filter(|f| f.ty == FrameType::Option)
+        .map(|f| f.payload)
+        .collect();
+    // id 5, mode 3, full 1: a swapped `full` or a wrong option id both fail here.
+    assert_eq!(sent, vec![vec![5, 3, 1]]);
+    assert_eq!(
+        block_on(device.query_render()).unwrap(),
+        RenderStatus {
+            mode: RenderMode::Unsmoothed,
+            full: true,
+            ready: false,
+        }
+    );
+}
+
+#[test]
+fn async_spread_round_trips_through_the_mock() {
+    use crate::protocol::FrameType;
+    use crate::types::SpreadStatus;
+
+    let mock = MockBox::new().with_spread_learned(4000);
+    let device = Device::with_mock(mock.clone()).into_async();
+    device.set_spread(250).unwrap();
+    let sent: Vec<Vec<u8>> = mock
+        .recorded_frames()
+        .into_iter()
+        .filter(|f| f.ty == FrameType::Option)
+        .map(|f| f.payload)
+        .collect();
+    // id 6, percent 250 little-endian: a wrong option id or a byte-swapped percent both fail here.
+    assert_eq!(sent, vec![vec![6, 250, 0]]);
+    assert_eq!(
+        block_on(device.query_spread()).unwrap(),
+        SpreadStatus {
+            percent: 250,
+            span_us: 10000,
+        }
+    );
+}

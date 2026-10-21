@@ -2156,9 +2156,14 @@ namespace vanta::sunshine
             result.message = error;
             return result;
         }
-        if ((refreshedHost.info.codecSupport & VIDEO_FORMAT_H264) == 0)
+        int hostFormats{};
+        if(refreshedHost.info.codecSupport&SCM_H264)hostFormats|=VIDEO_FORMAT_H264;
+        if(refreshedHost.info.codecSupport&SCM_HEVC)hostFormats|=VIDEO_FORMAT_H265;
+        if(refreshedHost.info.codecSupport&SCM_AV1_MAIN8)hostFormats|=VIDEO_FORMAT_AV1_MAIN8;
+        result.supportedVideoFormats=hostFormats&request.supportedVideoFormats;
+        if (result.supportedVideoFormats==0)
         {
-            result.message = "This Sunshine host does not advertise H.264, which Vanta's native receiver currently requires";
+            result.message = "Sunshine and the selected receiver adapter have no common hardware codec for this selection";
             return result;
         }
 

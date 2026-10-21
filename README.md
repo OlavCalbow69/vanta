@@ -14,6 +14,9 @@ the executable through their opaque C API; no separate MAKCU DLL is required.
 
 This feature branch adds the [1440p detector and MAKCU 4.094 update](README-DETECTOR.md).
 It includes contour filters, mask-top aiming, configurable morphology, and red/yellow presets.
+The [Python mode](README-PYTHON.md) replaces the removed timer page.
+The [streaming-240 guide](README-STREAMING.md) covers hardware codecs, native GPU
+ROI capture, diagnostics, laptop acceptance checks and rollback.
 
 ## License
 
@@ -32,7 +35,8 @@ the MSVC `v145` x64 toolset, and Windows SDK `10.0.26100.0`. Open
 ```
 
 The script initializes the Moonlight submodule, builds its static `/MT`
-library, and installs static OpenSSL in the local `work\` directory. Then run:
+library, and installs pinned static FFmpeg and OpenSSL in the local `work\`
+directory. Then run:
 
 ```powershell
 & 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe' `
@@ -45,6 +49,7 @@ The output is:
 build\Release\vanta.exe
 build\Release\vanta-updater.exe
 build\Release\opencv_world500.dll
+build\Release\python-config.json
 ```
 
 ## Automated builds and releases
@@ -84,14 +89,13 @@ the rest of the desktop remains genuinely click-through.
 
 Press `Insert` to show or hide the menu. When hidden, the overlay is fully
 click-through and its window is hidden. Drag the lower-right corner to resize
-the menu within the current monitor. Press `End` or `Delete` to close Vanta;
-press `Home` to reset the Bomb Timer.
+the menu within the current monitor. Press `End` or `Delete` to close Vanta.
 
 Every supported exit route uses the same graceful shutdown path, including
 `End`, `Delete`, `WM_CLOSE`, `Ctrl+C`, `Ctrl+Break`, console close, and Windows session
-shutdown. Vanta first stops the TestClick and TestMove workers, then capture,
-MAKCU/RP2040, configuration, ImGui, DirectComposition/D3D11, the native
-outline windows, and their registered window classes. Shutdown is idempotent
+shutdown. Vanta first stops the TestClick, TestMove and Python workers, then capture,
+MAKCU, configuration, ImGui and DirectComposition/D3D11.
+Shutdown is idempotent
 and also handles partial initialization failures.
 
 The console output is mirrored to `vanta.log` beside the executable.
@@ -117,93 +121,63 @@ physical or virtual host display can use the requested resolution and refresh
 rate; turn it off if the host display must remain unchanged. Vanta launches
 Sunshine's `Desktop` app
 over its certificate-pinned HTTPS GameStream API, uses Moonlight common-c for
-the GameStream UDP transport, and hardware-decodes H.264 directly to a D3D11
-texture shown in the receiver page. H.264 is deliberately the initial native
-decoder; configure Sunshine to permit H.264 for Vanta. It does not launch an
+the GameStream UDP transport, and uses FFmpeg/D3D11VA for hardware H.264,
+HEVC or AV1 decoding. Auto chooses AV1, then HEVC, then H.264 from the common
+receiver/host capabilities; forced choices stay fixed. It does not launch an
 external Moonlight process. For a clean handoff, stop any separate active
 Moonlight session before starting Vanta's stream; Vanta refuses to take over
 an already-active Sunshine session.
 
-To make Vanta's existing capture consumers use the remote video, select
-**Sunshine stream** as the source on the `Capture` page. Vanta then copies
-only newly decoded BGRA frames into its normal OpenCV capture pipeline, so
-TestClick, TestMove, and the Bomb Timer receive the same stream frame source.
-The receiver page remains a direct GPU preview when this source is not
-selected. Remote frames have no physical receiver-PC screen coordinates, so
-Vanta deliberately does not draw desktop capture/FOV/calibration outlines for
-that source.
+Sunshine is the only capture source. Background region subscriptions feed
+TestClick, TestMove and Python with immutable native BGRA snapshots. The
+receiver preview samples GPU surfaces, while the capture pipeline reads back
+only the union of active CPU regions. Remote coordinates are never treated as receiver-desktop
+coordinates.
 
 ## Capture
 
-Vanta opens directly on the `Capture` page and immediately starts Windows
-Graphics Capture on the monitor under the cursor. Selecting another backend,
-source, window, or monitor restarts capture automatically; there is no manual
-Start step.
+Vanta opens on the Capture page and waits for the Sunshine stream. Pair and
+connect through Stream Receiver. There are no local-window/monitor selectors,
+Windows Graphics Capture, or Desktop Duplication backends in this build.
 
-The Capture page uses the supplied LineFlow sidebar, child panels, animated
-combos, checkboxes, sliders, and compact color picker. Its permanent
-`Capture output` panel shows live status, source/region dimensions, preview
-dimensions, FPS, matching-pixel count when filtering, and the scaled frame.
-The custom combo state is safe to close and reopen immediately and long
-source lists scroll inside a six-item popup. Reopened combo windows are
-explicitly kept above the parent menu. The native capture outline remains
-click-through and is ordered directly behind the menu, so it cannot cover or
-fight the menu controls.
+Capture settings retain:
 
-Capture settings include:
+- Full decoded source or a centered square from 128 to 1280 pixels.
+- Original, color-filtered or black-and-white preview.
+- Purple, yellow and dual-range red preview presets.
+- Preview border visibility/color and TestMove FOV visualization.
 
-- Windows Graphics Capture or DXGI Desktop Duplication
-- a top-level window, monitor, or native Sunshine stream
-- the full source or a centered square from 128 to 1280 pixels
-- original/color-filtered output or a black-and-white mask
-- a capture-preview color target independent from TestClick and TestMove
-- whether to show the click-through capture-area outline and its color
-
-The default centered region is `640x640`. Captured pixels are processed at
-the selected source resolution and only the GUI preview is scaled down to at
-most `560x315`. Capture no longer has a 30 FPS timer: it is polled every
-render iteration, WinRT uses a three-frame pool, and centered monitor/WinRT
-regions are cropped during the D3D11 readback to reduce CPU bandwidth. The
-console reports measured capture throughput periodically.
-
-The capture outline uses a fixed 1 px colored line with black edging. The
-complete frame remains inside the exact capture rectangle and shares the
-selected outline opacity.
-
-The OpenCV filter converts BGRA to BGR and then HSV, supports the original
-inclusive range `[144, 106, 172]` through `[151, 255, 255]` and the alternative
-range `[135, 63, 102]` through `[155, 255, 255]`, yellow, and dual-range red
-across the hue boundary. The 75 supplied exact blacklist colors apply to purple
-only. With `Black/white mask` enabled,
-non-matching pixels are black and matching pixels are white.
-
-Windows Graphics Capture captures the selected window directly. Desktop
-Duplication captures a monitor; window mode crops that window's visible screen
-rectangle, so overlapping windows can remain in that backend's result.
+The default centered ROI is 640x640. Only the GUI preview is resized, to at most
+560x315; target detection keeps native decoded pixels and full-source dimensions.
+The preview reports source/ROI dimensions, FPS and matching-pixel count.
+The purple presets keep the existing exact-color blacklist; red and yellow do
+not use it. Preview filtering never changes the raw frames supplied to workers.
+Python mode requests its own centered 2*fov_radius region directly from the GPU,
+independently of this page's ROI and preview settings.
 
 ## Mouse output
 
-The `Mouse output` page selects MAKCU 1.3.5 or the RP2040 USB HID bridge.
-The MAKCU backend scans for supported CH343/CH340 devices and provides
-non-blocking connection handling. It shows the selected port, VID/PID, and
-firmware version, and includes high-performance mode, relative movement,
-left/right click, and wheel test controls. Auto detect/connect is enabled by
-default and retries every two seconds. MAKCU is always preferred; RP2040 is
-selected as a fallback when MAKCU is unavailable, and a MAKCU attached later
-takes over only after connecting successfully. Auto connection can be disabled
-from the page. The `vendor\makcu-cpp` sources include a documented V4 compatibility
-patch for baud discovery, numeric firmware replies, and interleaved button packets.
+Mouse output defaults to stock MAKCU, with an optional Medius 3.4.6 backend.
+The stock controller scans supported CH343/CH340 devices,
+connects asynchronously, shows the port, VID/PID and numeric firmware version,
+and retains high-performance mode, movement, left/right-click and wheel tests.
+Auto-connect retries every two seconds and can be disabled. If MAKCU is absent,
+output remains unavailable; there is no secondary-device fallback.
 
-When MAKCU is connected, Vanta enables its physical-button monitor. The
-TestClick hold binding and TestMove aim binding are limited to `Left click`,
-`Right click`, `Mouse X1`, and `Mouse X2`; their press/release state comes from
-the MAKCU callback rather than Windows key-state polling.
+Medius is an optional output backend using the original Python and TestMove
+calculations. See [README-MEDIUS.md](README-MEDIUS.md) for setup, recovery and
+laptop checks. Stock MAKCU remains the default for missing backend settings.
 
-Both backends implement clicks as left-down, a 1 ms hold, and left-up. A failed
-release is retried three times and remains pending for recovery before later
-click/move commands and during the main device tick. Backend switching,
-disconnect, rescan, and shutdown force a neutral released state. A TestClick
-shot is counted only after the release succeeds.
+The vendored C++ implementation probes 4 Mbaud before 115,200 and preserves the
+V4 compatibility patch for volatile baud switching/reopen, numeric firmware
+discovery and interleaved physical-button packets. It never flashes firmware.
+TestClick and TestMove activation comes from MAKCU's physical-button monitor
+(Left, Right, X1 or X2), not Windows key polling.
+
+Quick clicks retain the existing bounded 14-34 ms hold. Failed release commands
+are retried and remain pending for recovery before subsequent commands and
+during the device tick. Disconnect, rescan and shutdown release injected state.
+A TestClick shot is counted only after its release command succeeds.
 
 ## TestClick and TestMove
 
@@ -233,35 +207,35 @@ pending-target identity so the delay persists correctly across fresh frames.
 These controls and merge proximity are grouped under the code-icon
 `Experimental` section.
 
-TestMove can show a fixed 1 px, anti-aliased Kill FOV circle with black
-edging. The circle is drawn with per-pixel alpha in its own topmost,
-click-through, capture-excluded native window. It remains behind the menu,
-stays visible while the menu is hidden, and is clamped to the active capture
-rectangle.
+TestMove's configurable Kill FOV circle is drawn inside the Sunshine ROI
+preview, using decoded-pixel coordinates and the selected color. It is not a
+receiver-desktop overlay. The FOV still constrains targeting, and the enhanced
+detector preview retains accepted/rejected contours and calibrated aim points.
 
-## Bomb Timer
+## Python
 
-The `Bomb Timer` page samples a small raw BGRA region from the currently
-selected capture source without expanding the centered capture or creating a
-second capture session. Its default normalized region maps to
-`918,6,79,68` at 1920×1080 and detects RGB `(170,0,0)` with a per-channel
-tolerance of 30. Three matching pixels across three fresh frames start one
-45-second countdown; three clear frames are required before detection can
-re-arm.
+The **Python** tab recreates the supplied colorbot.py detection and movement
+algorithm in native C++, with Sunshine pixels and physical MAKCU mouse-button
+activation. Original and Renderer use native C++; the optional Continuous pipeline
+uses the bundled private Python runtime on the receiver. No system Python is needed.
+The supplied config is embedded and also shipped as `python-config.json`;
+load/save JSON, restore defaults, edit HSV/FOV/smoothing/offsets and inspect
+the mask/contour/aim preview on the tab.
 
-The detector region, target color, tolerance, pixel threshold, and confirmation
-frames are fixed to those built-in defaults and are intentionally hidden from
-the GUI. The page provides manual start and reset controls, a working 10-second
-widget test. The countdown
-is rendered in its own topmost,
-capture-excluded native overlay that is permanently click-through and
-non-activating. It uses a semi-transparent dark panel, a 1 px
-black-accent-black frame, and safe/warning text colors at the fixed 6.9-second
-threshold. Three panel styles and three timer fonts include an in-menu preview.
-The Bomb Timer page keeps an editor preview visible even while inactive; X/Y
-controls move it without making the overlay interactive. Position, style,
-font, colors, and opacity are saved locally. No auto-defuse input, UDP listener,
-or startup flag is included.
+Its independent centered crop is 120x120 with the supplied radius 60. Thresholds,
+offsets and morphology use decoded pixels and are **not** scaled for 1440p.
+It retains double-precision smoothing 0.4030150753768844 and Python's
+integer truncation. There is no normal detector, blacklist, tracking, extra speed,
+deadzone or automatic shooting in this mode. Physical-input locking is handled
+by the shared Mouse Output coordinator; see [README-INPUT-LOCKS.md](README-INPUT-LOCKS.md).
+Python and TestMove movement are mutually exclusive; TestClick remains an
+independent feature. Python is always disabled on startup and after JSON/profile
+loading. Python uses the current MAKCU connection and automatic COM discovery;
+legacy Python COM-port overrides are ignored. The saved port is a preference
+while detected, rather than a port lock.
+
+See [README-PYTHON.md](README-PYTHON.md) for exact reference behavior,
+configuration caveats, software parity tests and hardware limitations.
 
 ## Configuration
 
@@ -272,10 +246,16 @@ atomically at the end of the UI frame in:
 %LocalAppData%\Vanta\local.json
 ```
 
-This includes capture/source identity, mouse backend and selected MAKCU port,
-auto-connect preference, update preferences, Bomb Timer settings/widget position, menu
-geometry/options, opacity, and the complete style palette. Missing saved
-monitors or windows fall back to an available source.
+This includes Sunshine resolution/FPS/bitrate, ROI and preview tuning, selected
+MAKCU port and auto-connect preference, update preferences, Python configuration,
+menu geometry/options, opacity, and the style palette.
+
+Local settings use schema 10. Legacy backend/source selections and local
+window/monitor identities are ignored on load; other settings are retained.
+An older file is backed up once before a schema upgrade is saved.
+Shared profiles use schema 9, including detector and optional Python settings.
+Old profiles keep their detector tuning. Removed timer fields are ignored.
+Neither JSON files nor shared profiles persist an armed Python state.
 
 ## Updates
 
@@ -317,8 +297,9 @@ picker with its alpha bar, so the original opacity values are editable too.
 ```
 
 This creates the always-on-top virtual-desktop surface, renders 120 frames,
-and exits with code zero when successful. Renderer/capture self-tests ignore
-local configuration and do not write user configuration.
+and exits with code zero when successful. Renderer tests use synthetic Sunshine
+frames, disable device auto-connect, ignore local configuration, and do not write
+user settings or launch/pair a Sunshine session.
 
 Configuration serialization diagnostics use a temporary directory:
 
@@ -357,7 +338,7 @@ To test the same automatic LAN discovery used by the receiver page:
 
 After pairing Vanta through the **Stream Receiver** page, this explicit live
 smoke test launches the paired host's Desktop with display-mode matching off,
-waits for one real H.264 frame to reach Vanta's decoder, and stops the session
+waits for a verified hardware frame to reach Vanta's decoder, and stops the session
 again. It does not pair a client or change the host display mode:
 
 ```powershell
@@ -372,11 +353,11 @@ touching the installed bundle:
 .\build\Release\vanta-updater.exe --self-test
 ```
 
-Capture diagnostics:
+Sunshine-only GUI diagnostics (Capture, TestClick, TestMove, Python):
 
 ```powershell
-.\build\Release\vanta.exe --self-test 300 --capture-test-winrt
-.\build\Release\vanta.exe --self-test 300 --capture-test-duplication
-.\build\Release\vanta.exe --self-test 300 --capture-test-winrt-window
-.\build\Release\vanta.exe --self-test 300 --capture-test-duplication-window
+.\build\Release\vanta.exe --self-test 60 --page-test 1
+.\build\Release\vanta.exe --self-test 60 --page-test 4
+.\build\Release\vanta.exe --self-test 60 --page-test 5
+.\build\Release\vanta.exe --self-test 60 --page-test 7
 ```

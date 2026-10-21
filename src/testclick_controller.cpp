@@ -280,6 +280,7 @@ namespace vanta
         int        burstSize{3};
 
         CaptureController* capture{nullptr};
+        CaptureSubscription frameSubscription;
         MakcuController*   makcu{nullptr};
         std::thread        workerThread;
         std::atomic_bool   running{false};
@@ -319,6 +320,7 @@ namespace vanta
 
             while (running.load(std::memory_order_acquire))
             {
+                std::uint64_t outputGeneration{};
                 bool  snapEnabled, snapBurstLimiter;
                 MouseButtonBinding snapHoldButton;
                 int   snapHsvRange, snapRoi, snapRayLength, snapRayHalf, snapHitMode, snapBurstSize;
@@ -336,8 +338,12 @@ namespace vanta
                     snapBurstSize        = burstSize;
                     snapBurstDelay       = burstDelay;
                     snapBurstPause       = burstPause;
+                    outputGeneration=settingsRevision.load();
                 }
 
+                if(makcu)makcu->SetInputPolicy(InputOwner::testClick,snapEnabled,outputGeneration,snapHoldButton);
+                frameSubscription.Update({FrameRegionKind::configuredCapture,640,{},0,snapEnabled});
+                if(capture)capture->SetConsumerState("TestClick",false,snapEnabled ? "Waiting for activation / MAKCU" : "Disabled");
                 if (!snapEnabled)
                 {
                     state.store(TestClickState::disabled);
@@ -382,13 +388,18 @@ namespace vanta
                     continue;
                 }
 
-                // ZERO-DELAY FRAME SYNC: Blocks on condition_variable until DXGI captures a new frame!
-                if (capture == nullptr || !capture->WaitForCenteredFrame(lastSequence, frame, sequence, timestamp, 10))
+                CpuFrameSnapshot snapshot;
+                if(capture)capture->SetConsumerState("TestClick",true,"Processing while activation is held");
+                if (capture == nullptr || !frameSubscription.Wait(lastSequence,snapshot,10))
                 {
                     state.store(TestClickState::waitingForCapture);
                     triggerActive.store(false);
                     continue;
                 }
+                frame=snapshot.bgra;
+                sequence=snapshot.metadata.sequence;
+                timestamp=snapshot.metadata.captureTimestampNanoseconds;
+                CaptureWorkTimer workTimer(capture,"TestClick",snapshot.metadata);
                 lastSequence = sequence;
 
                 const int fcx = frame.cols / 2;
@@ -483,9 +494,13 @@ namespace vanta
 
                     if (shouldClick)
                     {
-                        const bool clicked =
-                            makcu != nullptr &&
-                            makcu->TryClick();
+                        OutputContext output;output.owner=InputOwner::testClick;output.generation=outputGeneration;
+                        const auto metadata=snapshot.metadata;
+                        output.streamGeneration=metadata.generation;output.streamSession=metadata.session;output.sequence=metadata.sequence;
+                        output.frameTimeUs=metadata.timing.receivedUs?metadata.timing.receivedUs:metadata.timing.publishedUs;
+                        output.activation=snapHoldButton;
+                        output.isCurrent=[this,metadata,outputGeneration]{return running.load() && settingsRevision.load()==outputGeneration && capture && capture->IsCurrent(metadata);};
+                        const bool clicked = makcu && capture->IsCurrent(metadata) && makcu->TryClick(output);
                         lastShotTime = now;
                         if (clicked)
                         {
@@ -520,17 +535,28 @@ namespace vanta
         {
             if (running.load()) return;
             running.store(true, std::memory_order_release);
-            workerThread = std::thread(&Implementation::WorkerLoop, this);
+            workerThread = std::thread([this]
+            {
+                try{WorkerLoop();}
+                catch(const std::exception& error){vanta::log::Error("TestClick worker failed: %s",error.what());}
+                catch(...){vanta::log::Error("TestClick worker failed with an unknown exception");}
+                running.store(false);threadAlive.store(false);
+                if(makcu)makcu->CancelOutput(InputOwner::testClick);
+            });
         }
 
         void Stop()
         {
             running.store(false, std::memory_order_release);
+            if(makcu)makcu->CancelOutput(InputOwner::testClick);
             if (workerThread.joinable())
             {
                 workerThread.join();
             }
+            if(makcu)makcu->CancelOutput(InputOwner::testClick);
+            frameSubscription.Update({FrameRegionKind::configuredCapture,640,{},0,false});
             state.store(TestClickState::offline);
+            makcu=nullptr;capture=nullptr;
         }
     };
 
@@ -550,6 +576,7 @@ namespace vanta
     {
         auto& impl = *implementation_;
         impl.capture = capture;
+        if (capture) impl.frameSubscription=capture->Subscribe({FrameRegionKind::configuredCapture,640,{},0,false},"TestClick");
         impl.makcu   = makcu;
         impl.Start();
         vanta::log::Info("TestClick controller initialized");

@@ -5,20 +5,8 @@
 #include "color_targets.hpp"
 #include "logger.hpp"
 
-#include <Windows.h>
 #include <d3d11.h>
-#include <dwmapi.h>
-#include <dxgi1_2.h>
-#include <windows.graphics.capture.interop.h>
-#include <windows.graphics.directx.direct3d11.interop.h>
 #include <wrl/client.h>
-
-#include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.Graphics.h>
-#include <winrt/Windows.Graphics.Capture.h>
-#include <winrt/Windows.Graphics.DirectX.h>
-#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
-#include <winrt/base.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -36,7 +24,9 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <optional>
+#include <thread>
+#include <map>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -46,1337 +36,11 @@ using Microsoft::WRL::ComPtr;
 
 namespace
 {
-    enum class CaptureBackendKind
-    {
-        windowsGraphicsCapture,
-        desktopDuplication
-    };
-
-    enum class CaptureSourceKind
-    {
-        window,
-        monitor,
-        sunshineStream
-    };
-
-    struct WindowEntry
-    {
-        HWND window{};
-        std::string label;
-        std::string executable;
-        std::string className;
-        std::string title;
-    };
-
-    struct MonitorEntry
-    {
-        HMONITOR monitor{};
-        RECT rectangle{};
-        std::string label;
-        std::string deviceName;
-    };
-
-    struct CaptureSettings
-    {
-        CaptureBackendKind backend{};
-        CaptureSourceKind source{};
-        HWND window{};
-        HMONITOR monitor{};
-    };
-
     struct CapturedFrame
     {
         cv::Mat bgra;
-        cv::Mat auxiliaryBgra;
-        RECT screenRectangle{};
-        RECT auxiliaryScreenRectangle{};
         int sourceWidth{};
         int sourceHeight{};
-        bool centeredRegionApplied{};
-    };
-
-    std::string WideToUtf8(const std::wstring& text)
-    {
-        if (text.empty())
-        {
-            return {};
-        }
-
-        const int required = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text.data(),
-            static_cast<int>(text.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr);
-        if (required <= 0)
-        {
-            return {};
-        }
-
-        std::string result(static_cast<std::size_t>(required), '\0');
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text.data(),
-            static_cast<int>(text.size()),
-            result.data(),
-            required,
-            nullptr,
-            nullptr);
-        return result;
-    }
-
-    bool EqualsInsensitive(
-        const std::string& left,
-        const std::string& right)
-    {
-        return
-            left.size() == right.size() &&
-            _stricmp(
-                left.c_str(),
-                right.c_str()) == 0;
-    }
-
-    std::wstring WindowTitle(HWND window)
-    {
-        const int length = GetWindowTextLengthW(window);
-        if (length <= 0)
-        {
-            return {};
-        }
-
-        std::wstring result(
-            static_cast<std::size_t>(length + 1),
-            L'\0');
-        GetWindowTextW(window, result.data(), length + 1);
-        result.resize(static_cast<std::size_t>(length));
-        return result;
-    }
-
-    std::wstring ProcessImagePath(DWORD processId)
-    {
-        HANDLE process = OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION,
-            FALSE,
-            processId);
-        if (process == nullptr)
-        {
-            return {};
-        }
-
-        wchar_t path[32768]{};
-        DWORD length = static_cast<DWORD>(std::size(path));
-        const BOOL success =
-            QueryFullProcessImageNameW(process, 0, path, &length);
-        CloseHandle(process);
-        if (!success)
-        {
-            return {};
-        }
-
-        return std::wstring(path, length);
-    }
-
-    std::wstring FileNameFromPath(
-        const std::wstring& path)
-    {
-        const std::size_t lastSeparator =
-            path.find_last_of(L"\\/");
-        return lastSeparator == std::wstring::npos
-            ? path
-            : path.substr(lastSeparator + 1);
-    }
-
-    std::wstring WindowClassName(HWND window)
-    {
-        std::array<wchar_t, 256> name{};
-        const int length = GetClassNameW(
-            window,
-            name.data(),
-            static_cast<int>(name.size()));
-        return length > 0
-            ? std::wstring(
-                name.data(),
-                static_cast<std::size_t>(length))
-            : std::wstring{};
-    }
-
-    bool IsCapturableWindow(HWND window, DWORD ownProcessId)
-    {
-        if (window == nullptr ||
-            window == GetShellWindow() ||
-            window == GetDesktopWindow() ||
-            !IsWindowVisible(window) ||
-            IsIconic(window) ||
-            WindowTitle(window).empty())
-        {
-            return false;
-        }
-
-        DWORD processId = 0;
-        GetWindowThreadProcessId(window, &processId);
-        if (processId == 0 || processId == ownProcessId)
-        {
-            return false;
-        }
-
-        DWORD cloaked = 0;
-        if (SUCCEEDED(DwmGetWindowAttribute(
-                window,
-                DWMWA_CLOAKED,
-                &cloaked,
-                sizeof(cloaked))) &&
-            cloaked != 0)
-        {
-            return false;
-        }
-        return true;
-    }
-
-    struct WindowEnumeration
-    {
-        DWORD ownProcessId{};
-        std::vector<WindowEntry>* windows{};
-    };
-
-    BOOL CALLBACK EnumerateWindowCallback(
-        HWND window,
-        LPARAM parameter)
-    {
-        auto& enumeration =
-            *reinterpret_cast<WindowEnumeration*>(parameter);
-        if (!IsCapturableWindow(
-                window,
-                enumeration.ownProcessId))
-        {
-            return TRUE;
-        }
-
-        DWORD processId = 0;
-        GetWindowThreadProcessId(window, &processId);
-        const std::wstring title = WindowTitle(window);
-        const std::wstring executable =
-            ProcessImagePath(processId);
-        const std::wstring process =
-            FileNameFromPath(executable);
-
-        WindowEntry entry;
-        entry.window = window;
-        entry.title = WideToUtf8(title);
-        entry.executable = WideToUtf8(executable);
-        entry.className =
-            WideToUtf8(WindowClassName(window));
-        entry.label = entry.title;
-        if (!process.empty())
-        {
-            entry.label += "  [" + WideToUtf8(process) + "]";
-        }
-        enumeration.windows->push_back(std::move(entry));
-        return TRUE;
-    }
-
-    std::vector<WindowEntry> EnumerateWindows(DWORD ownProcessId)
-    {
-        std::vector<WindowEntry> result;
-        WindowEnumeration enumeration{
-            ownProcessId,
-            &result};
-        EnumWindows(
-            &EnumerateWindowCallback,
-            reinterpret_cast<LPARAM>(&enumeration));
-        std::sort(
-            result.begin(),
-            result.end(),
-            [](const WindowEntry& left, const WindowEntry& right)
-            {
-                return left.label < right.label;
-            });
-        return result;
-    }
-
-    BOOL CALLBACK EnumerateMonitorCallback(
-        HMONITOR monitor,
-        HDC,
-        LPRECT,
-        LPARAM parameter)
-    {
-        auto& monitors =
-            *reinterpret_cast<std::vector<MonitorEntry>*>(parameter);
-
-        MONITORINFOEXW information{};
-        information.cbSize = sizeof(information);
-        if (!GetMonitorInfoW(
-                monitor,
-                reinterpret_cast<MONITORINFO*>(&information)))
-        {
-            return TRUE;
-        }
-
-        MonitorEntry entry;
-        entry.monitor = monitor;
-        entry.rectangle = information.rcMonitor;
-        entry.deviceName =
-            WideToUtf8(information.szDevice);
-        entry.label =
-            entry.deviceName +
-            "  (" +
-            std::to_string(
-                information.rcMonitor.right -
-                information.rcMonitor.left) +
-            "x" +
-            std::to_string(
-                information.rcMonitor.bottom -
-                information.rcMonitor.top) +
-            ")";
-        if ((information.dwFlags & MONITORINFOF_PRIMARY) != 0)
-        {
-            entry.label += "  [primary]";
-        }
-        monitors.push_back(std::move(entry));
-        return TRUE;
-    }
-
-    std::vector<MonitorEntry> EnumerateMonitors()
-    {
-        std::vector<MonitorEntry> result;
-        EnumDisplayMonitors(
-            nullptr,
-            nullptr,
-            &EnumerateMonitorCallback,
-            reinterpret_cast<LPARAM>(&result));
-        return result;
-    }
-
-    RECT IntersectRectangles(
-        const RECT& left,
-        const RECT& right)
-    {
-        return {
-            std::max(left.left, right.left),
-            std::max(left.top, right.top),
-            std::min(left.right, right.right),
-            std::min(left.bottom, right.bottom)};
-    }
-
-    bool IsValidRectangle(const RECT& rectangle)
-    {
-        return rectangle.right > rectangle.left &&
-            rectangle.bottom > rectangle.top;
-    }
-
-    std::optional<D3D11_BOX> CenteredTextureBox(
-        const D3D11_TEXTURE2D_DESC& description,
-        bool centeredRegion,
-        int requestedSize)
-    {
-        if (!centeredRegion ||
-            description.Width == 0 ||
-            description.Height == 0)
-        {
-            return std::nullopt;
-        }
-
-        const UINT side = std::max(
-            1U,
-            std::min({
-                static_cast<UINT>(
-                    std::max(1, requestedSize)),
-                description.Width,
-                description.Height}));
-        const UINT left =
-            (description.Width - side) / 2;
-        const UINT top =
-            (description.Height - side) / 2;
-        return D3D11_BOX{
-            left,
-            top,
-            0,
-            left + side,
-            top + side,
-            1};
-    }
-
-    RECT TextureBoxToScreenRectangle(
-        const RECT& fullRectangle,
-        UINT textureWidth,
-        UINT textureHeight,
-        const D3D11_BOX& box)
-    {
-        const double scaleX =
-            static_cast<double>(
-                fullRectangle.right -
-                fullRectangle.left) /
-            static_cast<double>(textureWidth);
-        const double scaleY =
-            static_cast<double>(
-                fullRectangle.bottom -
-                fullRectangle.top) /
-            static_cast<double>(textureHeight);
-        return {
-            fullRectangle.left +
-                static_cast<LONG>(std::lround(
-                    box.left * scaleX)),
-            fullRectangle.top +
-                static_cast<LONG>(std::lround(
-                    box.top * scaleY)),
-            fullRectangle.left +
-                static_cast<LONG>(std::lround(
-                    box.right * scaleX)),
-            fullRectangle.top +
-                static_cast<LONG>(std::lround(
-                    box.bottom * scaleY))};
-    }
-
-    vanta::NormalizedCaptureRegion ClampNormalizedRegion(
-        const vanta::NormalizedCaptureRegion& input)
-    {
-        vanta::NormalizedCaptureRegion result = input;
-        result.left =
-            std::clamp(result.left, 0.0F, 0.9999F);
-        result.top =
-            std::clamp(result.top, 0.0F, 0.9999F);
-        result.width =
-            std::clamp(
-                result.width,
-                0.0001F,
-                1.0F - result.left);
-        result.height =
-            std::clamp(
-                result.height,
-                0.0001F,
-                1.0F - result.top);
-        return result;
-    }
-
-    std::optional<D3D11_BOX> NormalizedTextureBox(
-        const D3D11_TEXTURE2D_DESC& description,
-        const vanta::NormalizedCaptureRegion* region)
-    {
-        if (region == nullptr ||
-            !region->enabled ||
-            description.Width == 0 ||
-            description.Height == 0)
-        {
-            return std::nullopt;
-        }
-
-        const auto normalized =
-            ClampNormalizedRegion(*region);
-        const UINT left = std::min(
-            description.Width - 1,
-            static_cast<UINT>(std::lround(
-                normalized.left *
-                description.Width)));
-        const UINT top = std::min(
-            description.Height - 1,
-            static_cast<UINT>(std::lround(
-                normalized.top *
-                description.Height)));
-        const UINT right = std::clamp(
-            static_cast<UINT>(std::lround(
-                (normalized.left +
-                 normalized.width) *
-                description.Width)),
-            left + 1,
-            description.Width);
-        const UINT bottom = std::clamp(
-            static_cast<UINT>(std::lround(
-                (normalized.top +
-                 normalized.height) *
-                description.Height)),
-            top + 1,
-            description.Height);
-        return D3D11_BOX{
-            left,
-            top,
-            0,
-            right,
-            bottom,
-            1};
-    }
-
-    RECT NormalizedScreenRectangle(
-        const RECT& source,
-        const vanta::NormalizedCaptureRegion& input)
-    {
-        const auto region =
-            ClampNormalizedRegion(input);
-        const double width =
-            static_cast<double>(
-                source.right - source.left);
-        const double height =
-            static_cast<double>(
-                source.bottom - source.top);
-        return {
-            source.left +
-                static_cast<LONG>(std::lround(
-                    region.left * width)),
-            source.top +
-                static_cast<LONG>(std::lround(
-                    region.top * height)),
-            source.left +
-                static_cast<LONG>(std::lround(
-                    (region.left + region.width) *
-                    width)),
-            source.top +
-                static_cast<LONG>(std::lround(
-                    (region.top + region.height) *
-                    height))};
-    }
-
-    std::optional<D3D11_BOX> ScreenRectangleTextureBox(
-        const RECT& textureScreenRectangle,
-        UINT textureWidth,
-        UINT textureHeight,
-        const RECT& requestedScreenRectangle)
-    {
-        const RECT clipped =
-            IntersectRectangles(
-                textureScreenRectangle,
-                requestedScreenRectangle);
-        if (!IsValidRectangle(clipped) ||
-            textureWidth == 0 ||
-            textureHeight == 0)
-        {
-            return std::nullopt;
-        }
-
-        const double xScale =
-            static_cast<double>(textureWidth) /
-            static_cast<double>(
-                textureScreenRectangle.right -
-                textureScreenRectangle.left);
-        const double yScale =
-            static_cast<double>(textureHeight) /
-            static_cast<double>(
-                textureScreenRectangle.bottom -
-                textureScreenRectangle.top);
-        const UINT left = std::min(
-            textureWidth - 1,
-            static_cast<UINT>(std::lround(
-                (clipped.left -
-                 textureScreenRectangle.left) *
-                xScale)));
-        const UINT top = std::min(
-            textureHeight - 1,
-            static_cast<UINT>(std::lround(
-                (clipped.top -
-                 textureScreenRectangle.top) *
-                yScale)));
-        const UINT right = std::clamp(
-            static_cast<UINT>(std::lround(
-                (clipped.right -
-                 textureScreenRectangle.left) *
-                xScale)),
-            left + 1,
-            textureWidth);
-        const UINT bottom = std::clamp(
-            static_cast<UINT>(std::lround(
-                (clipped.bottom -
-                 textureScreenRectangle.top) *
-                yScale)),
-            top + 1,
-            textureHeight);
-        return D3D11_BOX{
-            left,
-            top,
-            0,
-            right,
-            bottom,
-            1};
-    }
-
-    bool CopyTextureToMat(
-        ID3D11Device* device,
-        ID3D11DeviceContext* context,
-        ID3D11Texture2D* source,
-        ComPtr<ID3D11Texture2D>& staging,
-        cv::Mat& output,
-        const D3D11_BOX* sourceBox = nullptr)
-    {
-        D3D11_TEXTURE2D_DESC description{};
-        source->GetDesc(&description);
-        if (sourceBox != nullptr)
-        {
-            description.Width =
-                sourceBox->right - sourceBox->left;
-            description.Height =
-                sourceBox->bottom - sourceBox->top;
-        }
-
-        bool recreate = staging == nullptr;
-        if (!recreate)
-        {
-            D3D11_TEXTURE2D_DESC existing{};
-            staging->GetDesc(&existing);
-            recreate =
-                existing.Width != description.Width ||
-                existing.Height != description.Height ||
-                existing.Format != description.Format;
-        }
-        if (recreate)
-        {
-            staging.Reset();
-            description.BindFlags = 0;
-            description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            description.Usage = D3D11_USAGE_STAGING;
-            description.MiscFlags = 0;
-            description.MipLevels = 1;
-            description.ArraySize = 1;
-            if (FAILED(device->CreateTexture2D(
-                    &description,
-                    nullptr,
-                    &staging)))
-            {
-                return false;
-            }
-        }
-
-        if (sourceBox != nullptr)
-        {
-            context->CopySubresourceRegion(
-                staging.Get(),
-                0,
-                0,
-                0,
-                0,
-                source,
-                0,
-                sourceBox);
-        }
-        else
-        {
-            context->CopyResource(staging.Get(), source);
-        }
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(context->Map(
-                staging.Get(),
-                0,
-                D3D11_MAP_READ,
-                0,
-                &mapped)))
-        {
-            return false;
-        }
-
-        const cv::Mat view(
-            static_cast<int>(description.Height),
-            static_cast<int>(description.Width),
-            CV_8UC4,
-            mapped.pData,
-            mapped.RowPitch);
-        output = view.clone();
-        context->Unmap(staging.Get(), 0);
-        return !output.empty();
-    }
-
-    class CaptureBackend
-    {
-    public:
-        virtual ~CaptureBackend() = default;
-        virtual bool Start(
-            const CaptureSettings& settings,
-            ID3D11Device* sharedDevice,
-            std::string& status) = 0;
-        virtual bool TryGetFrame(
-            CapturedFrame& frame,
-            std::string& status,
-            bool centeredRegion,
-            int regionSize,
-            const vanta::NormalizedCaptureRegion*
-                auxiliaryRegion) = 0;
-    };
-
-    class WindowsGraphicsCaptureBackend final
-        : public CaptureBackend
-    {
-    public:
-        bool Start(
-            const CaptureSettings& settings,
-            ID3D11Device* sharedDevice,
-            std::string& status) override
-        {
-            settings_ = settings;
-            sharedDevice_ = sharedDevice;
-            sharedDevice_->GetImmediateContext(&context_);
-
-            if (!winrt::Windows::Graphics::Capture::
-                    GraphicsCaptureSession::IsSupported())
-            {
-                status =
-                    "Windows Graphics Capture is not supported";
-                return false;
-            }
-
-            try
-            {
-                auto factory = winrt::get_activation_factory<
-                    winrt::Windows::Graphics::Capture::
-                        GraphicsCaptureItem,
-                    IGraphicsCaptureItemInterop>();
-
-                winrt::Windows::Graphics::Capture::
-                    GraphicsCaptureItem item{nullptr};
-                HRESULT result = E_INVALIDARG;
-                if (settings.source == CaptureSourceKind::window)
-                {
-                    if (!IsWindow(settings.window))
-                    {
-                        status = "The selected window is no longer available";
-                        return false;
-                    }
-                    result = factory->CreateForWindow(
-                        settings.window,
-                        winrt::guid_of<
-                            winrt::Windows::Graphics::Capture::
-                                GraphicsCaptureItem>(),
-                        winrt::put_abi(item));
-                }
-                else
-                {
-                    if (settings.monitor == nullptr)
-                    {
-                        status = "No monitor is selected";
-                        return false;
-                    }
-                    result = factory->CreateForMonitor(
-                        settings.monitor,
-                        winrt::guid_of<
-                            winrt::Windows::Graphics::Capture::
-                                GraphicsCaptureItem>(),
-                        winrt::put_abi(item));
-                }
-                winrt::check_hresult(result);
-                item_ = item;
-
-                ComPtr<IDXGIDevice> dxgiDevice;
-                winrt::check_hresult(
-                    sharedDevice_->QueryInterface(
-                        IID_PPV_ARGS(&dxgiDevice)));
-
-                winrt::com_ptr<IInspectable> inspectable;
-                winrt::check_hresult(
-                    CreateDirect3D11DeviceFromDXGIDevice(
-                        dxgiDevice.Get(),
-                        inspectable.put()));
-                direct3DDevice_ = inspectable.as<
-                    winrt::Windows::Graphics::DirectX::
-                        Direct3D11::IDirect3DDevice>();
-
-                frameSize_ = item_.Size();
-                framePool_ =
-                    winrt::Windows::Graphics::Capture::
-                        Direct3D11CaptureFramePool::
-                            CreateFreeThreaded(
-                                direct3DDevice_,
-                                winrt::Windows::Graphics::DirectX::
-                                    DirectXPixelFormat::
-                                        B8G8R8A8UIntNormalized,
-                                3,
-                                frameSize_);
-                session_ = framePool_.CreateCaptureSession(item_);
-                try
-                {
-                    session_.IsCursorCaptureEnabled(false);
-                }
-                catch (...)
-                {
-                }
-                try
-                {
-                    session_.IsBorderRequired(false);
-                }
-                catch (...)
-                {
-                }
-                session_.StartCapture();
-
-                status = "Windows Graphics Capture is running";
-                return true;
-            }
-            catch (const winrt::hresult_error& error)
-            {
-                status =
-                    "WinRT capture failed: 0x" +
-                    HexCode(error.code().value);
-                return false;
-            }
-        }
-
-        bool TryGetFrame(
-            CapturedFrame& frame,
-            std::string& status,
-            bool centeredRegion,
-            int regionSize,
-            const vanta::NormalizedCaptureRegion*
-                auxiliaryRegion) override
-        {
-            try
-            {
-                auto captureFrame = framePool_.TryGetNextFrame();
-                if (!captureFrame)
-                {
-                    return false;
-                }
-
-                const auto contentSize = captureFrame.ContentSize();
-                auto access = captureFrame.Surface().as<
-                    ::Windows::Graphics::DirectX::Direct3D11::
-                        IDirect3DDxgiInterfaceAccess>();
-                ComPtr<ID3D11Texture2D> texture;
-                winrt::check_hresult(access->GetInterface(
-                    IID_PPV_ARGS(&texture)));
-
-                D3D11_TEXTURE2D_DESC textureDescription{};
-                texture->GetDesc(&textureDescription);
-                frame.sourceWidth =
-                    static_cast<int>(
-                        textureDescription.Width);
-                frame.sourceHeight =
-                    static_cast<int>(
-                        textureDescription.Height);
-
-                if (settings_.source == CaptureSourceKind::window)
-                {
-                    if (!GetWindowRect(
-                            settings_.window,
-                            &frame.screenRectangle))
-                    {
-                        frame.screenRectangle = {
-                            0,
-                            0,
-                            contentSize.Width,
-                            contentSize.Height};
-                    }
-                }
-                else
-                {
-                    MONITORINFO information{sizeof(MONITORINFO)};
-                    if (GetMonitorInfoW(
-                            settings_.monitor,
-                            &information))
-                    {
-                        frame.screenRectangle =
-                            information.rcMonitor;
-                    }
-                    else
-                    {
-                        frame.screenRectangle = {
-                            0,
-                            0,
-                            contentSize.Width,
-                            contentSize.Height};
-                    }
-                }
-
-                const RECT fullScreenRectangle =
-                    frame.screenRectangle;
-                const auto sourceBox =
-                    CenteredTextureBox(
-                        textureDescription,
-                        centeredRegion,
-                        regionSize);
-                if (sourceBox.has_value())
-                {
-                    frame.screenRectangle =
-                        TextureBoxToScreenRectangle(
-                            frame.screenRectangle,
-                            textureDescription.Width,
-                            textureDescription.Height,
-                            *sourceBox);
-                    frame.centeredRegionApplied = true;
-                }
-                if (!CopyTextureToMat(
-                        sharedDevice_.Get(),
-                        context_.Get(),
-                        texture.Get(),
-                        staging_,
-                        frame.bgra,
-                        sourceBox.has_value()
-                            ? &*sourceBox
-                            : nullptr))
-                {
-                    status = "Could not read the WinRT capture texture";
-                    return false;
-                }
-
-                const auto auxiliaryBox =
-                    NormalizedTextureBox(
-                        textureDescription,
-                        auxiliaryRegion);
-                if (auxiliaryBox.has_value())
-                {
-                    if (!CopyTextureToMat(
-                            sharedDevice_.Get(),
-                            context_.Get(),
-                            texture.Get(),
-                            auxiliaryStaging_,
-                            frame.auxiliaryBgra,
-                            &*auxiliaryBox))
-                    {
-                        status =
-                            "Could not read the WinRT auxiliary region";
-                        frame.auxiliaryBgra.release();
-                    }
-                    else
-                    {
-                        frame.auxiliaryScreenRectangle =
-                            TextureBoxToScreenRectangle(
-                                fullScreenRectangle,
-                                textureDescription.Width,
-                                textureDescription.Height,
-                                *auxiliaryBox);
-                    }
-                }
-
-                if (contentSize.Width != frameSize_.Width ||
-                    contentSize.Height != frameSize_.Height)
-                {
-                    frameSize_ = contentSize;
-                    framePool_.Recreate(
-                        direct3DDevice_,
-                        winrt::Windows::Graphics::DirectX::
-                            DirectXPixelFormat::
-                                B8G8R8A8UIntNormalized,
-                        3,
-                        frameSize_);
-                    staging_.Reset();
-                }
-                return true;
-            }
-            catch (const winrt::hresult_error& error)
-            {
-                status =
-                    "WinRT frame error: 0x" +
-                    HexCode(error.code().value);
-                return false;
-            }
-        }
-
-    private:
-        static std::string HexCode(std::int32_t value)
-        {
-            char buffer[16]{};
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "%08lX",
-                static_cast<unsigned long>(
-                    static_cast<std::uint32_t>(value)));
-            return buffer;
-        }
-
-        CaptureSettings settings_;
-        ComPtr<ID3D11Device> sharedDevice_;
-        ComPtr<ID3D11DeviceContext> context_;
-        ComPtr<ID3D11Texture2D> staging_;
-        ComPtr<ID3D11Texture2D> auxiliaryStaging_;
-        winrt::Windows::Graphics::DirectX::Direct3D11::
-            IDirect3DDevice direct3DDevice_{nullptr};
-        winrt::Windows::Graphics::Capture::
-            GraphicsCaptureItem item_{nullptr};
-        winrt::Windows::Graphics::Capture::
-            Direct3D11CaptureFramePool framePool_{nullptr};
-        winrt::Windows::Graphics::Capture::
-            GraphicsCaptureSession session_{nullptr};
-        winrt::Windows::Graphics::SizeInt32 frameSize_{};
-    };
-
-    class DesktopDuplicationCaptureBackend final
-        : public CaptureBackend
-    {
-    public:
-        ~DesktopDuplicationCaptureBackend() override
-        {
-            if (frameAcquired_ && duplication_ != nullptr)
-            {
-                duplication_->ReleaseFrame();
-            }
-        }
-
-        bool Start(
-            const CaptureSettings& settings,
-            ID3D11Device*,
-            std::string& status) override
-        {
-            settings_ = settings;
-            HMONITOR desiredMonitor = settings.monitor;
-            if (settings.source == CaptureSourceKind::window)
-            {
-                if (!IsWindow(settings.window))
-                {
-                    status = "The selected window is no longer available";
-                    return false;
-                }
-                desiredMonitor = MonitorFromWindow(
-                    settings.window,
-                    MONITOR_DEFAULTTONEAREST);
-            }
-            if (desiredMonitor == nullptr)
-            {
-                status = "No monitor is selected";
-                return false;
-            }
-
-            ComPtr<IDXGIFactory1> factory;
-            HRESULT result = CreateDXGIFactory1(
-                IID_PPV_ARGS(&factory));
-            if (FAILED(result))
-            {
-                status = "CreateDXGIFactory1 failed";
-                return false;
-            }
-
-            ComPtr<IDXGIAdapter1> selectedAdapter;
-            ComPtr<IDXGIOutput> selectedOutput;
-            for (UINT adapterIndex = 0;; ++adapterIndex)
-            {
-                ComPtr<IDXGIAdapter1> adapter;
-                if (factory->EnumAdapters1(
-                        adapterIndex,
-                        &adapter) == DXGI_ERROR_NOT_FOUND)
-                {
-                    break;
-                }
-
-                for (UINT outputIndex = 0;; ++outputIndex)
-                {
-                    ComPtr<IDXGIOutput> output;
-                    if (adapter->EnumOutputs(
-                            outputIndex,
-                            &output) == DXGI_ERROR_NOT_FOUND)
-                    {
-                        break;
-                    }
-
-                    DXGI_OUTPUT_DESC description{};
-                    if (SUCCEEDED(output->GetDesc(&description)) &&
-                        description.Monitor == desiredMonitor)
-                    {
-                        selectedAdapter = adapter;
-                        selectedOutput = output;
-                        outputDescription_ = description;
-                        break;
-                    }
-                }
-                if (selectedOutput != nullptr)
-                {
-                    break;
-                }
-            }
-
-            if (selectedAdapter == nullptr ||
-                selectedOutput == nullptr)
-            {
-                status = "Could not match the monitor to a DXGI output";
-                return false;
-            }
-
-            constexpr D3D_FEATURE_LEVEL levels[]{
-                D3D_FEATURE_LEVEL_11_1,
-                D3D_FEATURE_LEVEL_11_0,
-                D3D_FEATURE_LEVEL_10_1,
-                D3D_FEATURE_LEVEL_10_0};
-            D3D_FEATURE_LEVEL selectedLevel{};
-            result = D3D11CreateDevice(
-                selectedAdapter.Get(),
-                D3D_DRIVER_TYPE_UNKNOWN,
-                nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                levels,
-                static_cast<UINT>(std::size(levels)),
-                D3D11_SDK_VERSION,
-                &device_,
-                &selectedLevel,
-                &context_);
-            if (FAILED(result))
-            {
-                status = "Could not create the duplication D3D11 device";
-                return false;
-            }
-
-            ComPtr<IDXGIOutput1> output1;
-            result = selectedOutput.As(&output1);
-            if (SUCCEEDED(result))
-            {
-                result = output1->DuplicateOutput(
-                    device_.Get(),
-                    &duplication_);
-            }
-            if (FAILED(result))
-            {
-                status =
-                    "DuplicateOutput failed: 0x" +
-                    HexCode(result);
-                return false;
-            }
-
-            status = "Desktop Duplication is running";
-            return true;
-        }
-
-        bool TryGetFrame(
-            CapturedFrame& frame,
-            std::string& status,
-            bool centeredRegion,
-            int regionSize,
-            const vanta::NormalizedCaptureRegion*
-                auxiliaryRegion) override
-        {
-            if (duplication_ == nullptr)
-            {
-                return false;
-            }
-
-            if (frameAcquired_)
-            {
-                duplication_->ReleaseFrame();
-                frameAcquired_ = false;
-            }
-
-            DXGI_OUTDUPL_FRAME_INFO frameInformation{};
-            ComPtr<IDXGIResource> resource;
-            const HRESULT result = duplication_->AcquireNextFrame(
-                0,
-                &frameInformation,
-                &resource);
-            if (result == DXGI_ERROR_WAIT_TIMEOUT)
-            {
-                return false;
-            }
-            if (result == DXGI_ERROR_ACCESS_LOST)
-            {
-                status =
-                    "Desktop Duplication access was lost; restart capture";
-                return false;
-            }
-            if (FAILED(result))
-            {
-                status =
-                    "AcquireNextFrame failed: 0x" +
-                    HexCode(result);
-                return false;
-            }
-            frameAcquired_ = true;
-
-            ComPtr<ID3D11Texture2D> texture;
-            if (FAILED(resource.As(&texture)))
-            {
-                status = "Could not access the duplicated desktop texture";
-                duplication_->ReleaseFrame();
-                frameAcquired_ = false;
-                return false;
-            }
-
-            D3D11_TEXTURE2D_DESC textureDescription{};
-            texture->GetDesc(&textureDescription);
-            frame.sourceWidth =
-                static_cast<int>(textureDescription.Width);
-            frame.sourceHeight =
-                static_cast<int>(textureDescription.Height);
-            frame.screenRectangle =
-                outputDescription_.DesktopCoordinates;
-            const RECT fullOutputRectangle =
-                frame.screenRectangle;
-
-            RECT auxiliaryReferenceRectangle =
-                fullOutputRectangle;
-            if (settings_.source ==
-                    CaptureSourceKind::window &&
-                settings_.window != nullptr)
-            {
-                RECT windowRectangle{};
-                if (GetWindowRect(
-                        settings_.window,
-                        &windowRectangle))
-                {
-                    auxiliaryReferenceRectangle =
-                        windowRectangle;
-                }
-            }
-            RECT requestedAuxiliaryRectangle{};
-            const bool auxiliaryRequested =
-                auxiliaryRegion != nullptr &&
-                auxiliaryRegion->enabled;
-            if (auxiliaryRequested)
-            {
-                requestedAuxiliaryRectangle =
-                    NormalizedScreenRectangle(
-                        auxiliaryReferenceRectangle,
-                        *auxiliaryRegion);
-            }
-
-            std::optional<D3D11_BOX> sourceBox;
-            if (settings_.source == CaptureSourceKind::monitor &&
-                (outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_IDENTITY ||
-                 outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_UNSPECIFIED))
-            {
-                sourceBox = CenteredTextureBox(
-                    textureDescription,
-                    centeredRegion,
-                    regionSize);
-            }
-            if (sourceBox.has_value())
-            {
-                frame.screenRectangle =
-                    TextureBoxToScreenRectangle(
-                        frame.screenRectangle,
-                        textureDescription.Width,
-                        textureDescription.Height,
-                        *sourceBox);
-                frame.centeredRegionApplied = true;
-            }
-
-            if (!CopyTextureToMat(
-                    device_.Get(),
-                    context_.Get(),
-                    texture.Get(),
-                    staging_,
-                    frame.bgra,
-                    sourceBox.has_value()
-                        ? &*sourceBox
-                        : nullptr))
-            {
-                status = "Could not read the duplicated desktop texture";
-                duplication_->ReleaseFrame();
-                frameAcquired_ = false;
-                return false;
-            }
-
-            const bool rotatedOutput =
-                outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_ROTATE90 ||
-                outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_ROTATE180 ||
-                outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_ROTATE270;
-            if (auxiliaryRequested &&
-                !rotatedOutput)
-            {
-                const auto auxiliaryBox =
-                    ScreenRectangleTextureBox(
-                        fullOutputRectangle,
-                        textureDescription.Width,
-                        textureDescription.Height,
-                        requestedAuxiliaryRectangle);
-                if (auxiliaryBox.has_value())
-                {
-                    if (!CopyTextureToMat(
-                            device_.Get(),
-                            context_.Get(),
-                            texture.Get(),
-                            auxiliaryStaging_,
-                            frame.auxiliaryBgra,
-                            &*auxiliaryBox))
-                    {
-                        status =
-                            "Could not read the duplicated auxiliary region";
-                        frame.auxiliaryBgra.release();
-                    }
-                    else
-                    {
-                        frame.auxiliaryScreenRectangle =
-                            IntersectRectangles(
-                                fullOutputRectangle,
-                                requestedAuxiliaryRectangle);
-                    }
-                }
-            }
-
-            duplication_->ReleaseFrame();
-            frameAcquired_ = false;
-
-            switch (outputDescription_.Rotation)
-            {
-            case DXGI_MODE_ROTATION_ROTATE90:
-                cv::rotate(
-                    frame.bgra,
-                    frame.bgra,
-                    cv::ROTATE_90_CLOCKWISE);
-                break;
-            case DXGI_MODE_ROTATION_ROTATE180:
-                cv::rotate(
-                    frame.bgra,
-                    frame.bgra,
-                    cv::ROTATE_180);
-                break;
-            case DXGI_MODE_ROTATION_ROTATE270:
-                cv::rotate(
-                    frame.bgra,
-                    frame.bgra,
-                    cv::ROTATE_90_COUNTERCLOCKWISE);
-                break;
-            default:
-                break;
-            }
-            if (outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_ROTATE90 ||
-                outputDescription_.Rotation ==
-                    DXGI_MODE_ROTATION_ROTATE270)
-            {
-                frame.sourceWidth = frame.bgra.cols;
-                frame.sourceHeight = frame.bgra.rows;
-            }
-            if (auxiliaryRequested &&
-                rotatedOutput)
-            {
-                const auto auxiliaryBox =
-                    ScreenRectangleTextureBox(
-                        fullOutputRectangle,
-                        static_cast<UINT>(
-                            frame.bgra.cols),
-                        static_cast<UINT>(
-                            frame.bgra.rows),
-                        requestedAuxiliaryRectangle);
-                if (auxiliaryBox.has_value())
-                {
-                    const cv::Rect region(
-                        static_cast<int>(
-                            auxiliaryBox->left),
-                        static_cast<int>(
-                            auxiliaryBox->top),
-                        static_cast<int>(
-                            auxiliaryBox->right -
-                            auxiliaryBox->left),
-                        static_cast<int>(
-                            auxiliaryBox->bottom -
-                            auxiliaryBox->top));
-                    frame.auxiliaryBgra =
-                        frame.bgra(region).clone();
-                    frame.auxiliaryScreenRectangle =
-                        IntersectRectangles(
-                            fullOutputRectangle,
-                            requestedAuxiliaryRectangle);
-                }
-            }
-            return true;
-        }
-
-    private:
-        static std::string HexCode(HRESULT value)
-        {
-            char buffer[16]{};
-            snprintf(
-                buffer,
-                sizeof(buffer),
-                "%08lX",
-                static_cast<unsigned long>(value));
-            return buffer;
-        }
-
-        CaptureSettings settings_;
-        DXGI_OUTPUT_DESC outputDescription_{};
-        bool frameAcquired_ = false;
-        ComPtr<ID3D11Device> device_;
-        ComPtr<ID3D11DeviceContext> context_;
-        ComPtr<IDXGIOutputDuplication> duplication_;
-        ComPtr<ID3D11Texture2D> staging_;
-        ComPtr<ID3D11Texture2D> auxiliaryStaging_;
     };
 
     std::uint32_t ColorKey(
@@ -1481,128 +145,40 @@ namespace
 
 struct vanta::CaptureController::Implementation
 {
+    vanta::CaptureController* owner{};
     bool Initialize(
         ID3D11Device* device,
         ID3D11DeviceContext* context,
-        DWORD processId,
         const vanta::CaptureConfig* initialConfig)
     {
+        if (device == nullptr || context == nullptr)
+        {
+            status = "The Sunshine preview needs a graphics device";
+            return false;
+        }
         previewDevice = device;
         previewContext = context;
-        ownProcessId = processId;
-
-        try
-        {
-            winrt::init_apartment(
-                winrt::apartment_type::multi_threaded);
-            apartmentInitialized = true;
-        }
-        catch (const winrt::hresult_error& error)
-        {
-            if (error.code() != RPC_E_CHANGED_MODE)
-            {
-                status = "Could not initialize Windows Runtime capture";
-                return false;
-            }
-        }
-
-        RefreshSources();
-        if (initialConfig != nullptr)
-        {
-            ApplyConfigValues(*initialConfig);
-        }
-        else
-        {
-            sourceIndex = 1;
-        }
-        captureEnabled = true;
-        if (!StartCapture())
-        {
-            vanta::log::Warning(
-                "automatic capture start failed: %s",
-                status.c_str());
-        }
+        if (initialConfig != nullptr) ApplyConfigValues(*initialConfig);
+        SyncWorkerConfig();
+        StartCapture();
         return true;
     }
 
     void Shutdown()
     {
         StopCapture();
-        sunshineVideoFrameProvider = {};
+        {std::lock_guard lock(subscriptionMutex);for(auto& weak:subscriptions)if(auto subscriptionState=weak.lock())
+        {std::lock_guard frameLock(subscriptionState->mutex);subscriptionState->cancelled=true;subscriptionState->latest={};subscriptionState->condition.notify_all();}}
+        regionFrameProvider={};
         previewShaderResource.Reset();
         previewTexture.Reset();
         previewContext.Reset();
         previewDevice.Reset();
-        windows.clear();
-        monitors.clear();
-        if (apartmentInitialized)
-        {
-            winrt::uninit_apartment();
-            apartmentInitialized = false;
-        }
-    }
-
-    void RefreshSources()
-    {
-        const HWND previousWindow =
-            selectedWindow >= 0 &&
-            selectedWindow < static_cast<int>(windows.size())
-            ? windows[static_cast<std::size_t>(
-                selectedWindow)].window
-            : nullptr;
-        const HMONITOR previousMonitor =
-            selectedMonitor >= 0 &&
-            selectedMonitor < static_cast<int>(monitors.size())
-            ? monitors[static_cast<std::size_t>(
-                selectedMonitor)].monitor
-            : nullptr;
-
-        windows = EnumerateWindows(ownProcessId);
-        monitors = EnumerateMonitors();
-
-        const HWND preferredWindow =
-            previousWindow != nullptr
-            ? previousWindow
-            : GetForegroundWindow();
-        selectedWindow = 0;
-        for (std::size_t index = 0; index < windows.size(); ++index)
-        {
-            if (windows[index].window == preferredWindow)
-            {
-                selectedWindow = static_cast<int>(index);
-                break;
-            }
-        }
-
-        HMONITOR preferredMonitor = previousMonitor;
-        if (preferredMonitor == nullptr)
-        {
-            POINT cursor{};
-            if (GetCursorPos(&cursor))
-            {
-                preferredMonitor = MonitorFromPoint(
-                    cursor,
-                    MONITOR_DEFAULTTOPRIMARY);
-            }
-        }
-        selectedMonitor = 0;
-        for (std::size_t index = 0; index < monitors.size(); ++index)
-        {
-            if (monitors[index].monitor == preferredMonitor)
-            {
-                selectedMonitor = static_cast<int>(index);
-                break;
-            }
-        }
     }
 
     void ApplyConfigValues(
         const vanta::CaptureConfig& config)
     {
-        backendIndex =
-            std::clamp(config.backendIndex, 0, 1);
-        sourceIndex =
-            std::clamp(config.sourceIndex, 0, 2);
         regionIndex =
             std::clamp(config.regionIndex, 0, 1);
         regionSize =
@@ -1624,154 +200,20 @@ struct vanta::CaptureController::Implementation
             static_cast<int>(
                 vanta::kHsvColorTargets.size()) - 1);
 
-        if (!config.monitorDevice.empty())
-        {
-            for (std::size_t index = 0;
-                 index < monitors.size();
-                 ++index)
-            {
-                if (EqualsInsensitive(
-                        monitors[index].deviceName,
-                        config.monitorDevice))
-                {
-                    selectedMonitor =
-                        static_cast<int>(index);
-                    break;
-                }
-            }
-        }
-
-        int fallbackWindow = -1;
-        for (std::size_t index = 0;
-             index < windows.size();
-             ++index)
-        {
-            const auto& entry = windows[index];
-            const bool executableMatches =
-                !config.windowExecutable.empty() &&
-                EqualsInsensitive(
-                    entry.executable,
-                    config.windowExecutable);
-            const bool classMatches =
-                config.windowClass.empty() ||
-                EqualsInsensitive(
-                    entry.className,
-                    config.windowClass);
-            if (executableMatches &&
-                classMatches &&
-                fallbackWindow < 0)
-            {
-                fallbackWindow =
-                    static_cast<int>(index);
-            }
-            if (executableMatches &&
-                classMatches &&
-                (config.windowTitle.empty() ||
-                 entry.title ==
-                    config.windowTitle))
-            {
-                selectedWindow =
-                    static_cast<int>(index);
-                fallbackWindow = -1;
-                break;
-            }
-        }
-        if (fallbackWindow >= 0)
-        {
-            selectedWindow = fallbackWindow;
-        }
-    }
-
-    CaptureSettings CurrentSettings() const
-    {
-        CaptureSettings settings;
-        settings.backend =
-            backendIndex == 0
-            ? CaptureBackendKind::windowsGraphicsCapture
-            : CaptureBackendKind::desktopDuplication;
-        settings.source =
-            sourceIndex == 0
-            ? CaptureSourceKind::window
-            : sourceIndex == 1
-                ? CaptureSourceKind::monitor
-                : CaptureSourceKind::sunshineStream;
-        if (selectedWindow >= 0 &&
-            selectedWindow < static_cast<int>(windows.size()))
-        {
-            settings.window =
-                windows[static_cast<std::size_t>(
-                    selectedWindow)].window;
-        }
-        if (selectedMonitor >= 0 &&
-            selectedMonitor < static_cast<int>(monitors.size()))
-        {
-            settings.monitor =
-                monitors[static_cast<std::size_t>(
-                    selectedMonitor)].monitor;
-        }
-        return settings;
     }
 
     bool StartCapture()
     {
         StopCapture();
-        if (!captureEnabled)
+        if (!regionFrameProvider)
         {
-            status = "Capture paused";
-            return true;
-        }
-
-        activeSettings = CurrentSettings();
-        if (activeSettings.source == CaptureSourceKind::window &&
-            activeSettings.window == nullptr)
-        {
-            status = "No capturable window is selected";
+            status = "Waiting for a Sunshine frame provider";
             return false;
         }
-        if (activeSettings.source == CaptureSourceKind::monitor &&
-            activeSettings.monitor == nullptr)
-        {
-            status = "No monitor is selected";
-            return false;
-        }
-        if (activeSettings.source == CaptureSourceKind::sunshineStream)
-        {
-            if (!sunshineVideoFrameProvider)
-            {
-                status = "Sunshine stream source is not available";
-                return false;
-            }
-            status = "Waiting for the first decoded Sunshine video frame";
-        }
-        else
-        {
-            if (activeSettings.backend ==
-                CaptureBackendKind::windowsGraphicsCapture)
-            {
-                captureBackend =
-                    std::make_unique<
-                        WindowsGraphicsCaptureBackend>();
-            }
-            else
-            {
-                captureBackend =
-                    std::make_unique<
-                        DesktopDuplicationCaptureBackend>();
-            }
-
-            if (!captureBackend->Start(
-                    activeSettings,
-                    previewDevice.Get(),
-                    status))
-            {
-                captureBackend.reset();
-                running = false;
-                return false;
-            }
-        }
-
+        status = "Waiting for the first decoded Sunshine video frame";
         running = true;
-        frameCounter = 0;
+        captureWorkerFailed=false;
+        frameCounter = cpuPublishedCount.load();
         sessionPublishedFrames = 0;
         framesPerSecond = 0.0F;
         firstFrameLogged = false;
@@ -1781,11 +223,27 @@ struct vanta::CaptureController::Implementation
             fpsWindowStart +
             std::chrono::seconds(1);
         vanta::log::Info("capture started: %s", status.c_str());
+        previewWorker=std::jthread([this](std::stop_token stop){RunPreview(stop);});
+        captureWorker=std::jthread([this](std::stop_token stop)
+        {try{RunCapture(stop);}catch(const std::exception& error){vanta::log::Error("Capture worker: %s",error.what());ClearPublished();captureWorkerFailed=true;}
+            catch(...){vanta::log::Error("Capture worker failed unexpectedly");ClearPublished();captureWorkerFailed=true;}});
         return true;
     }
 
     void StopCapture()
     {
+        captureWorker.request_stop();
+        previewWorker.request_stop();previewWorkCondition.notify_all();
+        demandCondition.notify_all();
+        demandSignal->Wake();
+        if (captureWorker.joinable()) captureWorker.join();
+        if (previewWorker.joinable()) previewWorker.join();
+        {std::lock_guard lock(previewWorkMutex);pendingPreview={};hasPendingPreview=false;}
+        {
+            std::lock_guard lock(subscriptionMutex);
+            for (auto& weak:subscriptions) if(auto subscription=weak.lock())
+            {std::lock_guard frameLock(subscription->mutex);subscription->latest={};subscription->condition.notify_all();}
+        }
         if (running)
         {
             vanta::log::Info(
@@ -1796,476 +254,224 @@ struct vanta::CaptureController::Implementation
                 static_cast<unsigned long long>(
                     latestFrameSequence));
         }
-        captureBackend.reset();
-        sunshineFrameSequence = 0;
         running = false;
-        outline.visible = false;
+        previewShaderResource.Reset();
+        previewTexture.Reset();
+        previewWidth=previewHeight=0;
+        lastPreviewSequence=0;
+        {std::lock_guard backgroundLock(backgroundPreviewMutex);backgroundPreview={};}
+        sourceWidth=sourceHeight=captureWidth=captureHeight=0;
+        framesPerSecond=0.0F;
         {
             std::lock_guard<std::mutex> lock(latestFrameMutex);
             latestCenteredFrame.release();
-            latestFrameTimestampNanoseconds = 0;
+            latestSourceFrame.release();
         }
         latestFrameCondition.notify_all();
-        {
-            std::lock_guard<std::mutex> lock(auxiliaryFrameMutex);
-            latestAuxiliaryFrame.release();
-            latestAuxiliaryScreenRectangle = {};
-            latestAuxiliaryTimestampNanoseconds = 0;
-        }
-        auxiliaryFrameCondition.notify_all();
     }
 
-    bool TryGetSunshineFrame(
-        CapturedFrame& frame,
-        const vanta::NormalizedCaptureRegion& auxiliaryRequest)
+    void SyncWorkerConfig()
     {
-        if (!sunshineVideoFrameProvider)
-        {
-            status = "Sunshine stream source is not available";
-            return false;
-        }
-
-        std::uint64_t sequence{};
-        cv::Mat bgra;
-        if (!sunshineVideoFrameProvider(
-                sunshineFrameSequence,
-                bgra,
-                sequence))
-        {
-            return false;
-        }
-        if (bgra.empty() || bgra.type() != CV_8UC4 ||
-            sequence <= sunshineFrameSequence)
-        {
-            status = "Sunshine stream returned an invalid decoded frame";
-            return false;
-        }
-
-        sunshineFrameSequence = sequence;
-        frame.bgra = std::move(bgra);
-        frame.sourceWidth = frame.bgra.cols;
-        frame.sourceHeight = frame.bgra.rows;
-        frame.screenRectangle = {
-            0,
-            0,
-            frame.bgra.cols,
-            frame.bgra.rows};
-
-        if (auxiliaryRequest.enabled)
-        {
-            const auto normalized = ClampNormalizedRegion(auxiliaryRequest);
-            const int left = std::clamp(
-                static_cast<int>(std::lround(
-                    normalized.left * frame.bgra.cols)),
-                0,
-                frame.bgra.cols - 1);
-            const int top = std::clamp(
-                static_cast<int>(std::lround(
-                    normalized.top * frame.bgra.rows)),
-                0,
-                frame.bgra.rows - 1);
-            const int right = std::clamp(
-                static_cast<int>(std::lround(
-                    (normalized.left + normalized.width) *
-                    frame.bgra.cols)),
-                left + 1,
-                frame.bgra.cols);
-            const int bottom = std::clamp(
-                static_cast<int>(std::lround(
-                    (normalized.top + normalized.height) *
-                    frame.bgra.rows)),
-                top + 1,
-                frame.bgra.rows);
-            frame.auxiliaryBgra = frame.bgra(
-                cv::Rect(left, top, right - left, bottom - top));
-            frame.auxiliaryScreenRectangle = {
-                left,
-                top,
-                right,
-                bottom};
-        }
-        return true;
+        vanta::CaptureConfig config;
+        config.regionIndex=regionIndex;config.regionSize=regionSize;config.applyFilter=applyFilter;
+        config.binaryMask=binaryMask;config.colorTargetIndex=colorTargetIndex;
+        {std::lock_guard lock(workerConfigMutex);workerConfig=config;++workerConfigRevision;}
+        demandSignal->Wake();
     }
-
+    static vanta::FrameRegionRequest EffectiveRegion(vanta::FrameRegionRequest request,const vanta::CaptureConfig& config)
+    {
+        if(request.kind==vanta::FrameRegionKind::configuredCapture)
+        {
+            request.kind=config.regionIndex==1 ? vanta::FrameRegionKind::centered : vanta::FrameRegionKind::fullSource;
+            request.side=config.regionSize;
+        }
+        return request;
+    }
+    void BuildPreview(const cv::Mat& capture,const vanta::CapturedFrameMetadata& metadata,const vanta::CaptureConfig& config,std::uint64_t settingsVersion)
+    {
+        cv::Mat processed;int matches{};
+        if(config.applyFilter || config.binaryMask)
+        {
+            cv::Mat bgr,hsv,mask;
+            cv::cvtColor(capture,bgr,cv::COLOR_BGRA2BGR);cv::cvtColor(bgr,hsv,cv::COLOR_BGR2HSV);
+            const int target=std::clamp(config.colorTargetIndex,0,int(vanta::kHsvColorTargets.size())-1);
+            vanta::BuildHsvMask(hsv,target,mask);
+            if(vanta::kHsvColorTargets[target].purpleBlacklist)RemoveBlacklistedPixels(bgr,mask);
+            matches=cv::countNonZero(mask);
+            if(config.binaryMask)cv::cvtColor(mask,processed,cv::COLOR_GRAY2BGRA);
+            else{processed=cv::Mat::zeros(capture.size(),CV_8UC4);capture.copyTo(processed,mask);}
+        }
+        else processed=capture;
+        const double scale=std::min({1.0,560.0/processed.cols,315.0/processed.rows});
+        cv::Mat preview;
+        if(scale<1.0)cv::resize(processed,preview,{std::max(1,int(std::lround(processed.cols*scale))),
+            std::max(1,int(std::lround(processed.rows*scale)))},0,0,cv::INTER_AREA);
+        else preview=processed;
+        std::lock_guard lock(backgroundPreviewMutex);backgroundPreview={preview,metadata};backgroundMatches=matches;backgroundPreviewRevision=settingsVersion;
+    }
+    void SchedulePreview(const cv::Mat& image,const vanta::CapturedFrameMetadata& metadata,const vanta::CaptureConfig& config,std::uint64_t settingsVersion)
+    {
+        auto geometry=metadata;geometry.cropWidth=image.cols;geometry.cropHeight=image.rows;
+        {std::lock_guard lock(previewWorkMutex);pendingPreview={image,geometry};pendingPreviewConfig=config;pendingPreviewRevision=settingsVersion;hasPendingPreview=true;}
+        previewWorkCondition.notify_one();
+    }
+    void RunPreview(std::stop_token stop)
+    {
+        std::uint64_t next{};
+        while(!stop.stop_requested())
+        {
+            vanta::CpuFrameSnapshot input;vanta::CaptureConfig config;std::uint64_t revision{};
+            {
+                std::unique_lock lock(previewWorkMutex);
+                previewWorkCondition.wait(lock,stop,[&]{return hasPendingPreview;});
+                const auto now=vanta::StreamNowUs();
+                if(now<next)previewWorkCondition.wait_for(lock,stop,std::chrono::microseconds(next-now),[]{return false;});
+                if(stop.stop_requested())break;
+                input=std::move(pendingPreview);config=pendingPreviewConfig;revision=pendingPreviewRevision;hasPendingPreview=false;
+                next=vanta::StreamNowUs()+16667;
+            }
+            if(input.bgra.empty() || vanta::StreamNowUs()>=previewVisibleUntil.load() ||
+                (generationProvider && input.metadata.generation!=generationProvider()))continue;
+            try
+            {const auto started=vanta::StreamNowUs();BuildPreview(input.bgra,input.metadata,config,revision);
+                if(owner)owner->RecordConsumer("Capture preview",input.metadata,started);}
+            catch(const std::exception& error){vanta::log::Warning("Capture preview processing failed: %s",error.what());}
+        }
+    }
+    void ClearPublished()
+    {
+        {std::lock_guard lock(latestFrameMutex);latestCenteredFrame.release();latestSourceFrame.release();}
+        std::lock_guard lock(subscriptionMutex);
+        for(auto& weak:subscriptions)if(auto subscriptionState=weak.lock())
+        {std::lock_guard frameLock(subscriptionState->mutex);subscriptionState->latest={};subscriptionState->condition.notify_all();}
+        {std::lock_guard backgroundLock(backgroundPreviewMutex);backgroundPreview={};}
+        latestFrameCondition.notify_all();
+    }
+    void RunCapture(std::stop_token stop)
+    {
+        std::uint64_t after{},sourceGeneration{},previewLast{},observedDemand=~std::uint64_t{};
+        schedulerWakeLateness.Clear();
+        const auto waitForDemand=[&](std::uint64_t revision,std::uint64_t deadline=0)
+        {
+            demandSignal->WaitUntil(revision,deadline,stop);
+            const auto woke=vanta::StreamNowUs();
+            if(deadline && woke>=deadline && demandSignal->revision.load()==revision && !stop.stop_requested())
+                schedulerWakeLateness.Add(double(woke-deadline)/1000.0);
+        };
+        vanta::CpuFrameSnapshot cachedInput;
+        while(!stop.stop_requested())
+        {
+            const auto now=vanta::StreamNowUs(),revision=demandSignal->revision.load();
+            std::uint64_t nextDemandUs{};
+            const auto schedule=[&](std::uint64_t due){if(due && (!nextDemandUs || due<nextDemandUs))nextDemandUs=due;};
+            vanta::CaptureConfig config;std::uint64_t configRevision{};
+            {std::lock_guard lock(workerConfigMutex);config=workerConfig;configRevision=workerConfigRevision.load();}
+            std::vector<std::pair<std::shared_ptr<vanta::CaptureSubscriptionState>,vanta::FrameRegionRequest>> interested;
+            const bool demandChanged=observedDemand!=revision;
+            vanta::FrameReadbackRequest request;request.afterSequence=demandChanged ? 0 : after;request.revision=revision;
+            {
+                std::lock_guard lock(subscriptionMutex);std::erase_if(subscriptions,[](const auto& weak){return weak.expired();});
+                for(auto& weak:subscriptions)if(auto subscriptionState=weak.lock())
+                {
+                    std::lock_guard frameLock(subscriptionState->mutex);auto region=EffectiveRegion(subscriptionState->request,config);
+                    if(subscriptionState->cancelled || !region.active)continue;
+                    const auto due=vanta::FrameRequestDueUs(subscriptionState->lastPublishedUs,region.maximumFps);
+                    if(due>now){schedule(due);continue;}
+                    interested.push_back({subscriptionState,subscriptionState->request});request.regions.push_back(region);
+                }
+            }
+            const bool preview=now<previewVisibleUntil.load(),compatibility=now<compatibilityDemandUntil.load();
+            const vanta::FrameRegionRequest primary=EffectiveRegion({vanta::FrameRegionKind::configuredCapture,640,{},0,true},config);
+            if(preview && !cachedInput.bgra.empty() && now-previewLast>=16667 &&
+                (!generationProvider || cachedInput.metadata.generation==generationProvider()) &&
+                (cachedInput.metadata.sequence!=lastBuiltPreviewSequence || configRevision!=lastBuiltPreviewRevision))
+            {
+                const auto wanted=vanta::ResolveFrameRegion(primary,cachedInput.metadata.sourceWidth,cachedInput.metadata.sourceHeight);
+                const cv::Rect available(cachedInput.metadata.cropX,cachedInput.metadata.cropY,cachedInput.bgra.cols,cachedInput.bgra.rows);
+                if(!wanted.empty() && (wanted&available)==wanted)
+                {auto metadata=cachedInput.metadata;metadata.cropX=wanted.x;metadata.cropY=wanted.y;
+                    SchedulePreview(cachedInput.bgra({wanted.x-available.x,wanted.y-available.y,wanted.width,wanted.height}),metadata,config,configRevision);
+                    previewLast=now;lastBuiltPreviewSequence=metadata.sequence;lastBuiltPreviewRevision=configRevision;}
+            }
+            if(compatibility || (preview && now-previewLast>=16667))
+            {auto previewRequest=primary;previewRequest.maximumFps=compatibility ? 0 : 60;request.regions.push_back(previewRequest);}
+            else if(preview)schedule(vanta::FrameRequestDueUs(previewLast,60));
+            if(request.regions.empty())
+            {
+                if(generationProvider && sourceGeneration!=generationProvider())
+                {ClearPublished();sourceGeneration=generationProvider();}
+                waitForDemand(revision,nextDemandUs);continue;
+            }
+            // Each capped subscription/preview already contributes only when
+            // due. A second global throttle can delay a faster subscription
+            // behind a slower one, or impose an extra polling sleep.
+            vanta::CpuFrameSnapshot snapshot;bool received{};const auto acquisitionStarted=vanta::StreamNowUs();
+            if(regionFrameProvider)received=regionFrameProvider(request,snapshot,stop);
+            if(sourceGeneration && snapshot.metadata.generation && snapshot.metadata.generation!=sourceGeneration)ClearPublished();
+            if(snapshot.metadata.generation)sourceGeneration=snapshot.metadata.generation;
+            if(!received || snapshot.bgra.empty() || snapshot.bgra.type()!=CV_8UC4 || (!demandChanged && snapshot.metadata.sequence<=after))
+            {
+                if(!regionFrameProvider || vanta::StreamNowUs()-acquisitionStarted<1000)
+                {waitForDemand(revision,vanta::StreamNowUs()+1000);}
+                continue;
+            }
+            if(stop.stop_requested())break;
+            if(generationProvider && snapshot.metadata.generation!=generationProvider())continue;
+            const bool unique=snapshot.metadata.sequence>after;
+            after=std::max(after,snapshot.metadata.sequence);observedDemand=revision;
+            const cv::Rect available(snapshot.metadata.cropX,snapshot.metadata.cropY,snapshot.bgra.cols,snapshot.bgra.rows);
+            const auto published=vanta::StreamNowUs();snapshot.metadata.timing.publishedUs=published;
+            cachedInput=snapshot;
+            for(auto& [subscriptionState,original]:interested)
+            {
+                const auto wanted=vanta::ResolveFrameRegion(EffectiveRegion(original,config),snapshot.metadata.sourceWidth,snapshot.metadata.sourceHeight);
+                if(wanted.empty() || (wanted&available)!=wanted)continue;
+                auto metadata=snapshot.metadata;metadata.cropX=wanted.x;metadata.cropY=wanted.y;metadata.cropWidth=wanted.width;metadata.cropHeight=wanted.height;
+                std::lock_guard frameLock(subscriptionState->mutex);if(subscriptionState->cancelled || subscriptionState->request!=original)continue;
+                if(subscriptionState->latest.metadata.sequence>metadata.sequence)continue;
+                subscriptionState->latest={snapshot.bgra({wanted.x-available.x,wanted.y-available.y,wanted.width,wanted.height}),metadata};
+                subscriptionState->lastPublishedUs=published;subscriptionState->condition.notify_all();
+            }
+            const auto primaryCrop=vanta::ResolveFrameRegion(primary,snapshot.metadata.sourceWidth,snapshot.metadata.sourceHeight);
+            if(!primaryCrop.empty() && (primaryCrop&available)==primaryCrop)
+            {
+                auto metadata=snapshot.metadata;metadata.cropX=primaryCrop.x;metadata.cropY=primaryCrop.y;metadata.cropWidth=primaryCrop.width;metadata.cropHeight=primaryCrop.height;
+                const cv::Mat image=snapshot.bgra({primaryCrop.x-available.x,primaryCrop.y-available.y,primaryCrop.width,primaryCrop.height});
+                {
+                    std::lock_guard lock(latestFrameMutex);latestCenteredFrame=image;latestMetadata=metadata;latestFrameSequence=metadata.sequence;++sessionPublishedFrames;
+                    if(available==cv::Rect(0,0,metadata.sourceWidth,metadata.sourceHeight))latestSourceFrame=snapshot.bgra;else latestSourceFrame.release();
+                }
+                latestFrameCondition.notify_all();
+            }
+            if(unique)++cpuPublishedCount;lastCpuPublishedUs=published;
+            {std::lock_guard lock(metadataMutex);lastPublishedMetadata=snapshot.metadata;lastPublishedMetadata.cropWidth=snapshot.bgra.cols;lastPublishedMetadata.cropHeight=snapshot.bgra.rows;}
+            if(publicationObserver)publicationObserver(snapshot.metadata);
+            if(preview && published-previewLast>=16667 && !primaryCrop.empty() && (primaryCrop&available)==primaryCrop)
+            {auto metadata=snapshot.metadata;metadata.cropX=primaryCrop.x;metadata.cropY=primaryCrop.y;
+                SchedulePreview(snapshot.bgra({primaryCrop.x-available.x,primaryCrop.y-available.y,primaryCrop.width,primaryCrop.height}),metadata,config,configRevision);
+                previewLast=published;lastBuiltPreviewSequence=metadata.sequence;lastBuiltPreviewRevision=configRevision;}
+        }
+    }
     void Tick()
     {
-        if (!running)
+        if(!running)return;
+        if(captureWorkerFailed){status="Capture worker failed; see vanta.log and restart capture";framesPerSecond=0;return;}
+        const auto now=std::chrono::steady_clock::now();const double elapsed=std::chrono::duration<double>(now-fpsWindowStart).count();
+        if(elapsed>=1.0){const auto count=cpuPublishedCount.load();framesPerSecond=float((count-frameCounter)/elapsed);frameCounter=count;fpsWindowStart=now;}
+        if(vanta::StreamNowUs()-lastCpuPublishedUs.load()>1000000)framesPerSecond=0;
+        vanta::CpuFrameSnapshot preview;int matches{};std::uint64_t previewRevision{};
+        {std::lock_guard lock(backgroundPreviewMutex);preview=backgroundPreview;matches=backgroundMatches;previewRevision=backgroundPreviewRevision;}
+        if(generationProvider && lastPreviewGeneration!=generationProvider())
+        {previewShaderResource.Reset();previewTexture.Reset();lastPreviewSequence=0;sourceWidth=sourceHeight=captureWidth=captureHeight=0;lastPreviewGeneration=generationProvider();}
+        if(generationProvider && preview.metadata.generation!=generationProvider())return;
+        if(!preview.bgra.empty() && (preview.metadata.sequence!=lastPreviewSequence || previewRevision!=lastPreviewRevision) && vanta::StreamNowUs()<previewVisibleUntil.load())
         {
-            return;
-        }
-
-        CapturedFrame frame;
-        vanta::NormalizedCaptureRegion auxiliaryRequest;
-        {
-            std::lock_guard<std::mutex> lock(
-                auxiliaryFrameMutex);
-            auxiliaryRequest =
-                auxiliaryNormalizedRegion;
-        }
-        const std::string previousStatus = status;
-        bool receivedFrame = false;
-        if (activeSettings.source == CaptureSourceKind::sunshineStream)
-        {
-            receivedFrame = TryGetSunshineFrame(frame, auxiliaryRequest);
-        }
-        else if (captureBackend != nullptr)
-        {
-            receivedFrame = captureBackend->TryGetFrame(
-                frame,
-                status,
-                regionIndex == 1,
-                regionSize,
-                auxiliaryRequest.enabled
-                    ? &auxiliaryRequest
-                    : nullptr);
-        }
-        if (!receivedFrame)
-        {
-            if (status != previousStatus &&
-                status.find("error") != std::string::npos)
-            {
-                vanta::log::Warning(
-                    "capture update: %s",
-                    status.c_str());
-            }
-            return;
-        }
-        if (frame.bgra.empty())
-        {
-            return;
-        }
-
-        ProcessFrame(frame);
-        if (activeSettings.source == CaptureSourceKind::sunshineStream &&
-            previewShaderResource != nullptr)
-        {
-            status = "Sunshine stream is feeding Vanta's capture pipeline";
-        }
-        if (!firstFrameLogged &&
-            previewShaderResource != nullptr)
-        {
-            const char* previewMode =
-                binaryMask
-                ? "binary"
-                : applyFilter
-                    ? "filtered-color"
-                    : "original";
-            vanta::log::Info(
-                "capture preview ready: source=%dx%d region=%dx%d "
-                "preview=%dx%d matches=%d mode=%s",
-                sourceWidth,
-                sourceHeight,
-                captureWidth,
-                captureHeight,
-                previewWidth,
-                previewHeight,
-                matchedPixels,
-                previewMode);
-            firstFrameLogged = true;
-        }
-        ++frameCounter;
-        const auto current =
-            std::chrono::steady_clock::now();
-        const float elapsed =
-            std::chrono::duration<float>(
-                current - fpsWindowStart).count();
-        if (elapsed >= 1.0F)
-        {
-            framesPerSecond =
-                static_cast<float>(frameCounter) / elapsed;
-            frameCounter = 0;
-            fpsWindowStart = current;
-            if (current >= nextFpsLog)
-            {
-                vanta::log::Info(
-                    "capture throughput: %.1f FPS",
-                    framesPerSecond);
-                nextFpsLog =
-                    current +
-                    std::chrono::seconds(5);
-            }
+            UploadPreview(preview.bgra);lastPreviewSequence=preview.metadata.sequence;lastPreviewRevision=previewRevision;sourceWidth=preview.metadata.sourceWidth;sourceHeight=preview.metadata.sourceHeight;
+            vanta::CaptureConfig config;{std::lock_guard lock(workerConfigMutex);config=workerConfig;}
+            const auto region=vanta::ResolveFrameRegion(EffectiveRegion({vanta::FrameRegionKind::configuredCapture},config),sourceWidth,sourceHeight);
+            captureWidth=region.width;captureHeight=region.height;matchedPixels=matches;status="Receiving native GPU ROI frames";
         }
     }
-
-    void ProcessFrame(const CapturedFrame& captured)
-    {
-        cv::Mat source = captured.bgra;
-        RECT sourceScreenRectangle =
-            captured.screenRectangle;
-
-        if (activeSettings.backend ==
-                CaptureBackendKind::desktopDuplication &&
-            activeSettings.source == CaptureSourceKind::window)
-        {
-            RECT windowRectangle{};
-            if (!GetWindowRect(
-                    activeSettings.window,
-                    &windowRectangle))
-            {
-                status = "The selected window is no longer available";
-                return;
-            }
-
-            const RECT intersection = IntersectRectangles(
-                sourceScreenRectangle,
-                windowRectangle);
-            if (!IsValidRectangle(intersection))
-            {
-                status =
-                    "The selected window is outside the duplicated monitor";
-                return;
-            }
-
-            const float scaleX =
-                static_cast<float>(source.cols) /
-                static_cast<float>(
-                    sourceScreenRectangle.right -
-                    sourceScreenRectangle.left);
-            const float scaleY =
-                static_cast<float>(source.rows) /
-                static_cast<float>(
-                    sourceScreenRectangle.bottom -
-                    sourceScreenRectangle.top);
-            const int left = std::clamp(
-                static_cast<int>(std::lround(
-                    (intersection.left -
-                     sourceScreenRectangle.left) * scaleX)),
-                0,
-                source.cols - 1);
-            const int top = std::clamp(
-                static_cast<int>(std::lround(
-                    (intersection.top -
-                     sourceScreenRectangle.top) * scaleY)),
-                0,
-                source.rows - 1);
-            const int right = std::clamp(
-                static_cast<int>(std::lround(
-                    (intersection.right -
-                     sourceScreenRectangle.left) * scaleX)),
-                left + 1,
-                source.cols);
-            const int bottom = std::clamp(
-                static_cast<int>(std::lround(
-                    (intersection.bottom -
-                     sourceScreenRectangle.top) * scaleY)),
-                top + 1,
-                source.rows);
-            source = source(
-                cv::Rect(
-                    left,
-                    top,
-                    right - left,
-                    bottom - top));
-            sourceScreenRectangle = intersection;
-        }
-
-        const bool desktopWindowSource =
-            activeSettings.backend ==
-                CaptureBackendKind::desktopDuplication &&
-            activeSettings.source ==
-                CaptureSourceKind::window;
-        sourceWidth =
-            !desktopWindowSource &&
-                captured.sourceWidth > 0
-            ? captured.sourceWidth
-            : source.cols;
-        sourceHeight =
-            !desktopWindowSource &&
-                captured.sourceHeight > 0
-            ? captured.sourceHeight
-            : source.rows;
-        cv::Rect captureRectangle(
-            0,
-            0,
-            source.cols,
-            source.rows);
-        if (regionIndex == 1 &&
-            !captured.centeredRegionApplied)
-        {
-            const int side = std::max(
-                1,
-                std::min({
-                    regionSize,
-                    source.cols,
-                    source.rows}));
-            captureRectangle = cv::Rect(
-                (source.cols - side) / 2,
-                (source.rows - side) / 2,
-                side,
-                side);
-        }
-
-        const float screenScaleX =
-            static_cast<float>(
-                sourceScreenRectangle.right -
-                sourceScreenRectangle.left) /
-            static_cast<float>(source.cols);
-        const float screenScaleY =
-            static_cast<float>(
-                sourceScreenRectangle.bottom -
-                sourceScreenRectangle.top) /
-            static_cast<float>(source.rows);
-        outline.screenRectangle = {
-            sourceScreenRectangle.left +
-                static_cast<LONG>(std::lround(
-                    captureRectangle.x * screenScaleX)),
-            sourceScreenRectangle.top +
-                static_cast<LONG>(std::lround(
-                    captureRectangle.y * screenScaleY)),
-            sourceScreenRectangle.left +
-                static_cast<LONG>(std::lround(
-                    (captureRectangle.x +
-                     captureRectangle.width) * screenScaleX)),
-            sourceScreenRectangle.top +
-                static_cast<LONG>(std::lround(
-                    (captureRectangle.y +
-                     captureRectangle.height) * screenScaleY))};
-        outline.visible =
-            running &&
-            activeSettings.source != CaptureSourceKind::sunshineStream &&
-            drawOutline &&
-            IsValidRectangle(outline.screenRectangle);
-        std::copy(
-            std::begin(outlineColor),
-            std::end(outlineColor),
-            std::begin(outline.color));
-        outline.thickness = 1;
-
-        const cv::Mat capture =
-            source(captureRectangle);
-        captureWidth = capture.cols;
-        captureHeight = capture.rows;
-        const std::int64_t frameTimestampNanoseconds =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count();
-
-        // Publish the immutable BGRA capture region. cv::Mat reference
-        // counting keeps its storage alive after this lock is released.
-        {
-            std::lock_guard<std::mutex> lock(latestFrameMutex);
-            latestCenteredFrame = capture;
-            ++latestFrameSequence;
-            ++sessionPublishedFrames;
-            latestFrameTimestampNanoseconds =
-                frameTimestampNanoseconds;
-            latestMetadata = {latestFrameSequence, frameTimestampNanoseconds,
-                sourceWidth, sourceHeight,
-                captured.centeredRegionApplied ? (sourceWidth - capture.cols) / 2 : captureRectangle.x,
-                captured.centeredRegionApplied ? (sourceHeight - capture.rows) / 2 : captureRectangle.y};
-        }
-        latestFrameCondition.notify_all();
-
-        if (!captured.auxiliaryBgra.empty() &&
-            IsValidRectangle(
-                captured.auxiliaryScreenRectangle))
-        {
-            {
-                std::lock_guard<std::mutex> lock(
-                    auxiliaryFrameMutex);
-                latestAuxiliaryFrame =
-                    captured.auxiliaryBgra;
-                latestAuxiliaryScreenRectangle =
-                    captured.auxiliaryScreenRectangle;
-                ++latestAuxiliarySequence;
-                latestAuxiliaryTimestampNanoseconds =
-                    frameTimestampNanoseconds;
-            }
-            auxiliaryFrameCondition.notify_all();
-        }
-
-        cv::Mat processed;
-        if (applyFilter || binaryMask)
-        {
-            cv::Mat bgr;
-            cv::cvtColor(
-                capture,
-                bgr,
-                cv::COLOR_BGRA2BGR);
-
-            cv::Mat hsv;
-            cv::cvtColor(
-                bgr,
-                hsv,
-                cv::COLOR_BGR2HSV);
-
-            cv::Mat mask;
-            const auto& colorTarget =
-                vanta::kHsvColorTargets[
-                    static_cast<std::size_t>(
-                        std::clamp(
-                            colorTargetIndex,
-                            0,
-                            static_cast<int>(
-                                vanta::kHsvColorTargets.size()) - 1))];
-            vanta::BuildHsvMask(hsv, colorTargetIndex, mask);
-            if (colorTarget.purpleBlacklist) RemoveBlacklistedPixels(bgr, mask);
-            matchedPixels = cv::countNonZero(mask);
-
-            if (binaryMask)
-            {
-                cv::cvtColor(
-                    mask,
-                    processed,
-                    cv::COLOR_GRAY2BGRA);
-            }
-            else
-            {
-                cv::Mat colorFrame;
-                cv::cvtColor(
-                    bgr,
-                    colorFrame,
-                    cv::COLOR_BGR2BGRA);
-                processed = cv::Mat::zeros(
-                    colorFrame.size(),
-                    colorFrame.type());
-                colorFrame.copyTo(processed, mask);
-            }
-        }
-        else
-        {
-            processed = capture;
-            matchedPixels = 0;
-        }
-
-        constexpr int maximumPreviewWidth = 560;
-        constexpr int maximumPreviewHeight = 315;
-        const float previewScale = std::min({
-            1.0F,
-            static_cast<float>(maximumPreviewWidth) /
-                static_cast<float>(processed.cols),
-            static_cast<float>(maximumPreviewHeight) /
-                static_cast<float>(processed.rows)});
-        const cv::Size previewSize(
-            std::max(
-                1,
-                static_cast<int>(std::lround(
-                    processed.cols * previewScale))),
-            std::max(
-                1,
-                static_cast<int>(std::lround(
-                    processed.rows * previewScale))));
-
-        cv::Mat preview;
-        if (previewSize.width != processed.cols ||
-            previewSize.height != processed.rows)
-        {
-            cv::resize(
-                processed,
-                preview,
-                previewSize,
-                0.0,
-                0.0,
-                cv::INTER_AREA);
-        }
-        else
-        {
-            preview = processed;
-        }
-        UploadPreview(preview);
-        status = "Capturing";
-    }
-
     void UploadPreview(const cv::Mat& bgra)
     {
         if (bgra.empty() ||
@@ -2326,90 +532,6 @@ struct vanta::CaptureController::Implementation
             0);
     }
 
-    bool RenderWindowSelector()
-    {
-        const char* preview =
-            selectedWindow >= 0 &&
-            selectedWindow < static_cast<int>(windows.size())
-            ? windows[static_cast<std::size_t>(
-                selectedWindow)].label.c_str()
-            : "No capturable windows";
-
-        bool changed = false;
-        if (custom::BeginCombo(
-                "Window",
-                preview,
-                std::max(
-                    1,
-                    static_cast<int>(windows.size()))))
-        {
-            for (std::size_t index = 0;
-                 index < windows.size();
-                 ++index)
-            {
-                const bool selected =
-                    selectedWindow ==
-                    static_cast<int>(index);
-                if (custom::Selectable(
-                        windows[index].label.c_str(),
-                        selected))
-                {
-                    selectedWindow =
-                        static_cast<int>(index);
-                    changed = true;
-                }
-                if (selected)
-                {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            custom::EndCombo();
-        }
-        return changed;
-    }
-
-    bool RenderMonitorSelector()
-    {
-        const char* preview =
-            selectedMonitor >= 0 &&
-            selectedMonitor < static_cast<int>(monitors.size())
-            ? monitors[static_cast<std::size_t>(
-                selectedMonitor)].label.c_str()
-            : "No monitors";
-
-        bool changed = false;
-        if (custom::BeginCombo(
-                "Monitor",
-                preview,
-                std::max(
-                    1,
-                    static_cast<int>(monitors.size()))))
-        {
-            for (std::size_t index = 0;
-                 index < monitors.size();
-                 ++index)
-            {
-                const bool selected =
-                    selectedMonitor ==
-                    static_cast<int>(index);
-                if (custom::Selectable(
-                        monitors[index].label.c_str(),
-                        selected))
-                {
-                    selectedMonitor =
-                        static_cast<int>(index);
-                    changed = true;
-                }
-                if (selected)
-                {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            custom::EndCombo();
-        }
-        return changed;
-    }
-
     void RenderPanel()
     {
         const ImVec2 available =
@@ -2426,7 +548,6 @@ struct vanta::CaptureController::Implementation
             190.0F,
             available.y - 40.0F);
 
-        bool selectionChanged = false;
         bool settingsChanged = false;
         if (custom::Child(
                 ICON_SETTINGS_3_LINE
@@ -2437,74 +558,10 @@ struct vanta::CaptureController::Implementation
             ImGui::PushStyleVar(
                 ImGuiStyleVar_ItemSpacing,
                 ImVec2(12.0F, 12.0F));
-            const char* backends[]{
-                "Windows Graphics Capture",
-                "Desktop Duplication"};
-            const char* sources[]{
-                "Window",
-                "Monitor",
-                "Sunshine stream"};
-            const char* regions[]{
-                "Full source",
-                "Centered square"};
-
-            bool changed = custom::Combo(
-                "Source",
-                &sourceIndex,
-                sources,
-                IM_ARRAYSIZE(sources));
-            selectionChanged |= changed;
-            settingsChanged |= changed;
-
-            if (sourceIndex != 2)
-            {
-                changed = custom::Combo(
-                    "Backend",
-                    &backendIndex,
-                    backends,
-                    IM_ARRAYSIZE(backends));
-                selectionChanged |= changed;
-                settingsChanged |= changed;
-            }
-            else
-            {
-                ImGui::TextDisabled(
-                    "Backend: native Sunshine receiver");
-            }
-
-            if (sourceIndex == 0)
-            {
-                changed = RenderWindowSelector();
-            }
-            else if (sourceIndex == 1)
-            {
-                changed = RenderMonitorSelector();
-            }
-            else
-            {
-                ImGui::TextWrapped(
-                    "Frames are decoded by Stream Receiver and passed to "
-                    "Vanta's normal OpenCV capture pipeline.");
-                ImGui::TextDisabled(
-                    "GPU preview remains direct; CPU readback occurs only "
-                    "while this source is selected.");
-                changed = false;
-            }
-            selectionChanged |= changed;
-            settingsChanged |= changed;
-
-            if (sourceIndex != 2 &&
-                custom::Button(
-                    "Refresh sources",
-                    ImVec2(
-                        ImGui::GetContentRegionAvail().x,
-                        34.0F)))
-            {
-                RefreshSources();
-                selectionChanged = true;
-                settingsChanged = true;
-            }
-
+            const char* regions[]{"Full source","Centered square"};
+            ImGui::TextUnformatted("Source: Sunshine stream");
+            ImGui::TextWrapped("Native decoded frames feed TestMove, TestClick and Python. Pair and start the stream on Stream Receiver.");
+            ImGui::TextDisabled("No desktop or window capture is used.");
             custom::Separator();
             settingsChanged |= custom::Combo(
                 "Capture area",
@@ -2521,27 +578,11 @@ struct vanta::CaptureController::Implementation
                     "%d px");
             }
 
-            if (sourceIndex != 2)
-            {
-                settingsChanged |= custom::Checkbox(
-                    "Draw capture outline",
-                    &drawOutline);
-                if (drawOutline)
-                {
-                    settingsChanged |= custom::ColorEdit4(
-                        "Outline color",
-                        outlineColor,
-                        ImGuiColorEditFlags_NoSidePreview |
-                            ImGuiColorEditFlags_AlphaBar |
-                            ImGuiColorEditFlags_NoInputs |
-                            ImGuiColorEditFlags_AlphaPreview);
-                }
-            }
-            else
-            {
-                ImGui::TextDisabled(
-                    "Screen outlines are unavailable for remote frames.");
-            }
+            settingsChanged |= custom::Checkbox("Draw preview border",&drawOutline);
+            if (drawOutline)
+                settingsChanged |= custom::ColorEdit4("Preview border color",outlineColor,
+                    ImGuiColorEditFlags_NoSidePreview | ImGuiColorEditFlags_AlphaBar |
+                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreview);
 
             settingsChanged |= custom::Checkbox(
                 "Apply HSV + blacklist filter",
@@ -2576,33 +617,16 @@ struct vanta::CaptureController::Implementation
             ImGui::TextDisabled("%s\n%s", colorTarget.description,
                 colorTarget.purpleBlacklist ? "Purple blacklist enabled" : "Purple blacklist not applied");
 
-            if (backendIndex == 1 && sourceIndex == 0)
-            {
-                ImGui::TextDisabled(
-                    "Desktop Duplication crops the visible window "
-                    "rectangle; occlusion remains.");
-            }
             ImGui::PopStyleVar();
         }
         custom::EndChild();
 
         if (settingsChanged)
         {
+            SyncWorkerConfig();
             settingsRevision.fetch_add(
                 1,
                 std::memory_order_relaxed);
-        }
-
-        if (selectionChanged)
-        {
-            if (captureEnabled)
-            {
-                StartCapture();
-            }
-            else
-            {
-                status = "Source selected; capture is paused";
-            }
         }
 
         ImGui::SameLine(0.0F, gap);
@@ -2612,6 +636,8 @@ struct vanta::CaptureController::Implementation
                 ImVec2(previewPanelWidth, childBodyHeight),
                 true))
         {
+            const auto visibleNow=vanta::StreamNowUs();
+            if(previewVisibleUntil.exchange(visibleNow+100000)<=visibleNow)demandSignal->Wake();
             ImGui::TextColored(
                 running
                 ? ImVec4(0.45F, 0.96F, 0.65F, 1.0F)
@@ -2670,17 +696,25 @@ struct vanta::CaptureController::Implementation
                         ImVec2(4.0F, 4.0F),
                     IM_COL32(10, 10, 12, 220),
                     6.0F);
-                ImGui::GetWindowDrawList()->AddRect(
-                    imagePosition - ImVec2(4.0F, 4.0F),
-                    imagePosition +
-                        ImVec2(displayWidth, displayHeight) +
-                        ImVec2(4.0F, 4.0F),
-                    ImGui::GetColorU32(c::main_color.Value),
-                    6.0F);
+                if (drawOutline)
+                    ImGui::GetWindowDrawList()->AddRect(
+                        imagePosition-ImVec2(4.0F,4.0F),
+                        imagePosition+ImVec2(displayWidth,displayHeight)+ImVec2(4.0F,4.0F),
+                        ImGui::GetColorU32(ImVec4(outlineColor[0],outlineColor[1],outlineColor[2],outlineColor[3])),6.0F);
                 ImGui::Image(
                     reinterpret_cast<ImTextureID>(
                         previewShaderResource.Get()),
                     ImVec2(displayWidth, displayHeight));
+                if (fovPreviewVisible && captureWidth>0 && captureHeight>0)
+                {
+                    const int radius=std::clamp(fovPreviewRadius,0,std::max(0,std::min(captureWidth,captureHeight)/2-3));
+                    if (radius>0)
+                        ImGui::GetWindowDrawList()->AddCircle(
+                            imagePosition+ImVec2(displayWidth*.5F,displayHeight*.5F),
+                            radius*displayWidth/static_cast<float>(captureWidth),
+                            ImGui::GetColorU32(ImVec4(fovPreviewColor.red,fovPreviewColor.green,
+                                fovPreviewColor.blue,fovPreviewColor.alpha)),0,1.5F);
+                }
             }
             else
             {
@@ -2701,10 +735,7 @@ struct vanta::CaptureController::Implementation
                     placeholderPosition + placeholderSize,
                     ImGui::GetColorU32(c::child::stroke),
                     6.0F);
-                const char* placeholder =
-                    captureEnabled
-                    ? "Starting capture preview..."
-                    : "Capture is paused";
+                const char* placeholder = "Waiting for decoded Sunshine frames...";
                 const ImVec2 textSize =
                     ImGui::CalcTextSize(placeholder);
                 ImGui::GetWindowDrawList()->AddText(
@@ -2719,47 +750,7 @@ struct vanta::CaptureController::Implementation
         custom::EndChild();
     }
 
-    bool StartAutomatedCapture(
-        bool desktopDuplication,
-        bool windowSource)
-    {
-        RefreshSources();
-        if (windowSource && windows.empty())
-        {
-            status = "No window is available for the capture test";
-            return false;
-        }
-        if (!windowSource && monitors.empty())
-        {
-            status = "No monitor is available for the capture test";
-            return false;
-        }
-        backendIndex = desktopDuplication ? 1 : 0;
-        sourceIndex = windowSource ? 0 : 1;
-        captureEnabled = true;
-        if (windowSource)
-        {
-            selectedWindow = 0;
-        }
-        else
-        {
-            selectedMonitor = 0;
-        }
-        regionIndex = 1;
-        regionSize = 640;
-        applyFilter = true;
-        binaryMask = desktopDuplication;
-        return StartCapture();
-    }
-
-    DWORD ownProcessId{};
-    bool apartmentInitialized = false;
     bool running = false;
-    bool captureEnabled = true;
-    int backendIndex = 0;
-    int sourceIndex = 1;
-    int selectedWindow = 0;
-    int selectedMonitor = 0;
     int regionIndex = 1;
     int regionSize = 640;
     bool drawOutline = true;
@@ -2774,12 +765,44 @@ struct vanta::CaptureController::Implementation
         0.91F,
         1.0F};
     std::string status;
-    std::vector<WindowEntry> windows;
-    std::vector<MonitorEntry> monitors;
-    CaptureSettings activeSettings;
-    std::unique_ptr<CaptureBackend> captureBackend;
-    vanta::SunshineVideoFrameProvider sunshineVideoFrameProvider;
-    std::uint64_t sunshineFrameSequence{};
+    vanta::SunshineRegionFrameProvider regionFrameProvider;
+    std::jthread captureWorker;
+    std::jthread previewWorker;
+    std::mutex previewWorkMutex;
+    std::condition_variable_any previewWorkCondition;
+    vanta::CpuFrameSnapshot pendingPreview;
+    vanta::CaptureConfig pendingPreviewConfig;
+    std::uint64_t pendingPreviewRevision{};
+    bool hasPendingPreview{};
+    std::atomic_bool captureWorkerFailed{false};
+    std::function<std::uint64_t()> generationProvider;
+    std::function<void(const vanta::CapturedFrameMetadata&)> publicationObserver;
+    std::mutex subscriptionMutex,workerConfigMutex,backgroundPreviewMutex,demandMutex;
+    std::condition_variable_any demandCondition;
+    std::shared_ptr<vanta::CaptureDemandSignal> demandSignal=std::make_shared<vanta::CaptureDemandSignal>();
+    vanta::RollingStreamMetric schedulerWakeLateness;
+    std::vector<std::weak_ptr<vanta::CaptureSubscriptionState>> subscriptions;
+    vanta::CaptureConfig workerConfig;
+    std::atomic_uint64_t workerConfigRevision{0};
+    std::atomic_uint64_t previewVisibleUntil{0},compatibilityDemandUntil{0};
+    std::atomic_uint64_t cpuPublishedCount{0},lastCpuPublishedUs{0};
+    mutable std::mutex metadataMutex;
+    vanta::CapturedFrameMetadata lastPublishedMetadata;
+    vanta::CpuFrameSnapshot backgroundPreview;
+    int backgroundMatches{};
+    std::uint64_t backgroundPreviewRevision{},lastBuiltPreviewSequence{},lastBuiltPreviewRevision{};
+    std::uint64_t lastPreviewSequence{},lastPreviewRevision{},lastPreviewGeneration{},previewRateUs{};
+    struct ConsumerStats
+    {
+        bool processingExpected{};
+        std::string state;
+        std::uint64_t frames{},lastUs{},generation{};
+        std::deque<std::uint64_t> times;
+        vanta::RollingStreamMetric processing,age;
+        vanta::RollingStreamMetric algorithm;
+    };
+    mutable std::mutex consumerMutex;
+    std::map<std::string,ConsumerStats> consumers;
 
     ComPtr<ID3D11Device> previewDevice;
     ComPtr<ID3D11DeviceContext> previewContext;
@@ -2796,27 +819,19 @@ struct vanta::CaptureController::Implementation
     std::uint64_t frameCounter = 0;
     std::chrono::steady_clock::time_point fpsWindowStart{};
     std::chrono::steady_clock::time_point nextFpsLog{};
-    vanta::CaptureOutline outline;
+    bool fovPreviewVisible{};
+    int fovPreviewRadius{100};
+    vanta::RgbaColor fovPreviewColor{0.68F,0.56F,0.91F,1.0F};
 
-    // Store a BGR copy of the centered region for testclick (BGRA, CV_8UC4).
+    // Full decoded source and centered ROI share immutable BGRA storage.
     mutable std::mutex latestFrameMutex;
     mutable std::condition_variable latestFrameCondition;
     cv::Mat latestCenteredFrame;
+    cv::Mat latestSourceFrame;
     std::uint64_t latestFrameSequence{};
     std::uint64_t sessionPublishedFrames{};
-    std::int64_t latestFrameTimestampNanoseconds{};
     vanta::CapturedFrameMetadata latestMetadata;
 
-    mutable std::mutex auxiliaryFrameMutex;
-    mutable std::condition_variable
-        auxiliaryFrameCondition;
-    vanta::NormalizedCaptureRegion
-        auxiliaryNormalizedRegion;
-    cv::Mat latestAuxiliaryFrame;
-    RECT latestAuxiliaryScreenRectangle{};
-    std::uint64_t latestAuxiliarySequence{};
-    std::int64_t
-        latestAuxiliaryTimestampNanoseconds{};
 };
 
 namespace vanta
@@ -2834,39 +849,13 @@ namespace vanta
     bool CaptureController::Initialize(
         ID3D11Device* previewDevice,
         ID3D11DeviceContext* previewContext,
-        DWORD ownProcessId,
         const CaptureConfig* initialConfig)
     {
+        implementation_->owner=this;
         return implementation_->Initialize(
             previewDevice,
             previewContext,
-            ownProcessId,
             initialConfig);
-    }
-
-    void CaptureController::SetSunshineVideoFrameProvider(
-        SunshineVideoFrameProvider provider)
-    {
-        auto& impl = *implementation_;
-        const bool sunshineSelected = impl.sourceIndex == 2;
-        if (sunshineSelected && impl.running)
-        {
-            impl.StopCapture();
-        }
-        impl.sunshineVideoFrameProvider = std::move(provider);
-        if (sunshineSelected && impl.captureEnabled)
-        {
-            if (!impl.sunshineVideoFrameProvider)
-            {
-                impl.status = "Sunshine stream source is not available";
-            }
-            else if (!impl.StartCapture())
-            {
-                vanta::log::Warning(
-                    "Sunshine capture source could not start: %s",
-                    impl.status.c_str());
-            }
-        }
     }
 
     void CaptureController::Shutdown()
@@ -2875,6 +864,120 @@ namespace vanta
         {
             implementation_->Shutdown();
         }
+    }
+
+    void CaptureController::SetRegionFrameProvider(SunshineRegionFrameProvider provider)
+    {
+        auto& impl=*implementation_;impl.StopCapture();
+        impl.regionFrameProvider=std::move(provider);
+        if(impl.previewDevice)impl.StartCapture();
+    }
+    CaptureSubscription CaptureController::Subscribe(const FrameRegionRequest& request,const char* consumerName)
+    {
+        auto subscriptionState=std::make_shared<CaptureSubscriptionState>();subscriptionState->request=request;subscriptionState->demand=implementation_->demandSignal;
+        subscriptionState->consumerName=consumerName;
+        subscriptionState->generationProvider=implementation_->generationProvider;
+        {std::lock_guard lock(implementation_->subscriptionMutex);implementation_->subscriptions.push_back(subscriptionState);}
+        subscriptionState->demand->Wake();return CaptureSubscription(std::move(subscriptionState));
+    }
+    void CaptureController::SetGenerationProvider(std::function<std::uint64_t()> provider)
+    {implementation_->generationProvider=std::move(provider);}
+    CaptureController::DemandStats CaptureController::GetDemandStats(int width,int height) const
+    {
+        auto& impl=*implementation_;DemandStats result;result.running=impl.running;result.workerFailed=impl.captureWorkerFailed;
+        result.schedulerWakeLateness=impl.schedulerWakeLateness.Get();result.waitMode=impl.demandSignal->WaitMode();
+        CaptureConfig config;{std::lock_guard lock(impl.workerConfigMutex);config=impl.workerConfig;}
+        const auto append=[&](const std::string& name,const FrameRegionRequest& request)
+        {
+            if(!request.active)return;
+            const auto effective=Implementation::EffectiveRegion(request,config);
+            const auto rectangle=ResolveFrameRegion(effective,width,height);
+            result.regions.push_back({name,effective,rectangle});
+            result.streamRate=result.streamRate || effective.maximumFps==0;
+            result.maximumFps=std::max(result.maximumFps,effective.maximumFps);
+            if(!rectangle.empty())result.readbackUnion=result.readbackUnion.empty()?rectangle:result.readbackUnion|rectangle;
+        };
+        {std::lock_guard lock(impl.subscriptionMutex);
+            for(const auto& weak:impl.subscriptions)if(const auto subscription=weak.lock())
+            {std::lock_guard frameLock(subscription->mutex);if(!subscription->cancelled)append(subscription->consumerName,subscription->request);}}
+        const auto now=StreamNowUs();
+        if(now<impl.previewVisibleUntil.load())append("Capture preview",{FrameRegionKind::configuredCapture,640,{},60,true});
+        if(now<impl.compatibilityDemandUntil.load())append("Compatibility capture",{FrameRegionKind::configuredCapture,640,{},0,true});
+        return result;
+    }
+    void CaptureController::SetConsumerState(const char* name,bool expected,const char* activity)
+    {
+        auto& impl=*implementation_;std::lock_guard lock(impl.consumerMutex);
+        auto& consumer=impl.consumers[name];consumer.processingExpected=expected;
+        if(consumer.state!=activity)consumer.state=activity;
+    }
+    void CaptureController::SetPublicationObserver(std::function<void(const CapturedFrameMetadata&)> observer)
+    {implementation_->publicationObserver=std::move(observer);}
+    bool CaptureController::IsCurrent(const CapturedFrameMetadata& metadata) const
+    {const auto& impl=*implementation_;return !impl.generationProvider || metadata.generation==impl.generationProvider();}
+    void CaptureController::RecordConsumer(const char* name,const CapturedFrameMetadata& metadata,std::uint64_t startedUs)
+    {
+        auto& impl=*implementation_;const auto now=StreamNowUs();std::lock_guard lock(impl.consumerMutex);
+        if(!IsCurrent(metadata))return;
+        auto& stats=impl.consumers[name];
+        if(stats.generation!=metadata.generation){stats.generation=metadata.generation;stats.frames=0;stats.times.clear();stats.processing.Clear();stats.age.Clear();stats.algorithm.Clear();}
+        ++stats.frames;stats.lastUs=now;stats.times.push_back(now);
+        while(!stats.times.empty() && now-stats.times.front()>1000000)stats.times.pop_front();
+        stats.processing.Add(double(now-startedUs)/1000.0);
+        if(metadata.timing.receivedUs && startedUs>=metadata.timing.receivedUs)
+            stats.age.Add(double(startedUs-metadata.timing.receivedUs)/1000.0);
+    }
+    void CaptureController::RecordConsumerAlgorithm(const char* name,const CapturedFrameMetadata& metadata,std::uint64_t startedUs)
+    {
+        auto& impl=*implementation_;const auto now=StreamNowUs();std::lock_guard lock(impl.consumerMutex);
+        if(!IsCurrent(metadata))return;auto& stats=impl.consumers[name];
+        if(stats.generation!=metadata.generation)
+        {stats.generation=metadata.generation;stats.frames=0;stats.times.clear();stats.processing.Clear();stats.age.Clear();stats.algorithm.Clear();}
+        stats.algorithm.Add(double(now-startedUs)/1000.0);
+    }
+    CapturedFrameMetadata CaptureController::LastPublicationMetadata() const
+    {const auto& impl=*implementation_;std::lock_guard lock(impl.metadataMutex);return impl.lastPublishedMetadata;}
+    std::string CaptureController::DiagnosticsJson() const
+    {
+        const auto& impl=*implementation_;std::ostringstream output;
+        CapturedFrameMetadata frame;{std::lock_guard lock(impl.metadataMutex);frame=impl.lastPublishedMetadata;}
+        output<<"{\"cpu_published_total\":"<<impl.cpuPublishedCount.load()<<",\"last_publication\":{\"sequence\":"<<frame.sequence
+            <<",\"generation\":"<<frame.generation<<",\"frame_number\":"<<frame.frameNumber<<",\"crop_x\":"<<frame.cropX<<",\"crop_y\":"<<frame.cropY
+            <<",\"crop_width\":"<<frame.cropWidth<<",\"crop_height\":"<<frame.cropHeight<<",\"source_width\":"<<frame.sourceWidth<<",\"source_height\":"<<frame.sourceHeight
+            <<",\"presentation_us\":"<<frame.presentationTimeUs<<",\"received_us\":"<<frame.timing.receivedUs<<",\"assembled_us\":"<<frame.timing.assembledUs
+            <<",\"submitted_us\":"<<frame.timing.submittedUs<<",\"decoded_us\":"<<frame.timing.decodedUs<<",\"readback_issued_us\":"<<frame.timing.readbackStartedUs
+            <<",\"readback_us\":"<<frame.timing.readbackUs<<",\"published_us\":"<<frame.timing.publishedUs<<"},\"consumers\":{";
+        std::lock_guard lock(impl.consumerMutex);bool first=true;const auto now=StreamNowUs();
+        for(const auto& [name,stats]:impl.consumers)
+        {
+            if(!first)output<<',';first=false;
+            const auto duration=stats.processing.Get(),age=stats.age.Get();std::size_t rate{};
+            for(auto time:stats.times)if(now-time<=1000000)++rate;
+            output<<'"'<<name<<"\":{\"frames\":"<<stats.frames<<",\"fps\":"<<rate
+                <<",\"processing_median_ms\":"<<duration.medianMs<<",\"processing_p95_ms\":"<<duration.p95Ms
+                <<",\"processing_p99_ms\":"<<duration.p99Ms<<",\"receiver_age_median_ms\":"<<age.medianMs
+                <<",\"receiver_age_p95_ms\":"<<age.p95Ms<<",\"receiver_age_p99_ms\":"<<age.p99Ms<<'}';
+        }
+        output<<"}}";return output.str();
+    }
+    std::vector<CaptureController::ConsumerPerformance> CaptureController::ConsumerPerformanceStats() const
+    {
+        const auto& impl=*implementation_;std::lock_guard lock(impl.consumerMutex);std::vector<ConsumerPerformance> result;
+        const auto now=StreamNowUs();
+        for(const auto& [name,stats]:impl.consumers)
+        {double rate{};for(auto time:stats.times)if(now-time<=1000000)++rate;
+            const bool current=!impl.generationProvider || stats.generation==impl.generationProvider();
+            result.push_back({name,current?rate:0,stats.frames,current?stats.processing.Get():TimingSummary{},current?stats.age.Get():TimingSummary{},stats.processingExpected,stats.state,current?stats.algorithm.Get():TimingSummary{}});}
+        return result;
+    }
+    std::string CaptureController::DiagnosticsCsv() const
+    {
+        std::ostringstream csv;
+        for(const auto& consumer:ConsumerPerformanceStats())
+        {const auto row=[&](const char* stage,const TimingSummary& metric)
+            {csv<<consumer.name<<'_'<<stage<<','<<metric.medianMs<<','<<metric.p95Ms<<','<<metric.p99Ms<<','<<metric.samples<<'\n';};
+            row("processing",consumer.processing);row("receiver_frame_age",consumer.age);}
+        return csv.str();
     }
 
     void CaptureController::Tick()
@@ -2887,33 +990,10 @@ namespace vanta
         implementation_->RenderPanel();
     }
 
-    bool CaptureController::StartAutomatedCapture(
-        bool desktopDuplication,
-        bool windowSource)
-    {
-        return implementation_->StartAutomatedCapture(
-            desktopDuplication,
-            windowSource);
-    }
-
-    void CaptureController::SetColorTargetIndex(int index) noexcept
-    {
-        implementation_->colorTargetIndex =
-            std::clamp(
-                index,
-                0,
-                static_cast<int>(
-                    kHsvColorTargets.size()) - 1);
-    }
-
     CaptureConfig CaptureController::GetConfig() const
     {
         const auto& impl = *implementation_;
         CaptureConfig result;
-        result.backendIndex =
-            impl.backendIndex;
-        result.sourceIndex =
-            impl.sourceIndex;
         result.regionIndex =
             impl.regionIndex;
         result.regionSize =
@@ -2931,33 +1011,6 @@ namespace vanta
             impl.binaryMask;
         result.colorTargetIndex =
             impl.colorTargetIndex;
-        if (impl.selectedMonitor >= 0 &&
-            impl.selectedMonitor <
-                static_cast<int>(
-                    impl.monitors.size()))
-        {
-            result.monitorDevice =
-                impl.monitors[
-                    static_cast<std::size_t>(
-                        impl.selectedMonitor)]
-                    .deviceName;
-        }
-        if (impl.selectedWindow >= 0 &&
-            impl.selectedWindow <
-                static_cast<int>(
-                    impl.windows.size()))
-        {
-            const auto& entry =
-                impl.windows[
-                    static_cast<std::size_t>(
-                        impl.selectedWindow)];
-            result.windowExecutable =
-                entry.executable;
-            result.windowClass =
-                entry.className;
-            result.windowTitle =
-                entry.title;
-        }
         return result;
     }
 
@@ -2965,9 +1018,8 @@ namespace vanta
         const CaptureConfig& config)
     {
         auto& impl = *implementation_;
-        impl.RefreshSources();
         impl.ApplyConfigValues(config);
-        impl.captureEnabled = true;
+        impl.SyncWorkerConfig();
         if (!impl.StartCapture())
         {
             vanta::log::Warning(
@@ -2987,41 +1039,20 @@ namespace vanta
                 std::memory_order_relaxed);
     }
 
-    CaptureOutline CaptureController::GetOutline() const noexcept
+    void CaptureController::SetFovPreview(const bool visible,const int radius,const RgbaColor& fovColor)
     {
-        CaptureOutline result =
-            implementation_->outline;
-        result.visible =
-            implementation_->running &&
-            implementation_->activeSettings.source !=
-                CaptureSourceKind::sunshineStream &&
-            implementation_->drawOutline &&
-            IsValidRectangle(result.screenRectangle);
-        std::copy(
-            std::begin(implementation_->outlineColor),
-            std::end(implementation_->outlineColor),
-            std::begin(result.color));
-        result.thickness = 1;
-        return result;
-    }
-
-    bool CaptureController::GetCaptureScreenRectangle(
-        RECT& rectangle) const noexcept
-    {
-        rectangle =
-            implementation_->outline.screenRectangle;
-        return
-            implementation_->running &&
-            implementation_->activeSettings.source !=
-                CaptureSourceKind::sunshineStream &&
-            IsValidRectangle(rectangle);
+        auto& impl=*implementation_;
+        impl.fovPreviewVisible=visible;
+        impl.fovPreviewRadius=radius;
+        impl.fovPreviewColor=fovColor;
     }
 
     bool CaptureController::GetLatestCenteredFrame(cv::Mat& out) const
     {
+        implementation_->compatibilityDemandUntil=StreamNowUs()+100000;implementation_->demandSignal->Wake();
         std::lock_guard<std::mutex> lock(
             implementation_->latestFrameMutex);
-        if (implementation_->latestCenteredFrame.empty())
+        if (implementation_->latestCenteredFrame.empty() || !IsCurrent(implementation_->latestMetadata))
         {
             return false;
         }
@@ -3047,6 +1078,7 @@ namespace vanta
         const std::uint64_t afterSequence, cv::Mat& out,
         CapturedFrameMetadata& metadata, const std::uint32_t timeoutMilliseconds) const
     {
+        implementation_->compatibilityDemandUntil=StreamNowUs()+100000;implementation_->demandSignal->Wake();
         std::unique_lock<std::mutex> lock(
             implementation_->latestFrameMutex);
         const bool available =
@@ -3060,7 +1092,7 @@ namespace vanta
                             afterSequence &&
                         !implementation_->latestCenteredFrame.empty();
                 });
-        if (!available)
+        if (!available || !IsCurrent(implementation_->latestMetadata))
         {
             return false;
         }
@@ -3069,221 +1101,14 @@ namespace vanta
         return true;
     }
 
-    void CaptureController::SetAuxiliaryNormalizedRegion(
-        const NormalizedCaptureRegion& region)
+    bool CaptureController::WaitForSourceFrameWithMetadata(
+        const std::uint64_t afterSequence, cv::Mat& out,
+        CapturedFrameMetadata& metadata, const std::uint32_t timeoutMilliseconds) const
     {
-        auto& impl = *implementation_;
-        const auto clamped =
-            ClampNormalizedRegion(region);
-        bool changed = false;
-        {
-            std::lock_guard<std::mutex> lock(
-                impl.auxiliaryFrameMutex);
-            const auto& previous =
-                impl.auxiliaryNormalizedRegion;
-            changed =
-                previous.enabled != clamped.enabled ||
-                previous.left != clamped.left ||
-                previous.top != clamped.top ||
-                previous.width != clamped.width ||
-                previous.height != clamped.height;
-            if (changed)
-            {
-                impl.auxiliaryNormalizedRegion =
-                    clamped;
-                impl.latestAuxiliaryFrame.release();
-                impl.latestAuxiliaryScreenRectangle = {};
-                impl.latestAuxiliaryTimestampNanoseconds = 0;
-            }
-        }
-        if (changed)
-        {
-            impl.auxiliaryFrameCondition.notify_all();
-        }
+        FrameRegionRequest request;request.kind=FrameRegionKind::fullSource;
+        auto subscription=const_cast<CaptureController*>(this)->Subscribe(request);CpuFrameSnapshot snapshot;
+        if(!subscription.Wait(afterSequence,snapshot,timeoutMilliseconds))return false;
+        out=snapshot.bgra;metadata=snapshot.metadata;return true;
     }
 
-    bool CaptureController::WaitForAuxiliaryFrame(
-        std::uint64_t afterSequence,
-        cv::Mat& out,
-        std::uint64_t& sequence,
-        std::int64_t& captureTimestampNanoseconds,
-        RECT& screenRectangle,
-        std::uint32_t timeoutMilliseconds) const
-    {
-        auto& impl = *implementation_;
-        std::unique_lock<std::mutex> lock(
-            impl.auxiliaryFrameMutex);
-        const bool available =
-            impl.auxiliaryFrameCondition.wait_for(
-                lock,
-                std::chrono::milliseconds(
-                    timeoutMilliseconds),
-                [&]()
-                {
-                    return
-                        impl.latestAuxiliarySequence >
-                            afterSequence &&
-                        !impl.latestAuxiliaryFrame.empty();
-                });
-        if (!available)
-        {
-            return false;
-        }
-        out = impl.latestAuxiliaryFrame;
-        sequence = impl.latestAuxiliarySequence;
-        captureTimestampNanoseconds =
-            impl.latestAuxiliaryTimestampNanoseconds;
-        screenRectangle =
-            impl.latestAuxiliaryScreenRectangle;
-        return true;
-    }
-
-    bool CaptureController::GetAuxiliaryScreenRectangle(
-        RECT& rectangle) const noexcept
-    {
-        const auto& impl = *implementation_;
-        std::lock_guard<std::mutex> lock(
-            impl.auxiliaryFrameMutex);
-        rectangle =
-            impl.latestAuxiliaryScreenRectangle;
-        return
-            impl.running &&
-            impl.activeSettings.source !=
-                CaptureSourceKind::sunshineStream &&
-            !impl.latestAuxiliaryFrame.empty() &&
-            IsValidRectangle(rectangle);
-    }
-
-    bool RunSunshineCaptureSourceSelfTest()
-    {
-        constexpr D3D_FEATURE_LEVEL levels[]{
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0};
-        ComPtr<ID3D11Device> device;
-        ComPtr<ID3D11DeviceContext> context;
-        D3D_FEATURE_LEVEL selected{};
-        const HRESULT result = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels,
-            static_cast<UINT>(std::size(levels)),
-            D3D11_SDK_VERSION,
-            &device,
-            &selected,
-            &context);
-        if (FAILED(result))
-        {
-            vanta::log::Error(
-                "receiver capture self-test could not create a hardware D3D11 device: 0x%08lX",
-                static_cast<unsigned long>(result));
-            return false;
-        }
-
-        std::uint64_t supplied{};
-        CaptureController capture;
-        capture.SetSunshineVideoFrameProvider(
-            [&supplied](
-                const std::uint64_t afterSequence,
-                cv::Mat& output,
-                std::uint64_t& sequence)
-            {
-                constexpr std::uint64_t frameCount = 8;
-                if (afterSequence != supplied || supplied >= frameCount)
-                {
-                    return false;
-                }
-                ++supplied;
-                output = cv::Mat(
-                    supplied <= 4 ? 1080 : 1440,
-                    supplied <= 4 ? 1920 : 2560,
-                    CV_8UC4,
-                    cv::Scalar(
-                        static_cast<double>(13 + supplied),
-                        42,
-                        99,
-                        255));
-                sequence = supplied;
-                return true;
-            });
-        CaptureConfig config;
-        config.sourceIndex = 2;
-        config.regionIndex = 1;
-        config.regionSize = 640;
-        config.drawOutline = false;
-        if (!capture.Initialize(
-                device.Get(),
-                context.Get(),
-                GetCurrentProcessId(),
-                &config))
-        {
-            vanta::log::Error(
-                "receiver capture self-test could not initialize Vanta's capture source");
-            capture.Shutdown();
-            return false;
-        }
-
-        bool firstGeometryValid=false;
-        for (int index = 0; index < 8; ++index)
-        {
-            capture.Tick();
-            if (index==3)
-            {
-                cv::Mat image;
-                CapturedFrameMetadata metadata;
-                firstGeometryValid=capture.WaitForCenteredFrameWithMetadata(0,image,metadata,0) &&
-                    metadata.sourceWidth==1920 && metadata.sourceHeight==1080 &&
-                    metadata.cropX==640 && metadata.cropY==220 && metadata.sequence==4;
-            }
-        }
-        // A provider that has no new sequence must not cause Vanta to republish
-        // a duplicate capture frame.
-        capture.Tick();
-        cv::Mat frame;
-        RECT captureRectangle{};
-        std::uint64_t publishedSequence{};
-        std::int64_t publishedTimestamp{};
-        CapturedFrameMetadata metadata;
-        const bool finalGeometryValid=capture.WaitForCenteredFrameWithMetadata(0,frame,metadata,0) &&
-            metadata.sourceWidth==2560 && metadata.sourceHeight==1440 &&
-            metadata.cropX==960 && metadata.cropY==400 && metadata.sequence==8;
-        const cv::Vec4b firstPixel =
-            capture.WaitForCenteredFrame(
-                0,
-                frame,
-                publishedSequence,
-                publishedTimestamp,
-                0) &&
-                frame.type() == CV_8UC4 &&
-                !frame.empty()
-            ? frame.at<cv::Vec4b>(0, 0)
-            : cv::Vec4b{};
-        const bool valid =
-            firstGeometryValid && finalGeometryValid &&
-            frame.type() == CV_8UC4 &&
-            frame.cols == 640 &&
-            frame.rows == 640 &&
-            supplied == 8 &&
-            publishedSequence == 8 &&
-            publishedTimestamp > 0 &&
-            firstPixel[0] == 21 &&
-            firstPixel[1] == 42 &&
-            firstPixel[2] == 99 &&
-            firstPixel[3] == 255 &&
-            !capture.GetCaptureScreenRectangle(captureRectangle);
-        capture.Shutdown();
-        if (!valid)
-        {
-            vanta::log::Error(
-                "receiver capture self-test failed: Sunshine frame was not published through Vanta's capture pipeline");
-            return false;
-        }
-        vanta::log::Info(
-            "receiver capture self-test passed: Sunshine frames feed Vanta's OpenCV capture pipeline");
-        return true;
-    }
 }

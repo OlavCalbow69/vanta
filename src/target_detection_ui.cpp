@@ -1,4 +1,5 @@
 #include "target_detection_ui.hpp"
+#include "preview_mask.hpp"
 #include "logger.hpp"
 #include <opencv2/imgproc.hpp>
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -117,22 +118,12 @@ namespace vanta
         }
         const float side = std::min(360.0F, ImGui::GetContentRegionAvail().x);
         const ImVec2 start = ImGui::GetCursorScreenPos();
+        if(!ImGui::IsRectVisible(ImVec2(side,side))){ImGui::Dummy(ImVec2(side,side));return;}
         const float sx = side / static_cast<float>(d.mask.cols);
         const float sy = side / static_cast<float>(d.mask.rows);
         auto* draw = ImGui::GetWindowDrawList();
         draw->AddRectFilled(start,ImVec2(start.x+side,start.y+side),IM_COL32(12,14,22,255));
-        for (int y=0;y<d.mask.rows;y+=2)
-        {
-            const auto* row=d.mask.ptr<std::uint8_t>(y);
-            for (int x=0;x<d.mask.cols;)
-            {
-                if (!row[x]) { ++x; continue; }
-                const int left=x;
-                while (x<d.mask.cols && row[x]) ++x;
-                draw->AddRectFilled(ImVec2(start.x+left*sx,start.y+y*sy),
-                    ImVec2(start.x+x*sx,start.y+std::min(y+2,d.mask.rows)*sy),IM_COL32(135,110,190,190));
-            }
-        }
+        DrawPreviewMask(draw,"detector",d.mask,start,ImVec2(start.x+side,start.y+side),IM_COL32(135,110,190,190));
         const auto box = [&](const cv::Rect& r, ImU32 color)
         { draw->AddRect(ImVec2(start.x+r.x*sx,start.y+r.y*sy),
             ImVec2(start.x+(r.x+r.width)*sx,start.y+(r.y+r.height)*sy),color); };

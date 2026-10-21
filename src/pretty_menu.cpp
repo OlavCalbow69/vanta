@@ -3,7 +3,7 @@
 #include "pretty_menu.hpp"
 
 #include "capture_controller.hpp"
-#include "bomb_timer_controller.hpp"
+#include "python_bot_controller.hpp"
 #include "config_manager.hpp"
 #include "logger.hpp"
 #include "makcu_controller.hpp"
@@ -672,7 +672,7 @@ namespace vanta::menu
         const char* surfaceDescription,
         HWND overlayWindow,
         CaptureController& capture,
-        BombTimerController& bombTimer,
+        PythonBotController& pythonBot,
         ConfigManager& configManager,
         MakcuController& makcu,
         TestClickController& testClick,
@@ -860,7 +860,7 @@ namespace vanta::menu
                 page_is_changing = false;
             }
             if (custom::Tab(
-                    ICON_BOMB_LINE "  Bomb Timer",
+                    ICON_CODE_LINE "  Python",
                     &g_page,
                     7))
             {
@@ -1111,11 +1111,12 @@ namespace vanta::menu
             configManager.RenderPanel(
                 overlayWindow,
                 testClick,
-                testMove);
+                testMove,
+                pythonBot);
         }
         else if (g_page == 7)
         {
-            bombTimer.RenderPanel();
+            pythonBot.RenderPanel();
         }
         else if (g_page == 8)
         {
@@ -1135,7 +1136,7 @@ namespace vanta::menu
                 ImVec2(15.0F, windowSize.y - 30.0F),
             ImGui::GetColorU32(
                 c::text::label::default_color.Value),
-            "Insert: show / hide | Home: reset timer | End / Del: close Vanta");
+            "Insert: show / hide | End / Del: close Vanta");
 
         g_menuPosition = ImGui::GetWindowPos();
         g_menuSize = ImGui::GetWindowSize();

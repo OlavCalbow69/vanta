@@ -287,6 +287,13 @@ namespace vanta
         int mergeProximity{10};
 
         CaptureController* capture{nullptr};
+        CaptureSubscription frameSubscription;
+        CaptureSubscription diagnosticSubscription;
+        std::jthread diagnosticWorker;
+        std::atomic_uint64_t previewVisibleUntil{0};
+        std::mutex previewMutex;
+        std::shared_ptr<const TargetDetectionResult> previewResult;
+        std::uint64_t previewGeneration{},previewSequence{};
         MakcuController*   makcu{nullptr};
         std::thread        workerThread;
         std::atomic_bool   running{false};
@@ -393,6 +400,7 @@ namespace vanta
                       snapShortStopMaximumPauseMilliseconds,
                       snapNewTargetDelayMinimumMilliseconds,
                       snapNewTargetDelayMaximumMilliseconds;
+                std::uint64_t outputGeneration{};
                 MovementMethod snapMovementMethod;
                 AxisMovementMode snapAxisMode;
                 ShortStopMode snapShortStopMode;
@@ -452,8 +460,12 @@ namespace vanta
                         newTargetDelayMinimumMilliseconds;
                     snapNewTargetDelayMaximumMilliseconds =
                         newTargetDelayMaximumMilliseconds;
+                    outputGeneration=settingsRevision.load();
                 }
 
+                if(makcu)makcu->SetInputPolicy(InputOwner::testMove,snapEnabled,outputGeneration,snapAimButton);
+                frameSubscription.Update({FrameRegionKind::configuredCapture,640,{},0,snapEnabled});
+                if(capture)capture->SetConsumerState("TestMove",false,snapEnabled ? "Waiting for activation" : "Disabled");
                 if (!snapEnabled)
                 {
                     state.store(TestMoveState::disabled);
@@ -469,6 +481,7 @@ namespace vanta
                 if (makcu == nullptr ||
                     !makcu->IsMouseButtonInputAvailable())
                 {
+                    if(capture)capture->SetConsumerState("TestMove",false,"Waiting for MAKCU physical-button input");
                     state.store(TestMoveState::waitingForMakcu);
                     targetVisible.store(false);
                     resetWind();
@@ -510,6 +523,7 @@ namespace vanta
                 previousAxisMode = snapAxisMode;
 
                 // Block until a fresh capture frame arrives
+                if(capture)capture->SetConsumerState("TestMove",true,"Processing while activation is held");
                 if (capture == nullptr)
                 {
                     state.store(TestMoveState::waitingForCapture);
@@ -518,17 +532,18 @@ namespace vanta
                     resetTargetTracking();
                     continue;
                 }
-                if (!capture->WaitForCenteredFrameWithMetadata(
-                        lastSequence,
-                        frame,
-                        frameMetadata,
-                        10))
+                CpuFrameSnapshot snapshot;
+                if (!frameSubscription.Wait(lastSequence,snapshot,10))
                 {
                     state.store(TestMoveState::waitingForCapture);
                     targetVisible.store(false);
                     resetWind();
                     continue;
                 }
+                frame=snapshot.bgra;
+                frameMetadata=snapshot.metadata;
+                CaptureWorkTimer workTimer(capture,"TestMove",frameMetadata);
+                CorrectionScope correction(makcu,InputOwner::testMove,outputGeneration);
                 sequence = frameMetadata.sequence;
                 lastSequence = sequence;
 
@@ -801,6 +816,7 @@ namespace vanta
                         static_cast<float>(bestDy) *
                         snapSpeed * snapSmooth);
 
+                    std::uint32_t outputAxes=InputLockX|InputLockY;
                     if (snapMovementMethod ==
                         MovementMethod::windMouse)
                     {
@@ -922,6 +938,7 @@ namespace vanta
                                     std::chrono::steady_clock::now() -
                                     hybridWindowStarted).count(),
                                 snapHybridVerticalTimeMilliseconds);
+                        outputAxes=verticalActive?InputLockX|InputLockY:InputLockX;
                         moveY = verticalActive
                             ? static_cast<int>(
                                 std::lround(
@@ -1033,8 +1050,14 @@ namespace vanta
                     if (std::abs(moveX) > snapDeadzone ||
                         std::abs(moveY) > snapDeadzone)
                     {
-                        if (makcu->TryMove(moveX, moveY))
+                        OutputContext output;output.owner=InputOwner::testMove;output.generation=outputGeneration;
+                        output.streamGeneration=frameMetadata.generation;output.streamSession=frameMetadata.session;output.sequence=frameMetadata.sequence;
+                        output.frameTimeUs=frameMetadata.timing.receivedUs?frameMetadata.timing.receivedUs:frameMetadata.timing.publishedUs;
+                        output.activation=snapAimButton;output.axes=outputAxes;
+                        output.isCurrent=[this,frameMetadata,outputGeneration]{return running.load() && settingsRevision.load()==outputGeneration && capture && capture->IsCurrent(frameMetadata);};
+                        if (capture->IsCurrent(frameMetadata) && makcu->TryMove(moveX,moveY,output))
                         {
+                            correction.Submitted();
                             movesMade.fetch_add(
                                 1, std::memory_order_relaxed);
                             trackedTargetX -= moveX;
@@ -1060,20 +1083,71 @@ namespace vanta
             vanta::log::Info("TestMove worker stopped");
         }
 
+        void DiagnosticLoop(std::stop_token stop)
+        {
+            std::uint64_t sequence{},lastRevision=~std::uint64_t{};
+            CpuFrameSnapshot input;
+            while(!stop.stop_requested())
+            {
+                TargetDetectionConfig settings;int colorTarget{},fov{},height{};std::uint64_t revision{};
+                { std::lock_guard lock(settingsMutex);settings=detector;colorTarget=hsvRangeIndex;fov=killFov;
+                    height=targetHeightPercent;revision=settingsRevision.load(); }
+                const bool visible=StreamNowUs()<previewVisibleUntil.load();
+                diagnosticSubscription.Update({FrameRegionKind::configuredCapture,640,{},60,visible && settings.enabled});
+                CpuFrameSnapshot fresh;
+                const bool updated=diagnosticSubscription.Wait(sequence,fresh,20,stop);
+                if(updated){input=std::move(fresh);sequence=input.metadata.sequence;}
+                if(!visible || !settings.enabled || input.bgra.empty() || (!updated && revision==lastRevision))continue;
+                try
+                {
+                    CaptureWorkTimer workTimer(capture,"Detector preview",input.metadata);
+                    cv::Mat bgr,hsv,mask;
+                    cv::cvtColor(input.bgra,bgr,cv::COLOR_BGRA2BGR);cv::cvtColor(bgr,hsv,cv::COLOR_BGR2HSV);
+                    BuildHsvMask(hsv,colorTarget,mask);
+                    if(ColorTarget(colorTarget).purpleBlacklist)
+                        for(int y=0;y<mask.rows;++y)for(int x=0;x<mask.cols;++x)
+                        {const auto p=bgr.at<cv::Vec3b>(y,x);if(Blacklist().contains(BgrKey(p[0],p[1],p[2])))mask.at<std::uint8_t>(y,x)=0;}
+                    const int radius=std::min(fov,std::max(0,std::min(input.bgra.cols/2,input.bgra.rows/2)-3));
+                    auto result=DetectTargets(mask,settings,{input.metadata.sourceWidth,input.metadata.sourceHeight,
+                        input.metadata.cropX,input.metadata.cropY},radius,height);
+                    lastRevision=revision;
+                    std::shared_ptr<const TargetDetectionResult> published=std::make_shared<TargetDetectionResult>(std::move(result));
+                    std::lock_guard lock(previewMutex);previewResult.swap(published);
+                    previewGeneration=input.metadata.generation;previewSequence=sequence;
+                }
+                catch(const std::exception& error){log::Warning("Detector preview: %s",error.what());}
+            }
+        }
+
         void Start()
         {
             if (running.load()) return;
             running.store(true, std::memory_order_release);
             workerThread =
-                std::thread(&Implementation::WorkerLoop, this);
+                std::thread([this]
+                {
+                    try{WorkerLoop();}
+                    catch(const std::exception& error){vanta::log::Error("TestMove worker failed: %s",error.what());}
+                    catch(...){vanta::log::Error("TestMove worker failed with an unknown exception");}
+                    running.store(false);threadAlive.store(false);
+                    if(makcu)makcu->CancelOutput(InputOwner::testMove);
+                });
+            diagnosticWorker=std::jthread([this](std::stop_token stop){DiagnosticLoop(stop);});
         }
 
         void Stop()
         {
             running.store(false, std::memory_order_release);
+            if(makcu)makcu->CancelOutput(InputOwner::testMove);
+            diagnosticWorker.request_stop();
+            if(diagnosticWorker.joinable())diagnosticWorker.join();
             if (workerThread.joinable())
                 workerThread.join();
+            if(makcu)makcu->CancelOutput(InputOwner::testMove);
+            frameSubscription.Update({FrameRegionKind::configuredCapture,640,{},0,false});
+            diagnosticSubscription.Update({FrameRegionKind::configuredCapture,640,{},60,false});
             state.store(TestMoveState::offline);
+            makcu=nullptr;capture=nullptr;
         }
     };
 
@@ -1096,6 +1170,8 @@ namespace vanta
     {
         auto& impl = *implementation_;
         impl.capture = capture;
+        if (capture) impl.frameSubscription=capture->Subscribe({FrameRegionKind::configuredCapture,640,{},0,false},"TestMove");
+        if (capture) impl.diagnosticSubscription=capture->Subscribe({FrameRegionKind::configuredCapture,640,{},60,false},"Detector preview");
         impl.makcu   = makcu;
         impl.Start();
         vanta::log::Info("TestMove controller initialized");
@@ -1241,32 +1317,15 @@ namespace vanta
                 ImGui::Checkbox("Detector preview (works without mouse output)", &impl.previewEnabled);
                 if (impl.previewEnabled && impl.detector.enabled && impl.capture)
                 {
-                    cv::Mat image;
-                    CapturedFrameMetadata metadata;
-                    if (impl.capture->WaitForCenteredFrameWithMetadata(0,image,metadata,0))
-                    {
-                        cv::Mat bgr,hsv,mask;
-                        cv::cvtColor(image,bgr,cv::COLOR_BGRA2BGR);
-                        cv::cvtColor(bgr,hsv,cv::COLOR_BGR2HSV);
-                        BuildHsvMask(hsv,impl.hsvRangeIndex,mask);
-                        if (ColorTarget(impl.hsvRangeIndex).purpleBlacklist)
-                            for (int y=0;y<mask.rows;++y)
-                                for (int x=0;x<mask.cols;++x)
-                                {
-                                    const auto p=bgr.at<cv::Vec3b>(y,x);
-                                    if (Blacklist().contains(BgrKey(p[0],p[1],p[2]))) mask.at<std::uint8_t>(y,x)=0;
-                                }
-                        const int previewFov=std::min(impl.killFov,
-                            std::max(0,std::min(image.cols/2,image.rows/2)-3));
-                        auto preview=DetectTargets(mask,impl.detector,
-                            {metadata.sourceWidth,metadata.sourceHeight,metadata.cropX,metadata.cropY},
-                            previewFov,impl.targetHeightPercent);
-                        RenderDetectionPreview(preview,impl.antiBelowObjects);
-                    }
+                    if(ImGui::IsRectVisible(ImVec2(std::max(1.0F,ImGui::GetContentRegionAvail().x),480)))impl.previewVisibleUntil=StreamNowUs()+100000;
+                    std::shared_ptr<const TargetDetectionResult> preview;
+                    {std::lock_guard lock(impl.previewMutex);CapturedFrameMetadata current;current.generation=impl.previewGeneration;
+                        if(impl.capture->IsCurrent(current))preview=impl.previewResult;}
+                    if(preview && !preview->mask.empty())RenderDetectionPreview(*preview,impl.antiBelowObjects);
                     else ImGui::TextDisabled("Waiting for a captured frame.");
                 }
                 settingsChanged |= custom::Checkbox(
-                    "Draw Kill FOV outline",
+                    "Show Kill FOV in Sunshine preview",
                     &impl.drawFovOutline);
                 if (impl.drawFovOutline)
                 {

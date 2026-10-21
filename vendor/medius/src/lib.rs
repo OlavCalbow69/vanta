@@ -1,0 +1,63 @@
+//! Rust library for Medius, replacement firmware for the MAKCU box.
+
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
+#![warn(missing_debug_implementations)]
+
+#[macro_use]
+mod trace;
+
+mod device;
+mod error;
+mod link;
+pub(crate) mod protocol;
+mod transport;
+pub mod types;
+
+#[cfg(feature = "mock")]
+mod mock;
+
+#[cfg(test)]
+mod tests;
+
+pub use device::Device;
+pub use device::catch::EventStream;
+pub use device::clip::ClipHandle;
+pub use device::closer::StreamCloser;
+pub use device::discover::BoxInfo;
+pub use device::input::InputStream;
+pub use device::logs::LogStream;
+pub use device::options::{BEARING_WINDOW_DEFAULT, EMIT_MAX_HZ, NAME_MAX};
+pub use device::raw::DEFAULT_TRANSFER_TIMEOUT;
+pub use error::{Error, Result};
+pub use link::{DEFAULT_KEEPALIVE_CADENCE, DEFAULT_QUERY_TIMEOUT};
+pub use protocol::MAX_PAYLOAD;
+pub use protocol::PROTO_VER;
+pub use protocol::opcode::{
+    CATCH_MAX_ENTRIES, CLIP_PKT_MATCH_POOL, CLIP_PKT_TRIG_MAX, LOCK_SCALE_BLOCK, LOCK_SCALE_MAX,
+    LOCK_SCALE_MIN, LOCK_SCALE_PASS, PATCH_MAX_ENTRIES, PKT_MATCH_MAX, REWRITE_MATCH_MAX,
+    REWRITE_MAX_ENTRIES, REWRITE_PAYLOAD_POOL, TRANSFORM_MAX_ENTRIES,
+};
+pub use protocol::{DecodedFrame, FrameType};
+pub use transport::scan::find_medius;
+pub use types::{
+    Action, Axis, Bearing, BearingMode, Blanket, BusEvent, Button, CLIP_EDGES_MAX, CLIP_ENTRY_MAX,
+    CLIP_RAW_MAX, Caps, Capture, CatchClass, CatchEntry, CatchEvent, CatchFilter, CatchState,
+    ChipFirmware, Class, ClipAction, ClipBuilder, ClipFrame, ClipPacketTrigger,
+    ClipPacketTriggerEntry, ClipSettings, ClipState, ClipStatus, ClipTrigger, ClockDomain,
+    ClockEstimate, ControlStatus, CountersSnapshot, DeviceInfo, DeviceKind, Direction,
+    DirectionMeaning, Edge, EmitPace, EmitPaceStatus, FirmwareInfo, Health, ImageState,
+    ImperfectStatus, Input, InputEvent, KbdCaps, Key, LedMode, LedTarget, LockEntry, LockScope,
+    LockTarget, Locks, LogLevel, LogLine, MediaKey, Motion, MotionEvent, MouseCaps, MoveTiming,
+    Patch, PatchEntry, PatchKey, PatchSection, PatchSet, PendingMotion, PortInfo, Rate,
+    RebootTarget, RenderMode, RenderStatus, RewriteAction, RewriteClass, RewriteEntry, RewriteKey,
+    RewriteRule, RewriteTable, Setup, SpreadStatus, Stamped, Stats, Timeline, Timestamped,
+    TrafficClass, TrafficEvent, TransferOutcome, TransferStatus, Transform, TransformKey,
+    TransformOp, Transforms, UpdateProgress, UpdateStatus, UpdateTarget, Usage, UsageSnapshot,
+    Version,
+};
+
+#[cfg(feature = "async")]
+pub use device::asyncv::{AsyncClipHandle, AsyncDevice};
+#[cfg(feature = "mock")]
+pub use mock::MockBox;

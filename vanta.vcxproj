@@ -54,7 +54,7 @@
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vendor\medius\medius-capi\include;$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
       <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -62,12 +62,14 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)work\medius-target\release;$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>medius_capi.lib;userenv.lib;ntdll.lib;avcodec.lib;avutil.lib;d3dcompiler.lib;strmiids.lib;ole32.lib;iphlpapi.lib;advapi32.lib;moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"</Command>
+      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"
+copy /Y "$(ProjectDir)assets\python-config.json" "$(OutDir)python-config.json"
+if errorlevel 2 exit /b 1</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -81,7 +83,7 @@
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)vendor\medius\medius-capi\include;$(ProjectDir)src;$(ProjectDir)resources;$(ProjectDir)vendor\imgui;$(ProjectDir)vendor\imgui\backends;$(ProjectDir)vendor\imgui\custom;$(ProjectDir)vendor\freetype\include;$(ProjectDir)vendor\opencv\include;$(ProjectDir)vendor\makcu-cpp\include;$(ProjectDir)vendor\moonlight-common-c\src;$(ProjectDir)work\vcpkg\installed\x64-windows-static\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WIN32_WINNT=0x0A00;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
       <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -91,17 +93,28 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalLibraryDirectories>$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;hid.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;gdiplus.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)work\medius-target\release;$(ProjectDir)vendor\freetype\lib\x64;$(ProjectDir)vendor\opencv\lib\x64;$(ProjectDir)work\moonlight-common-c-mt-build\Release;$(ProjectDir)work\moonlight-common-c-mt-build\enet\Release;$(ProjectDir)work\vcpkg\installed\x64-windows-static\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>medius_capi.lib;userenv.lib;ntdll.lib;avcodec.lib;avutil.lib;d3dcompiler.lib;strmiids.lib;ole32.lib;iphlpapi.lib;advapi32.lib;moonlight-common-c.lib;enet.lib;libssl.lib;libcrypto.lib;opencv_world500.lib;freetype.lib;setupapi.lib;d3d11.lib;dxgi.lib;dcomp.lib;dwmapi.lib;mfplat.lib;mf.lib;mfuuid.lib;wmcodecdspuuid.lib;windowsapp.lib;runtimeobject.lib;winhttp.lib;bcrypt.lib;crypt32.lib;winmm.lib;user32.lib;gdi32.lib;shell32.lib;ws2_32.lib;dnsapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/ignore:4099 %(AdditionalOptions)</AdditionalOptions>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"</Command>
+      <Command>copy /Y "$(ProjectDir)vendor\opencv\bin\x64\opencv_world500.dll" "$(OutDir)opencv_world500.dll"
+copy /Y "$(ProjectDir)assets\python-config.json" "$(OutDir)python-config.json"
+if errorlevel 2 exit /b 1</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\input_backend_utils.cpp" />
+    <ClCompile Include="src\medius_backend.cpp" />
+    <ClCompile Include="src\stream_frame.cpp" />
+    <ClCompile Include="src\capture_fixture.cpp" />
+    <ClCompile Include="src\preview_mask.cpp" />
     <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\bomb_timer_controller.cpp" />
+    <ClCompile Include="src\input_locks.cpp" />
+    <ClCompile Include="src\input_recovery.cpp" />
+    <ClCompile Include="src\python_bot.cpp" />
+    <ClCompile Include="src\python_bot_config.cpp" />
+    <ClCompile Include="src\python_bot_controller.cpp" />
     <ClCompile Include="src\capture_controller.cpp">
       <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
@@ -111,12 +124,12 @@
     <ClCompile Include="src\makcu_protocol_self_test.cpp" />
     <ClCompile Include="src\overlay_app.cpp" />
     <ClCompile Include="src\pretty_menu.cpp" />
-    <ClCompile Include="src\rp2040_controller.cpp" />
     <ClCompile Include="src\hardware_video_decoder.cpp">
       <DisableSpecificWarnings>4864;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <ClCompile Include="src\sunshine_pairing.cpp" />
     <ClCompile Include="src\stream_receiver_controller.cpp" />
+    <ClCompile Include="src\stream_diagnostics.cpp" />
     <ClCompile Include="src\testclick_controller.cpp" />
     <ClCompile Include="src\testmove_controller.cpp" />
     <ClCompile Include="src\color_targets.cpp" />
@@ -147,21 +160,28 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\input_backend_utils.hpp" />
+    <ClInclude Include="src\medius_backend.hpp" />
+    <ClInclude Include="src\stream_frame.hpp" />
+    <ClInclude Include="src\preview_mask.hpp" />
     <ClInclude Include="src\app_settings.hpp" />
-    <ClInclude Include="src\bomb_timer_controller.hpp" />
+    <ClInclude Include="src\python_bot.hpp" />
+    <ClInclude Include="src\python_bot_controller.hpp" />
     <ClInclude Include="src\config_manager.hpp" />
     <ClInclude Include="src\color_targets.hpp" />
     <ClInclude Include="src\target_detection.hpp" />
     <ClInclude Include="src\target_detection_ui.hpp" />
     <ClInclude Include="src\logger.hpp" />
     <ClInclude Include="src\makcu_controller.hpp" />
+    <ClInclude Include="src\input_locks.hpp" />
+    <ClInclude Include="src\input_recovery.hpp" />
     <ClInclude Include="src\capture_controller.hpp" />
     <ClInclude Include="src\overlay_app.hpp" />
     <ClInclude Include="src\pretty_menu.hpp" />
-    <ClInclude Include="src\rp2040_controller.hpp" />
     <ClInclude Include="src\hardware_video_decoder.hpp" />
     <ClInclude Include="src\sunshine_pairing.hpp" />
     <ClInclude Include="src\stream_receiver_controller.hpp" />
+    <ClInclude Include="src\stream_diagnostics.hpp" />
     <ClInclude Include="src\testclick_controller.hpp" />
     <ClInclude Include="src\testmove_controller.hpp" />
     <ClInclude Include="src\update_controller.hpp" />

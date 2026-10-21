@@ -1,0 +1,28 @@
+//! Mouse capabilities: the mouse half of the unified `RESP(CAPS)` (§4.4).
+
+/// Cloned mouse's capabilities, parsed from its HID report descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct MouseCaps {
+    /// Buttons the mouse report carries.
+    pub n_buttons: u8,
+    /// Relative X axis present.
+    pub has_x: bool,
+    /// Relative Y axis present.
+    pub has_y: bool,
+    /// Wheel present.
+    pub has_wheel: bool,
+    /// AC Pan (horizontal scroll) present.
+    pub pan: bool,
+    /// The mouse report sits behind a HID report ID.
+    pub has_report_id: bool,
+    /// Number of cloned HID interfaces (>1 = composite). 0 with nothing cloned or for a clone with no
+    /// HID interface; [`DeviceInfo::is_cloned`](crate::DeviceInfo::is_cloned) tells the two apart.
+    pub n_hid: u8,
+}
+
+impl MouseCaps {
+    /// Whether the clone is a composite (multi-HID-interface) device.
+    pub fn is_composite(&self) -> bool {
+        self.n_hid > 1
+    }
+}

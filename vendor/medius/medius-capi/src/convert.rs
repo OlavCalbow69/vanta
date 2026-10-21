@@ -1,0 +1,1435 @@
+//! Conversions between the safe `medius` types and the `#[repr(C)]` mirrors.
+
+use std::os::raw::c_char;
+use std::time::Duration;
+
+use medius::{
+    Action, Axis, Bearing, BearingMode, Blanket, BoxInfo, Button, Caps, CatchClass, CatchEntry,
+    CatchEvent, CatchFilter, CatchState, ChipFirmware, Class, ClipPacketTrigger,
+    ClipPacketTriggerEntry, ClipState, ClipStatus, ClockDomain, ClockEstimate, CountersSnapshot,
+    DeviceInfo, DeviceKind, Direction, EmitPace, EmitPaceStatus, FirmwareInfo, Health, ImageState,
+    ImperfectStatus, Input, InputEvent, KbdCaps, Key, LedMode, LedTarget, LockEntry, LockScope,
+    LockTarget, Locks, LogLevel, LogLine, MediaKey, Motion, MouseCaps, MoveTiming, Patch,
+    PatchEntry, PatchSection, PatchSet, PendingMotion, PortInfo, Rate, RebootTarget, RenderMode,
+    RenderStatus, RewriteAction, RewriteClass, RewriteEntry, RewriteRule, RewriteTable, Setup,
+    SpreadStatus, Stats, TrafficClass, TransferOutcome, Transform, TransformOp, Transforms, Usage,
+    Version,
+};
+
+use crate::ctypes::*;
+
+#[inline]
+fn b(v: bool) -> u8 {
+    v as u8
+}
+
+fn fill_cstr(dst: &mut [c_char], s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(dst.len().saturating_sub(1));
+    for (slot, &byte) in dst.iter_mut().zip(bytes.iter()).take(n) {
+        *slot = byte as c_char;
+    }
+    dst[n] = 0;
+}
+
+fn read_cstr(src: &[c_char]) -> String {
+    let bytes: Vec<u8> = src
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+// Every enum crosses as a byte: materialising a `#[repr(u8)]` enum from a caller's byte is
+// undefined behaviour before any check can run.
+
+fn kind_to_c(k: DeviceKind) -> u8 {
+    let k = match k {
+        DeviceKind::Unknown => MediusDeviceKind::Unknown,
+        DeviceKind::Keyboard => MediusDeviceKind::Keyboard,
+        DeviceKind::Mouse => MediusDeviceKind::Mouse,
+    };
+    k as u8
+}
+
+#[cfg(feature = "mock")]
+pub(crate) fn device_kind_from_c(v: u8) -> Option<DeviceKind> {
+    Some(match v {
+        0 => DeviceKind::Unknown,
+        1 => DeviceKind::Keyboard,
+        2 => DeviceKind::Mouse,
+        _ => return None,
+    })
+}
+
+pub(crate) fn action_from_c(v: u8) -> Option<Action> {
+    Some(match v {
+        0 => Action::SoftRelease,
+        1 => Action::Press,
+        2 => Action::ForceRelease,
+        _ => return None,
+    })
+}
+
+pub(crate) fn reboot_target_from_c(v: u8) -> Option<RebootTarget> {
+    Some(match v {
+        0 => RebootTarget::DeviceDownload,
+        1 => RebootTarget::HostDownload,
+        2 => RebootTarget::DeviceRun,
+        3 => RebootTarget::HostRun,
+        _ => return None,
+    })
+}
+
+pub(crate) fn led_target_from_c(v: u8) -> Option<LedTarget> {
+    Some(match v {
+        0 => LedTarget::Device,
+        1 => LedTarget::Host,
+        2 => LedTarget::Both,
+        _ => return None,
+    })
+}
+
+pub(crate) fn led_mode_from_c(v: u8) -> Option<LedMode> {
+    Some(match v {
+        0 => LedMode::Auto,
+        1 => LedMode::Off,
+        2 => LedMode::Solid,
+        3 => LedMode::Blink,
+        _ => return None,
+    })
+}
+
+pub(crate) fn move_timing_from_c(v: u8) -> Option<MoveTiming> {
+    Some(match v {
+        0 => MoveTiming::Ride,
+        1 => MoveTiming::Now,
+        _ => return None,
+    })
+}
+
+pub(crate) fn pending_motion_from_c(v: u8) -> Option<PendingMotion> {
+    Some(match v {
+        0 => PendingMotion::Keep,
+        1 => PendingMotion::Flush,
+        2 => PendingMotion::Discard,
+        _ => return None,
+    })
+}
+
+pub(crate) fn axis_from_c(v: u8) -> Option<Axis> {
+    Some(match v {
+        0 => Axis::X,
+        1 => Axis::Y,
+        2 => Axis::Wheel,
+        3 => Axis::Pan,
+        _ => return None,
+    })
+}
+
+pub(crate) fn edge_from_c(v: u8) -> Option<medius::Edge> {
+    Some(match v {
+        0 => medius::Edge::Both,
+        1 => medius::Edge::Press,
+        2 => medius::Edge::Release,
+        _ => return None,
+    })
+}
+
+pub(crate) fn clip_action_from_c(v: u8) -> Option<medius::ClipAction> {
+    Some(match v {
+        0 => medius::ClipAction::Start,
+        1 => medius::ClipAction::Stop,
+        2 => medius::ClipAction::Pause,
+        3 => medius::ClipAction::Resume,
+        4 => medius::ClipAction::Restart,
+        5 => medius::ClipAction::Toggle,
+        _ => return None,
+    })
+}
+
+#[cfg(feature = "mock")]
+pub(crate) fn clip_state_from_c(v: u8) -> Option<ClipState> {
+    Some(match v {
+        0 => ClipState::Idle,
+        1 => ClipState::Playing,
+        2 => ClipState::Paused,
+        3 => ClipState::Faulted,
+        _ => return None,
+    })
+}
+
+pub(crate) fn clock_domain_from_c(v: u8) -> Option<ClockDomain> {
+    Some(match v {
+        0 => ClockDomain::HostChip,
+        1 => ClockDomain::DeviceChip,
+        _ => return None,
+    })
+}
+
+/// A crate [`RenderMode`] to its `MediusRenderMode`.
+pub(crate) fn render_to_c(r: RenderMode) -> MediusRenderMode {
+    match r {
+        RenderMode::Off => MediusRenderMode::Off,
+        RenderMode::Stock => MediusRenderMode::Stock,
+        RenderMode::Despiked => MediusRenderMode::Despiked,
+        RenderMode::Unsmoothed => MediusRenderMode::Unsmoothed,
+    }
+}
+
+/// `(mode, hz)` to an [`EmitPace`]; `hz` matters only for `Fixed`.
+pub(crate) fn emit_pace_from_c(mode: u8, hz: u16) -> Option<EmitPace> {
+    Some(match mode {
+        0 => EmitPace::Learned,
+        1 => EmitPace::Interval,
+        2 => EmitPace::Fixed(hz),
+        _ => return None,
+    })
+}
+
+pub(crate) fn motion_from_c(v: MediusMotion) -> Option<Motion> {
+    Some(match v.kind {
+        0 => Motion::Cursor { dx: v.dx, dy: v.dy },
+        1 => Motion::Wheel(v.wheel),
+        2 => Motion::Pan(v.pan),
+        _ => return None,
+    })
+}
+
+impl From<Bearing> for MediusBearing {
+    fn from(b: Bearing) -> Self {
+        MediusBearing {
+            window_ms: b
+                .window
+                .map_or(0, |d| d.as_millis().min(u16::MAX as u128) as u16),
+            mode: match b.mode {
+                BearingMode::PerAxis => MediusBearingMode::PerAxis,
+                BearingMode::Vector => MediusBearingMode::Vector,
+            },
+        }
+    }
+}
+
+/// A `MEDIUS_BLANKET_*` byte to a [`Blanket`], or `None` for an unnamed value.
+pub(crate) fn blanket_from_c(v: u8) -> Option<Blanket> {
+    Some(match v {
+        0 => Blanket::Aim,
+        1 => Blanket::Wheel,
+        2 => Blanket::Buttons,
+        3 => Blanket::Keys,
+        4 => Blanket::Media,
+        _ => return None,
+    })
+}
+
+impl From<MediusLogLevel> for LogLevel {
+    fn from(v: MediusLogLevel) -> Self {
+        match v {
+            MediusLogLevel::Error => LogLevel::Error,
+            MediusLogLevel::Warn => LogLevel::Warn,
+            MediusLogLevel::Info => LogLevel::Info,
+            MediusLogLevel::Debug => LogLevel::Debug,
+            MediusLogLevel::Verbose => LogLevel::Verbose,
+        }
+    }
+}
+
+// `MediusLockTarget` to [`LockTarget`]; `None` for a `kind` no constant names or a `Usage` target
+// whose id does not fit its class.
+pub(crate) fn lock_target_to_medius(v: MediusLockTarget) -> Option<LockTarget> {
+    Some(match v.kind {
+        0 => LockTarget::Axis(Axis::X),
+        1 => LockTarget::Axis(Axis::Y),
+        2 => LockTarget::Axis(Axis::Wheel),
+        3 => LockTarget::Axis(Axis::Pan),
+        4 => LockTarget::Usage(input_to_medius(v.usage)?),
+        _ => return None,
+    })
+}
+
+// `MediusUsage` to a [`Usage`]; `None` for an unnamed `kind`, or a button/key id above 255.
+pub(crate) fn input_to_medius(v: MediusUsage) -> Option<Usage> {
+    Some(match Class::from_u8(v.kind)? {
+        Class::Button => Usage::from(Button::from_id(u8::try_from(v.id).ok()?)),
+        Class::Key => Usage::from(Key::new(u8::try_from(v.id).ok()?)),
+        Class::Media => Usage::from(MediaKey::new(v.id)),
+    })
+}
+
+pub(crate) fn usage_to_c(u: Usage) -> MediusUsage {
+    MediusUsage {
+        kind: u.class.as_u8(),
+        id: u.id,
+    }
+}
+
+fn lock_target_to_c(t: LockTarget) -> MediusLockTarget {
+    match t {
+        LockTarget::Axis(a) => axis_target(axis_lock_kind(a)),
+        LockTarget::Usage(u) => MediusLockTarget {
+            kind: MediusLockTargetKind::Usage as u8,
+            usage: usage_to_c(u),
+        },
+    }
+}
+
+/// The `MediusLockTargetKind` naming an axis; total over [`Axis`], since the four axis kinds share
+/// the `MediusAxis` values.
+fn axis_lock_kind(a: Axis) -> MediusLockTargetKind {
+    match a {
+        Axis::X => MediusLockTargetKind::X,
+        Axis::Y => MediusLockTargetKind::Y,
+        Axis::Wheel => MediusLockTargetKind::Wheel,
+        Axis::Pan => MediusLockTargetKind::Pan,
+    }
+}
+
+pub(crate) fn blank_usage() -> MediusUsage {
+    MediusUsage {
+        kind: MediusClass::Button as u8,
+        id: 0,
+    }
+}
+
+fn axis_target(kind: MediusLockTargetKind) -> MediusLockTarget {
+    MediusLockTarget {
+        kind: kind as u8,
+        usage: blank_usage(),
+    }
+}
+
+impl From<ChipFirmware> for MediusChipFirmware {
+    fn from(c: ChipFirmware) -> Self {
+        MediusChipFirmware {
+            major: c.major,
+            minor: c.minor,
+            patch: c.patch,
+            slot: c.slot,
+            state: match c.state {
+                ImageState::New => 0,
+                ImageState::PendingVerify => 1,
+                ImageState::Valid => 2,
+                ImageState::Invalid => 3,
+                ImageState::Aborted => 4,
+                ImageState::Unknown(v) => v,
+            },
+        }
+    }
+}
+
+impl From<FirmwareInfo> for MediusFirmwareInfo {
+    fn from(f: FirmwareInfo) -> Self {
+        MediusFirmwareInfo {
+            device: f.device.into(),
+            host_present: u8::from(f.host.is_some()),
+            host: f
+                .host
+                .unwrap_or(ChipFirmware {
+                    major: 0,
+                    minor: 0,
+                    patch: 0,
+                    slot: 0xFF,
+                    state: ImageState::Unknown(0xFF),
+                })
+                .into(),
+            slot_size: f.slot_size,
+            device_staged: u8::from(f.device_staged),
+            host_staged: u8::from(f.host_staged),
+        }
+    }
+}
+
+impl From<Version> for MediusVersion {
+    fn from(v: Version) -> Self {
+        let mut name = [0 as c_char; MEDIUS_MAX_NAME];
+        fill_cstr(&mut name, &v.name);
+        MediusVersion {
+            proto_ver: v.proto_ver,
+            fw_major: v.fw_major,
+            fw_minor: v.fw_minor,
+            fw_patch: v.fw_patch,
+            mac: v.mac,
+            name,
+        }
+    }
+}
+
+impl From<Health> for MediusHealth {
+    fn from(h: Health) -> Self {
+        MediusHealth {
+            link_up: b(h.link_up),
+            mouse_attached: b(h.mouse_attached),
+            clone_configured: b(h.clone_configured),
+            injection_active: b(h.injection_active),
+            rate_confident: b(h.rate_confident),
+            lock_on: b(h.lock_on),
+            catch_on: b(h.catch_on),
+            kbd_attached: b(h.kbd_attached),
+            rewrite_on: b(h.rewrite_on),
+            patch_on: b(h.patch_on),
+            transform_on: b(h.transform_on),
+        }
+    }
+}
+
+impl From<MouseCaps> for MediusMouseCaps {
+    fn from(c: MouseCaps) -> Self {
+        MediusMouseCaps {
+            n_buttons: c.n_buttons,
+            has_x: b(c.has_x),
+            has_y: b(c.has_y),
+            has_wheel: b(c.has_wheel),
+            pan: b(c.pan),
+            has_report_id: b(c.has_report_id),
+            n_hid: c.n_hid,
+        }
+    }
+}
+
+impl From<KbdCaps> for MediusKbdCaps {
+    fn from(c: KbdCaps) -> Self {
+        MediusKbdCaps {
+            n_keys: c.n_keys,
+            nkro: b(c.nkro),
+            has_consumer: b(c.has_consumer),
+            has_system: b(c.has_system),
+            has_report_id: b(c.has_report_id),
+        }
+    }
+}
+
+impl From<Caps> for MediusCaps {
+    fn from(c: Caps) -> Self {
+        MediusCaps {
+            mouse: c.mouse.into(),
+            keyboard: c.keyboard.into(),
+            mouse_change_driven: b(c.mouse_change_driven),
+            kbd_change_driven: b(c.kbd_change_driven),
+        }
+    }
+}
+
+impl From<DeviceInfo> for MediusDeviceInfo {
+    fn from(m: DeviceInfo) -> Self {
+        let mut product = [0 as c_char; MEDIUS_MAX_PRODUCT];
+        fill_cstr(&mut product, &m.product);
+        MediusDeviceInfo {
+            vid: m.vid,
+            pid: m.pid,
+            bcd_device: m.bcd_device,
+            bcd_usb: m.bcd_usb,
+            has_serial: b(m.has_serial),
+            has_bos: b(m.has_bos),
+            kind: kind_to_c(m.kind),
+            product,
+        }
+    }
+}
+
+impl From<Rate> for MediusRate {
+    fn from(r: Rate) -> Self {
+        MediusRate {
+            native_period_us: r.native_period_us,
+            poll_period_us: r.poll_period_us,
+            confident: b(r.confident),
+            change_driven: b(r.change_driven),
+        }
+    }
+}
+
+impl From<Stats> for MediusStats {
+    fn from(s: Stats) -> Self {
+        MediusStats {
+            inject_emits: s.inject_emits,
+            tx_drops: s.tx_drops,
+            tx_merges: s.tx_merges,
+            tx_maxdepth: s.tx_maxdepth,
+            tx_wedges: s.tx_wedges,
+            wakeups: s.wakeups,
+            reset_count: s.reset_count,
+            config_count: s.config_count,
+            link_rx_drops: s.link_rx_drops,
+            host_rx_drops: s.host_rx_drops,
+            relay_drops: s.relay_drops,
+            session: s.session,
+        }
+    }
+}
+
+impl From<Locks> for MediusLocks {
+    fn from(l: Locks) -> Self {
+        let blank = MediusLockEntry {
+            target: axis_target(MediusLockTargetKind::X),
+            is_blanket: false,
+            direction: MediusDirection::Both as u8,
+            scale: MEDIUS_LOCK_SCALE_PASS,
+        };
+        let mut out = MediusLocks {
+            n: 0,
+            entries: [blank; MEDIUS_MAX_LOCKS],
+        };
+        for e in l.entries() {
+            if out.n as usize >= MEDIUS_MAX_LOCKS {
+                break;
+            }
+            let (target, is_blanket) = match e.scope {
+                LockScope::Blanket(class) => {
+                    let target = MediusLockTarget {
+                        kind: MediusLockTargetKind::Usage as u8,
+                        usage: MediusUsage {
+                            kind: class.as_u8(),
+                            id: 0,
+                        },
+                    };
+                    (target, true)
+                }
+                LockScope::Target(t) => (lock_target_to_c(t), false),
+            };
+            out.entries[out.n as usize] = MediusLockEntry {
+                target,
+                is_blanket,
+                direction: e.direction.as_u8(),
+                scale: e.scale,
+            };
+            out.n += 1;
+        }
+        out
+    }
+}
+
+fn clock_domain_to_c(d: ClockDomain) -> MediusClockDomain {
+    match d {
+        ClockDomain::HostChip => MediusClockDomain::HostChip,
+        ClockDomain::DeviceChip => MediusClockDomain::DeviceChip,
+    }
+}
+
+/// A [`CatchFilter`] to the C struct, wildcards resolved to their sentinels.
+pub(crate) fn catch_filter_to_c(f: CatchFilter) -> MediusCatchFilter {
+    let (class, id) = f.wire();
+    MediusCatchFilter {
+        class,
+        id,
+        direction: f.direction().as_u8(),
+        capture: f.capture().as_u8(),
+    }
+}
+
+// The C struct back to a [`CatchFilter`]; `None` for an unknown class or direction, or the wildcard
+// class with a real id.
+pub(crate) fn catch_filter_from_c(f: MediusCatchFilter) -> Option<CatchFilter> {
+    CatchFilter::from_wire(f.class, f.id, f.direction, f.capture)
+}
+
+// A decoded [`InputEvent`] to the C struct, unused arms zeroed so `dx` on a press reads 0.
+pub(crate) fn input_event_to_c(e: InputEvent) -> MediusInputEvent {
+    let blank = blank_usage();
+    let (kind, usage, dx, dy, dz, pan) = match e.input {
+        Input::Press(u) => (MediusInputKind::Press, usage_to_c(u), 0, 0, 0, 0),
+        Input::Release(u) => (MediusInputKind::Release, usage_to_c(u), 0, 0, 0, 0),
+        Input::Motion { dx, dy, dz, pan } => (MediusInputKind::Motion, blank, dx, dy, dz, pan),
+    };
+    MediusInputEvent {
+        kind,
+        ts_us: e.ts_us,
+        clock: clock_domain_to_c(e.clock),
+        usage,
+        dx,
+        dy,
+        dz,
+        pan,
+    }
+}
+
+fn clock_estimate_to_c(c: ClockEstimate) -> MediusClockEstimate {
+    MediusClockEstimate {
+        offset_us: c.offset_us,
+        rate_ppb: c.rate_ppb.unwrap_or(MEDIUS_CLOCK_RATE_NONE),
+        delay_us: c.delay_us,
+        // Saturate one short of the sentinel so a real age can never read as "no estimate".
+        age_ms: c.age.map_or(MEDIUS_CLOCK_AGE_NONE, |d| {
+            d.as_millis().min(MEDIUS_CLOCK_AGE_NONE as u128 - 1) as u32
+        }),
+    }
+}
+
+fn clock_estimate_from_c(c: MediusClockEstimate) -> ClockEstimate {
+    ClockEstimate {
+        offset_us: c.offset_us,
+        rate_ppb: (c.rate_ppb != MEDIUS_CLOCK_RATE_NONE).then_some(c.rate_ppb),
+        delay_us: c.delay_us,
+        age: (c.age_ms != MEDIUS_CLOCK_AGE_NONE).then(|| Duration::from_millis(c.age_ms as u64)),
+    }
+}
+
+impl From<CatchState> for MediusCatchState {
+    fn from(c: CatchState) -> Self {
+        let blank = MediusCatchEntry {
+            filter: catch_filter_to_c(CatchFilter::everything()),
+            dropped: 0,
+        };
+        let mut entries = [blank; MEDIUS_MAX_CATCH_ENTRIES];
+        let n = c.entries.len().min(MEDIUS_MAX_CATCH_ENTRIES);
+        for (slot, e) in entries.iter_mut().zip(c.entries.iter()).take(n) {
+            *slot = MediusCatchEntry {
+                filter: catch_filter_to_c(e.filter),
+                dropped: e.dropped,
+            };
+        }
+        MediusCatchState {
+            table_full: b(c.table_full),
+            dropped: c.dropped,
+            clock: clock_estimate_to_c(c.clock),
+            n: n as u16,
+            entries,
+        }
+    }
+}
+
+impl From<ImperfectStatus> for MediusImperfectStatus {
+    fn from(s: ImperfectStatus) -> Self {
+        MediusImperfectStatus {
+            allowed: b(s.allowed),
+            over_capacity: b(s.over_capacity),
+            clone_imperfect: b(s.clone_imperfect),
+        }
+    }
+}
+
+// Advanced control layer (§3.14): raw injection, control transfers, rewrite rules, descriptor
+// patches.
+
+// A read-only byte slice from a caller pointer and length.
+pub(crate) unsafe fn opt_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        Some(&[])
+    } else if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+
+/// A [`Setup`] from its C mirror. Every field is raw, so this never fails.
+pub(crate) fn setup_from_c(c: MediusSetup) -> Setup {
+    Setup {
+        request_type: c.request_type,
+        request: c.request,
+        value: c.value,
+        index: c.index,
+        length: c.length,
+    }
+}
+
+impl From<TransferOutcome> for MediusTransferOutcome {
+    fn from(o: TransferOutcome) -> Self {
+        let mut data = [0u8; MEDIUS_MAX_DEV_PAYLOAD];
+        let n = o.data.len().min(MEDIUS_MAX_DEV_PAYLOAD);
+        data[..n].copy_from_slice(&o.data[..n]);
+        MediusTransferOutcome {
+            status: o.status.as_u8(),
+            len: n as u16,
+            data,
+        }
+    }
+}
+
+// `len` bytes of a match or mask array, zero-filled past its end so the length checks see the
+// declared length.
+fn match_field(bytes: &[u8], len: u16) -> Vec<u8> {
+    let len = len as usize;
+    let mut v = bytes[..len.min(bytes.len())].to_vec();
+    v.resize(len, 0);
+    v
+}
+
+// A `MediusRewriteRule` to a [`RewriteRule`]; `None` for a class, action or direction byte no
+// constant names.
+pub(crate) fn rewrite_rule_from_c(c: &MediusRewriteRule) -> Option<RewriteRule> {
+    let pl = (c.payload_len as usize).min(MEDIUS_MAX_DEV_PAYLOAD);
+    Some(RewriteRule {
+        class: RewriteClass::from_u8(c.class)?,
+        id: c.id,
+        direction: Direction::from_u8(c.direction)?,
+        action: RewriteAction::from_u8(c.action)?,
+        offset: c.offset,
+        match_bytes: match_field(&c.match_bytes, c.match_len),
+        mask: match_field(&c.mask, c.mask_len),
+        payload: c.payload[..pl].to_vec(),
+    })
+}
+
+impl From<RewriteRule> for MediusRewriteRule {
+    fn from(r: RewriteRule) -> Self {
+        let mut match_bytes = [0u8; MEDIUS_MAX_REWRITE_MATCH];
+        let ml = r.match_bytes.len().min(MEDIUS_MAX_REWRITE_MATCH);
+        match_bytes[..ml].copy_from_slice(&r.match_bytes[..ml]);
+        let mut mask = [0u8; MEDIUS_MAX_REWRITE_MATCH];
+        let msl = r.mask.len().min(MEDIUS_MAX_REWRITE_MATCH);
+        mask[..msl].copy_from_slice(&r.mask[..msl]);
+        let mut payload = [0u8; MEDIUS_MAX_DEV_PAYLOAD];
+        let pl = r.payload.len().min(MEDIUS_MAX_DEV_PAYLOAD);
+        payload[..pl].copy_from_slice(&r.payload[..pl]);
+        MediusRewriteRule {
+            class: r.class.as_u8(),
+            id: r.id,
+            direction: r.direction.as_u8(),
+            action: r.action.as_u8(),
+            offset: r.offset,
+            match_len: ml as u16,
+            mask_len: msl as u16,
+            payload_len: pl as u16,
+            match_bytes,
+            mask,
+            payload,
+        }
+    }
+}
+
+fn rewrite_entry_to_c(e: &RewriteEntry) -> MediusRewriteEntry {
+    MediusRewriteEntry {
+        class: e.class.as_u8(),
+        id: e.id,
+        direction: e.direction.as_u8(),
+        action: e.action.as_u8(),
+        match_len: e.match_len,
+        offset: e.offset,
+        payload_len: e.payload_len,
+        hits: e.hits,
+    }
+}
+
+impl From<RewriteTable> for MediusRewriteTable {
+    fn from(t: RewriteTable) -> Self {
+        let blank = MediusRewriteEntry {
+            class: 0,
+            id: 0,
+            direction: 0,
+            action: 0,
+            match_len: 0,
+            offset: 0,
+            payload_len: 0,
+            hits: 0,
+        };
+        let mut entries = [blank; MEDIUS_MAX_REWRITE_ENTRIES];
+        let n = t.entries.len().min(MEDIUS_MAX_REWRITE_ENTRIES);
+        for (slot, e) in entries.iter_mut().zip(t.entries.iter()).take(n) {
+            *slot = rewrite_entry_to_c(e);
+        }
+        MediusRewriteTable {
+            table_full: b(t.table_full),
+            generation: t.generation,
+            n: n as u16,
+            entries,
+        }
+    }
+}
+
+// A `MediusPatch` to a [`Patch`]; `None` for a section byte no constant names and for the
+// `APPLY`/`CLEAR` verbs.
+pub(crate) fn patch_from_c(c: &MediusPatch) -> Option<Patch> {
+    let n = (c.len as usize).min(MEDIUS_MAX_DEV_PAYLOAD);
+    Some(Patch {
+        section: PatchSection::from_u8(c.section)?,
+        cfg: c.cfg,
+        index: c.index,
+        offset: c.offset,
+        bytes: c.bytes[..n].to_vec(),
+    })
+}
+
+impl From<Patch> for MediusPatch {
+    fn from(p: Patch) -> Self {
+        let mut bytes = [0u8; MEDIUS_MAX_DEV_PAYLOAD];
+        let n = p.bytes.len().min(MEDIUS_MAX_DEV_PAYLOAD);
+        bytes[..n].copy_from_slice(&p.bytes[..n]);
+        MediusPatch {
+            section: p.section.as_u8(),
+            cfg: p.cfg,
+            index: p.index,
+            offset: p.offset,
+            len: n as u16,
+            bytes,
+        }
+    }
+}
+
+fn patch_entry_to_c(e: &PatchEntry) -> MediusPatchEntry {
+    MediusPatchEntry {
+        section: e.section.as_u8(),
+        cfg: e.cfg,
+        index: e.index,
+        offset: e.offset,
+        len: e.len,
+    }
+}
+
+impl From<PatchSet> for MediusPatchSet {
+    fn from(s: PatchSet) -> Self {
+        let blank = MediusPatchEntry {
+            section: 0,
+            cfg: 0,
+            index: 0,
+            offset: 0,
+            len: 0,
+        };
+        let mut entries = [blank; MEDIUS_MAX_PATCH_ENTRIES];
+        let n = s.entries.len().min(MEDIUS_MAX_PATCH_ENTRIES);
+        for (slot, e) in entries.iter_mut().zip(s.entries.iter()).take(n) {
+            *slot = patch_entry_to_c(e);
+        }
+        MediusPatchSet {
+            applied: b(s.applied),
+            pending: b(s.pending),
+            refused: b(s.refused),
+            table_full: b(s.table_full),
+            n: n as u16,
+            entries,
+        }
+    }
+}
+
+// A `MediusTransform` to a [`Transform`]; `None` for an op, source or dest byte no constant names.
+// Transforms address fields as locks do, so both cross as a `MediusLockTarget`.
+pub(crate) fn transform_from_c(c: &MediusTransform) -> Option<Transform> {
+    Some(Transform {
+        op: TransformOp::from_u8(c.op)?,
+        source: lock_target_to_medius(c.source)?,
+        dest: lock_target_to_medius(c.dest)?,
+    })
+}
+
+fn transform_to_c(t: &Transform) -> MediusTransform {
+    MediusTransform {
+        op: t.op.as_u8(),
+        source: lock_target_to_c(t.source),
+        dest: lock_target_to_c(t.dest),
+    }
+}
+
+impl From<Transforms> for MediusTransforms {
+    fn from(t: Transforms) -> Self {
+        let blank = MediusTransform {
+            op: 0,
+            source: axis_target(MediusLockTargetKind::X),
+            dest: axis_target(MediusLockTargetKind::X),
+        };
+        let mut entries = [blank; MEDIUS_MAX_TRANSFORM_ENTRIES];
+        let n = t.entries.len().min(MEDIUS_MAX_TRANSFORM_ENTRIES);
+        for (slot, e) in entries.iter_mut().zip(t.entries.iter()).take(n) {
+            *slot = transform_to_c(e);
+        }
+        MediusTransforms {
+            table_full: b(t.table_full),
+            n: n as u16,
+            entries,
+        }
+    }
+}
+
+fn clip_state_to_c(s: ClipState) -> u8 {
+    let s = match s {
+        ClipState::Idle => MediusClipState::Idle,
+        ClipState::Playing => MediusClipState::Playing,
+        ClipState::Paused => MediusClipState::Paused,
+        ClipState::Faulted => MediusClipState::Faulted,
+    };
+    s as u8
+}
+
+// Out structs are zeroed whole, then written field by field, so every byte a caller reads is
+// defined, padding included.
+fn write_usage(dst: &mut MediusUsage, u: Usage) {
+    dst.kind = u.class.as_u8();
+    dst.id = u.id;
+}
+
+// Write `s` to `*out`, which must be valid for a write of one `MediusClipStatus`.
+pub(crate) unsafe fn clip_status_to_c(s: &ClipStatus, out: *mut MediusClipStatus) {
+    unsafe { std::ptr::write_bytes(out, 0, 1) };
+    let c = unsafe { &mut *out };
+    c.state = clip_state_to_c(s.state);
+    c.free = s.free;
+    c.total = s.total;
+    c.played = s.played;
+    c.ticks = s.ticks;
+    c.underruns = s.underruns;
+    c.overruns = s.overruns;
+    c.seq_gaps = s.seq_gaps;
+    c.xfers = s.xfers;
+    c.xfer_errs = s.xfer_errs;
+    c.gated = s.gated;
+    c.held_n = s.held.len().min(MEDIUS_MAX_USAGES) as u16;
+    for (slot, u) in c.held.iter_mut().zip(&s.held) {
+        write_usage(slot, *u);
+    }
+}
+
+pub(crate) fn traffic_class_from_c(v: u8) -> Option<TrafficClass> {
+    TrafficClass::try_from(CatchClass::from_u8(v)?).ok()
+}
+
+// A `MediusClipPacketTrigger`'s `(class, id, direction, match, mask)` key, as a trigger driving
+// `action`; `None` for a class or direction byte no constant names.
+fn clip_packet_key_from_c(
+    c: &MediusClipPacketTrigger,
+    action: medius::ClipAction,
+) -> Option<ClipPacketTrigger> {
+    Some(
+        ClipPacketTrigger::new(
+            traffic_class_from_c(c.class)?,
+            c.id,
+            Direction::from_u8(c.direction)?,
+            action,
+        )
+        .matching(
+            match_field(&c.match_bytes, c.match_len),
+            match_field(&c.mask, c.mask_len),
+        ),
+    )
+}
+
+// A `MediusClipPacketTrigger` to a [`ClipPacketTrigger`]; `None` for a class, direction or action
+// byte no constant names. `hits` is filled by the read-back; bind does not send it.
+pub(crate) fn clip_packet_trigger_from_c(c: &MediusClipPacketTrigger) -> Option<ClipPacketTrigger> {
+    let mut t = clip_packet_key_from_c(c, clip_action_from_c(c.action)?)?;
+    t.consume = c.consume != 0;
+    t.once_per_run = c.once_per_run != 0;
+    t.selector_len = c.selector_len;
+    Some(t)
+}
+
+// The trigger `medius_clip_unbind_packet` removes: the key alone, whatever the other bytes hold.
+pub(crate) fn clip_packet_unbind_from_c(c: &MediusClipPacketTrigger) -> Option<ClipPacketTrigger> {
+    clip_packet_key_from_c(c, medius::ClipAction::Start)
+}
+
+// Write `e` into `c`, a zeroed slot. The lengths are at most the array's.
+fn write_clip_packet_trigger(c: &mut MediusClipPacketTrigger, e: &ClipPacketTriggerEntry) {
+    let t = &e.trigger;
+    let ml = t.match_bytes.len().min(MEDIUS_MAX_PKT_MATCH);
+    c.match_bytes[..ml].copy_from_slice(&t.match_bytes[..ml]);
+    let msl = t.mask.len().min(MEDIUS_MAX_PKT_MATCH);
+    c.mask[..msl].copy_from_slice(&t.mask[..msl]);
+    c.class = t.class.as_u8();
+    c.id = t.id;
+    c.direction = t.direction.as_u8();
+    c.action = clip_action_to_c(t.action);
+    c.consume = b(t.consume);
+    c.once_per_run = b(t.once_per_run);
+    c.selector_len = t.selector_len;
+    c.match_len = ml as u16;
+    c.mask_len = msl as u16;
+    c.hits = e.hits;
+}
+
+// Write `s` to `*out`, which must be valid for one `MediusClipSettings` write: autolock as a
+// `CLIP_LOCK_*` bitmask, each trigger kind into its fixed array. A slot past its count reads zero.
+pub(crate) unsafe fn clip_settings_to_c(s: &medius::ClipSettings, out: *mut MediusClipSettings) {
+    unsafe { std::ptr::write_bytes(out, 0, 1) };
+    let c = unsafe { &mut *out };
+    c.autolock_bits = s.autolock.iter().fold(0u8, |m, b| m | blanket_bit(*b));
+    c.loop_ = b(s.loop_);
+    c.retain = b(s.retain);
+    c.finalized = b(s.finalized);
+    c.ride = b(s.ride);
+    c.n = s.triggers.len().min(MEDIUS_CLIP_TRIG_MAX) as u8;
+    for (slot, t) in c.triggers.iter_mut().zip(&s.triggers) {
+        write_usage(&mut slot.on, t.on);
+        slot.edge = edge_to_c(t.edge);
+        slot.action = clip_action_to_c(t.action);
+        slot.consume = b(t.consume);
+    }
+    c.packet_n = s.packet_triggers.len().min(MEDIUS_CLIP_PKT_TRIG_MAX) as u8;
+    for (slot, e) in c.packet_triggers.iter_mut().zip(&s.packet_triggers) {
+        write_clip_packet_trigger(slot, e);
+    }
+}
+
+fn edge_to_c(e: medius::Edge) -> u8 {
+    let e = match e {
+        medius::Edge::Both => MediusEdge::Both,
+        medius::Edge::Press => MediusEdge::Press,
+        medius::Edge::Release => MediusEdge::Release,
+    };
+    e as u8
+}
+
+pub(crate) fn clip_action_to_c(a: medius::ClipAction) -> u8 {
+    let a = match a {
+        medius::ClipAction::Start => MediusClipAction::Start,
+        medius::ClipAction::Stop => MediusClipAction::Stop,
+        medius::ClipAction::Pause => MediusClipAction::Pause,
+        medius::ClipAction::Resume => MediusClipAction::Resume,
+        medius::ClipAction::Restart => MediusClipAction::Restart,
+        medius::ClipAction::Toggle => MediusClipAction::Toggle,
+    };
+    a as u8
+}
+
+/// A blanket group's `CLIP_LOCK_*` scope bit.
+fn blanket_bit(b: Blanket) -> u8 {
+    match b {
+        Blanket::Aim => 0x01,
+        Blanket::Wheel => 0x02,
+        Blanket::Buttons => 0x04,
+        Blanket::Keys => 0x08,
+        Blanket::Media => 0x10,
+    }
+}
+
+// Clip settings from the C struct, the inverse of [`clip_settings_to_c`].
+#[cfg(feature = "mock")]
+pub(crate) fn clip_settings_from_c(c: &MediusClipSettings) -> medius::ClipSettings {
+    let n = (c.n as usize).min(MEDIUS_CLIP_TRIG_MAX);
+    let triggers = c.triggers[..n]
+        .iter()
+        .filter_map(|t| {
+            Some(medius::ClipTrigger {
+                on: input_to_medius(t.on)?,
+                edge: edge_from_c(t.edge)?,
+                action: clip_action_from_c(t.action)?,
+                consume: t.consume != 0,
+            })
+        })
+        .collect();
+    let packet_n = (c.packet_n as usize).min(MEDIUS_CLIP_PKT_TRIG_MAX);
+    let packet_triggers = c.packet_triggers[..packet_n]
+        .iter()
+        .filter_map(|t| {
+            Some(ClipPacketTriggerEntry {
+                trigger: clip_packet_trigger_from_c(t)?,
+                hits: t.hits,
+            })
+        })
+        .collect();
+    let autolock = [
+        Blanket::Aim,
+        Blanket::Wheel,
+        Blanket::Buttons,
+        Blanket::Keys,
+        Blanket::Media,
+    ]
+    .into_iter()
+    .filter(|&b| c.autolock_bits & blanket_bit(b) != 0)
+    .collect();
+    medius::ClipSettings {
+        autolock,
+        loop_: c.loop_ != 0,
+        retain: c.retain != 0,
+        finalized: c.finalized != 0,
+        ride: c.ride != 0,
+        triggers,
+        packet_triggers,
+    }
+}
+
+/// The C struct back to a [`ClipStatus`]; `None` for a `state` no constant names.
+#[cfg(feature = "mock")]
+pub(crate) fn clip_status_from_c(s: MediusClipStatus) -> Option<ClipStatus> {
+    let n = (s.held_n as usize).min(MEDIUS_MAX_USAGES);
+    let held = s.held[..n]
+        .iter()
+        .filter_map(|&u| input_to_medius(u))
+        .collect();
+    Some(ClipStatus {
+        state: clip_state_from_c(s.state)?,
+        free: s.free,
+        total: s.total,
+        played: s.played,
+        ticks: s.ticks,
+        underruns: s.underruns,
+        overruns: s.overruns,
+        seq_gaps: s.seq_gaps,
+        xfers: s.xfers,
+        xfer_errs: s.xfer_errs,
+        gated: s.gated,
+        held,
+    })
+}
+
+impl From<EmitPaceStatus> for MediusEmitPaceStatus {
+    fn from(s: EmitPaceStatus) -> Self {
+        let (mode, fixed_hz) = match s.mode {
+            EmitPace::Learned => (MediusEmitMode::Learned, 0),
+            EmitPace::Interval => (MediusEmitMode::Interval, 0),
+            EmitPace::Fixed(hz) => (MediusEmitMode::Fixed, hz),
+        };
+        MediusEmitPaceStatus {
+            mode,
+            fixed_hz,
+            resolved_hz: s.resolved_hz,
+            force_hz: s.force_hz.unwrap_or(0),
+            advertised_hz: s.advertised_hz,
+            force_active: s.force_active as u8,
+        }
+    }
+}
+
+impl From<RenderStatus> for MediusRenderStatus {
+    fn from(s: RenderStatus) -> Self {
+        MediusRenderStatus {
+            mode: render_to_c(s.mode),
+            full: s.full as u8,
+            ready: s.ready as u8,
+        }
+    }
+}
+
+impl From<SpreadStatus> for MediusSpreadStatus {
+    fn from(s: SpreadStatus) -> Self {
+        MediusSpreadStatus {
+            percent: s.percent,
+            span_us: s.span_us,
+        }
+    }
+}
+
+impl From<CountersSnapshot> for MediusCountersSnapshot {
+    fn from(c: CountersSnapshot) -> Self {
+        MediusCountersSnapshot {
+            frames_tx: c.frames_tx,
+            frames_rx: c.frames_rx,
+            crc_drops: c.crc_drops,
+            reconnects: c.reconnects,
+            restarts: c.restarts,
+        }
+    }
+}
+
+impl From<LogLevel> for MediusLogLevel {
+    fn from(l: LogLevel) -> Self {
+        match l {
+            LogLevel::Error => MediusLogLevel::Error,
+            LogLevel::Warn => MediusLogLevel::Warn,
+            LogLevel::Info => MediusLogLevel::Info,
+            LogLevel::Debug => MediusLogLevel::Debug,
+            LogLevel::Verbose => MediusLogLevel::Verbose,
+        }
+    }
+}
+
+impl From<CatchEvent> for MediusCatchEvent {
+    fn from(e: CatchEvent) -> Self {
+        match e {
+            CatchEvent::Motion(m) => MediusCatchEvent {
+                kind: MediusCatchEventKind::Motion,
+                ts_us: m.ts_us,
+                clock: clock_domain_to_c(m.clock),
+                data: MediusCatchEventData {
+                    motion: MediusMotionEvent {
+                        dx: m.dx,
+                        dy: m.dy,
+                        dz: m.dz,
+                        pan: m.pan,
+                    },
+                },
+            },
+            CatchEvent::Usages(s) => {
+                let mut usages = [blank_usage(); MEDIUS_MAX_USAGES];
+                let n = s.usages.len().min(MEDIUS_MAX_USAGES);
+                for (slot, u) in usages.iter_mut().zip(s.usages.iter()).take(n) {
+                    *slot = usage_to_c(*u);
+                }
+                MediusCatchEvent {
+                    kind: MediusCatchEventKind::Usages,
+                    ts_us: s.ts_us,
+                    clock: clock_domain_to_c(s.clock),
+                    data: MediusCatchEventData {
+                        usages: MediusUsageEvent {
+                            class: s.class.as_u8(),
+                            direction: s.direction.as_u8(),
+                            n: n as u16,
+                            usages,
+                        },
+                    },
+                }
+            }
+            CatchEvent::Traffic(t) => {
+                let mut bytes = [0u8; MEDIUS_MAX_TRAFFIC_BYTES];
+                let n = t.bytes.len().min(MEDIUS_MAX_TRAFFIC_BYTES);
+                bytes[..n].copy_from_slice(&t.bytes[..n]);
+                MediusCatchEvent {
+                    kind: MediusCatchEventKind::Traffic,
+                    ts_us: t.ts_us,
+                    clock: clock_domain_to_c(t.clock),
+                    data: MediusCatchEventData {
+                        traffic: MediusTrafficEvent {
+                            class: t.class.as_u8(),
+                            id: t.id,
+                            direction: t.direction.as_u8(),
+                            flags: t.flags,
+                            true_len: t.true_len,
+                            len: n as u16,
+                            bytes,
+                        },
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl From<&LogLine> for MediusLogLine {
+    fn from(l: &LogLine) -> Self {
+        let mut text = [0 as c_char; MEDIUS_MAX_LOG_TEXT];
+        fill_cstr(&mut text, &l.text);
+        MediusLogLine {
+            level: l.level.into(),
+            text,
+        }
+    }
+}
+
+#[inline]
+fn nz(v: u8) -> bool {
+    v != 0
+}
+
+impl From<MediusVersion> for Version {
+    fn from(v: MediusVersion) -> Self {
+        Version {
+            proto_ver: v.proto_ver,
+            fw_major: v.fw_major,
+            fw_minor: v.fw_minor,
+            fw_patch: v.fw_patch,
+            mac: v.mac,
+            name: read_cstr(&v.name),
+        }
+    }
+}
+
+impl From<MediusHealth> for Health {
+    fn from(h: MediusHealth) -> Self {
+        Health {
+            link_up: nz(h.link_up),
+            mouse_attached: nz(h.mouse_attached),
+            clone_configured: nz(h.clone_configured),
+            injection_active: nz(h.injection_active),
+            rate_confident: nz(h.rate_confident),
+            lock_on: nz(h.lock_on),
+            catch_on: nz(h.catch_on),
+            kbd_attached: nz(h.kbd_attached),
+            rewrite_on: nz(h.rewrite_on),
+            patch_on: nz(h.patch_on),
+            transform_on: nz(h.transform_on),
+        }
+    }
+}
+
+impl From<MediusMouseCaps> for MouseCaps {
+    fn from(c: MediusMouseCaps) -> Self {
+        MouseCaps {
+            n_buttons: c.n_buttons,
+            has_x: nz(c.has_x),
+            has_y: nz(c.has_y),
+            has_wheel: nz(c.has_wheel),
+            pan: nz(c.pan),
+            has_report_id: nz(c.has_report_id),
+            n_hid: c.n_hid,
+        }
+    }
+}
+
+impl From<MediusKbdCaps> for KbdCaps {
+    fn from(c: MediusKbdCaps) -> Self {
+        KbdCaps {
+            n_keys: c.n_keys,
+            nkro: nz(c.nkro),
+            has_consumer: nz(c.has_consumer),
+            has_system: nz(c.has_system),
+            has_report_id: nz(c.has_report_id),
+        }
+    }
+}
+
+impl From<MediusCaps> for Caps {
+    fn from(c: MediusCaps) -> Self {
+        Caps {
+            mouse: c.mouse.into(),
+            keyboard: c.keyboard.into(),
+            mouse_change_driven: nz(c.mouse_change_driven),
+            kbd_change_driven: nz(c.kbd_change_driven),
+        }
+    }
+}
+
+/// The C struct back to a [`DeviceInfo`]; `None` for a `kind` no constant names.
+#[cfg(feature = "mock")]
+pub(crate) fn device_info_from_c(m: MediusDeviceInfo) -> Option<DeviceInfo> {
+    Some(DeviceInfo {
+        vid: m.vid,
+        pid: m.pid,
+        bcd_device: m.bcd_device,
+        bcd_usb: m.bcd_usb,
+        has_serial: nz(m.has_serial),
+        has_bos: nz(m.has_bos),
+        kind: device_kind_from_c(m.kind)?,
+        product: read_cstr(&m.product),
+    })
+}
+
+impl From<MediusRate> for Rate {
+    fn from(r: MediusRate) -> Self {
+        Rate {
+            native_period_us: r.native_period_us,
+            poll_period_us: r.poll_period_us,
+            confident: nz(r.confident),
+            change_driven: nz(r.change_driven),
+        }
+    }
+}
+
+impl From<MediusStats> for Stats {
+    fn from(s: MediusStats) -> Self {
+        Stats {
+            inject_emits: s.inject_emits,
+            tx_drops: s.tx_drops,
+            tx_merges: s.tx_merges,
+            tx_maxdepth: s.tx_maxdepth,
+            tx_wedges: s.tx_wedges,
+            wakeups: s.wakeups,
+            reset_count: s.reset_count,
+            config_count: s.config_count,
+            link_rx_drops: s.link_rx_drops,
+            host_rx_drops: s.host_rx_drops,
+            relay_drops: s.relay_drops,
+            session: s.session,
+        }
+    }
+}
+
+impl From<MediusLocks> for Locks {
+    fn from(l: MediusLocks) -> Self {
+        let n = (l.n as usize).min(MEDIUS_MAX_LOCKS);
+        let entries = l.entries[..n]
+            .iter()
+            .filter_map(|e| {
+                let scope = if e.is_blanket {
+                    LockScope::Blanket(Class::from_u8(e.target.usage.kind)?)
+                } else {
+                    LockScope::Target(lock_target_to_medius(e.target)?)
+                };
+                Some(LockEntry {
+                    scope,
+                    direction: Direction::from_u8(e.direction)?,
+                    scale: e.scale,
+                })
+            })
+            .collect();
+        Locks::from_entries(entries)
+    }
+}
+
+impl From<MediusCatchState> for CatchState {
+    fn from(c: MediusCatchState) -> Self {
+        let n = (c.n as usize).min(MEDIUS_MAX_CATCH_ENTRIES);
+        let entries = c.entries[..n]
+            .iter()
+            .filter_map(|e| {
+                Some(CatchEntry {
+                    filter: catch_filter_from_c(e.filter)?,
+                    dropped: e.dropped,
+                })
+            })
+            .collect();
+        CatchState {
+            table_full: nz(c.table_full),
+            dropped: c.dropped,
+            clock: clock_estimate_from_c(c.clock),
+            entries,
+        }
+    }
+}
+
+impl From<MediusImperfectStatus> for ImperfectStatus {
+    fn from(s: MediusImperfectStatus) -> Self {
+        ImperfectStatus {
+            allowed: nz(s.allowed),
+            over_capacity: nz(s.over_capacity),
+            clone_imperfect: nz(s.clone_imperfect),
+        }
+    }
+}
+
+/// The held usages of a `MediusUsageEvent` as a `Usage` list; invalid entries are dropped.
+#[cfg(feature = "mock")]
+pub(crate) fn usage_event_to_medius(e: &MediusUsageEvent) -> Vec<Usage> {
+    let n = (e.n as usize).min(MEDIUS_MAX_USAGES);
+    e.usages[..n]
+        .iter()
+        .filter_map(|&u| input_to_medius(u))
+        .collect()
+}
+
+#[cfg(feature = "mock")]
+impl From<medius::FrameType> for MediusFrameType {
+    fn from(t: medius::FrameType) -> Self {
+        use medius::FrameType as F;
+        match t {
+            F::Move => MediusFrameType::Move,
+            F::Inject => MediusFrameType::Inject,
+            F::Reset => MediusFrameType::Reset,
+            F::Query => MediusFrameType::Query,
+            F::Resp => MediusFrameType::Resp,
+            F::RebootDl => MediusFrameType::RebootDl,
+            F::Log => MediusFrameType::Log,
+            F::Led => MediusFrameType::Led,
+            F::Lock => MediusFrameType::Lock,
+            F::Catch => MediusFrameType::Catch,
+            F::MotionEvent => MediusFrameType::MotionEvent,
+            F::UsageEvent => MediusFrameType::UsageEvent,
+            F::TrafficEvent => MediusFrameType::TrafficEvent,
+            F::Option => MediusFrameType::Option,
+            F::ClipAppend => MediusFrameType::ClipAppend,
+            F::ClipCtrl => MediusFrameType::ClipCtrl,
+            F::ClipSet => MediusFrameType::ClipSet,
+            F::ClipTrigger => MediusFrameType::ClipTrigger,
+            F::Update => MediusFrameType::Update,
+            F::UpdateResp => MediusFrameType::UpdateResp,
+            F::Raw => MediusFrameType::Raw,
+            F::Transfer => MediusFrameType::Transfer,
+            F::TransferResp => MediusFrameType::TransferResp,
+            F::Rewrite => MediusFrameType::Rewrite,
+            F::Patch => MediusFrameType::Patch,
+            F::Transform => MediusFrameType::Transform,
+        }
+    }
+}
+
+/// A `MEDIUS_FRAME_TYPE_*` byte to a `medius::FrameType`; `None` if no constant names it.
+#[cfg(feature = "mock")]
+pub(crate) fn frame_type_from_c(t: u8) -> Option<medius::FrameType> {
+    medius::FrameType::try_from(t).ok()
+}
+
+/// `PortInfo` to `MediusPortInfo`; `None` if the path would not fit (never a half-written string).
+pub(crate) fn port_to_medius(p: &PortInfo) -> Option<MediusPortInfo> {
+    if p.path.len() >= MEDIUS_MAX_PATH {
+        return None;
+    }
+    let mut path = [0 as c_char; MEDIUS_MAX_PATH];
+    fill_cstr(&mut path, &p.path);
+    let mut serial = [0 as c_char; MEDIUS_MAX_SERIAL];
+    if let Some(s) = &p.serial {
+        fill_cstr(&mut serial, s);
+    }
+    Some(MediusPortInfo {
+        path,
+        vid: p.vid,
+        pid: p.pid,
+        serial,
+        has_serial: b(p.serial.is_some()),
+    })
+}
+
+/// `BoxInfo` to `MediusBoxInfo`; `None` if the port path would not fit.
+pub(crate) fn box_to_medius(b: &BoxInfo) -> Option<MediusBoxInfo> {
+    Some(MediusBoxInfo {
+        port: port_to_medius(&b.port)?,
+        version: b.version.clone().into(),
+        device: b.device.clone().unwrap_or_default().into(),
+        has_device: u8::from(b.device.is_some()),
+    })
+}

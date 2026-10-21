@@ -262,6 +262,19 @@ makcu_connection_status_t makcu_get_status(makcu_device_t* device) {
     }
 }
 
+makcu_error_t makcu_get_last_error(makcu_device_t* device, char* error, size_t error_size) {
+    if (!device || !error || error_size == 0) {
+        return MAKCU_ERROR_INVALID_PARAMETER;
+    }
+    try {
+        safe_copy_string(error,error_size,device->cpp_device->getLastError());
+        return MAKCU_SUCCESS;
+    } catch (...) {
+        error[0]='\0';
+        return handle_exception();
+    }
+}
+
 // Device information
 makcu_error_t makcu_get_device_info(makcu_device_t* device, makcu_device_info_t* info) {
     if (!device || !info) {
@@ -964,6 +977,17 @@ makcu_error_t makcu_batch_execute(makcu_batch_builder_t* batch) {
         bool success = batch->cpp_batch->execute();
         return success ? MAKCU_SUCCESS : MAKCU_ERROR_COMMAND_FAILED;
     } catch (...) { return handle_exception(); }
+}
+
+makcu_error_t makcu_query_text(makcu_device_t* device, const char* command,
+    char* response, size_t response_size, uint32_t timeout_ms) {
+    if (!device || !command || !response || !response_size || !timeout_ms)
+        return MAKCU_ERROR_INVALID_PARAMETER;
+    try {
+        const auto value = device->cpp_device->queryText(command, timeout_ms);
+        safe_copy_string(response, response_size, value);
+        return MAKCU_SUCCESS;
+    } catch (...) { response[0] = 0; return MAKCU_ERROR_TIMEOUT; }
 }
 
 // Raw command interface

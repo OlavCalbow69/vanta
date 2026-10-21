@@ -1,9 +1,13 @@
 #define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "makcu_controller.hpp"
+#include "medius_backend.hpp"
+#include "input_backend_utils.hpp"
+#include <Windows.h>
+#include <winrt/base.h>
 
 #include "logger.hpp"
-#include "rp2040_controller.hpp"
+#include "stream_frame.hpp"
 
 #include "makcu_c.h"
 
@@ -21,12 +25,41 @@
 #include <future>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace
 {
+    struct MakcuPortChoices
+    {
+        std::vector<makcu_device_info_t> devices;
+        std::size_t detectedCount{};
+        int selected{};
+        std::string detectedPorts;
+    };
+    MakcuPortChoices SelectMakcuPorts(std::vector<makcu_device_info_t> detected,
+        const std::string& previous)
+    {
+        MakcuPortChoices result;
+        result.devices=std::move(detected);
+        result.detectedCount=result.devices.size();
+        for(const auto& entry:result.devices)
+        {
+            if(!result.detectedPorts.empty())result.detectedPorts+=", ";
+            result.detectedPorts+=entry.port;
+        }
+        for(std::size_t index=0;index<result.devices.size();++index)
+            if(previous==result.devices[index].port)result.selected=static_cast<int>(index);
+        return result;
+    }
+    std::string DiagnosticString(const std::string& value)
+    {
+        std::string result="\"";
+        for(unsigned char c:value){if(c=='"' || c=='\\')result+='\\';if(c>=32)result+=char(c);}
+        return result+'"';
+    }
     constexpr int kQuickClickHoldMinimumMilliseconds = 14;
     constexpr int kQuickClickHoldMaximumMilliseconds = 34;
 
@@ -64,24 +97,39 @@ namespace vanta
             makcu_error_t error{
                 MAKCU_ERROR_CONNECTION_FAILED};
             makcu_device_info_t device{};
-            std::string version;
+            std::string version,detail;
         };
 
+        InputLockCoordinator inputLocks;
+        MediusBackend medius;
+        InputBackend activeBackend{InputBackend::makcu};
+        mutable std::mutex configMutex;
+        bool reconfigurePending{};
+        MouseOutputConfig lockSettings;
         mutable std::mutex deviceMutex;
-        Rp2040Controller rp2040;
-        std::atomic<int> outputBackend{0};
         makcu_device_t* device{};
         std::vector<makcu_device_info_t> devices;
         std::vector<std::string> deviceLabels;
         std::future<ConnectionResult> connectionFuture;
         int selectedDevice{};
         std::string preferredPort;
-        int movementX{};
+        std::string connectionPort,pythonConnectionNote;
+        std::string detectedPorts,lastConnectionError;
+        std::size_t detectedDeviceCount{};
+        int movementX{40};
         int movementY{};
+        std::string manualActionStatus;
         bool initialized{};
         bool connectionPending{};
         bool highPerformanceMode{true};
         bool autoDetectAndConnect{true};
+        mutable std::mutex movementPolicyMutex;
+        std::atomic_bool pythonMovementActive{};
+        std::atomic_uint64_t pythonGeneration{};
+        mutable std::mutex outputStatusMutex;
+        std::array<std::string,4> movementBlocks;
+        std::array<std::uint64_t,4> movementBlockCounts{},movementBlockLogUs{},movementBlockAt{};
+        std::array<bool,4> movementBlocked{};
         ULONGLONG nextAutoDetectTick{};
         std::atomic_bool connected{false};
         // Register this before connecting.  This matches the MAKCU C++ demo:
@@ -93,6 +141,8 @@ namespace vanta
         std::atomic<std::uint64_t> buttonEventCount{0};
         std::atomic_bool releasePending{false};
         std::atomic<std::uint64_t> settingsRevision{0};
+        std::atomic_uint64_t moveAttempts{0},movesSent{0},ownershipRejections{0},disconnectedRejections{0},sendFailures{0};
+        RollingStreamMetric movementLockWait,movementSend;
         std::string status{
             "Scanning for MAKCU devices..."};
         std::string firmwareVersion;
@@ -107,6 +157,8 @@ namespace vanta
                 return 1U << 0;
             case MAKCU_MOUSE_RIGHT:
                 return 1U << 1;
+            case MAKCU_MOUSE_MIDDLE:
+                return 1U << 2;
             case MAKCU_MOUSE_SIDE1:
                 return 1U << 3;
             case MAKCU_MOUSE_SIDE2:
@@ -125,6 +177,8 @@ namespace vanta
                 return ButtonMask(MAKCU_MOUSE_LEFT);
             case MouseButtonBinding::right:
                 return ButtonMask(MAKCU_MOUSE_RIGHT);
+            case MouseButtonBinding::middle:
+                return ButtonMask(MAKCU_MOUSE_MIDDLE);
             case MouseButtonBinding::x1:
                 return ButtonMask(MAKCU_MOUSE_SIDE1);
             case MouseButtonBinding::x2:
@@ -164,6 +218,7 @@ namespace vanta
                     static_cast<std::uint8_t>(~mask),
                     std::memory_order_acq_rel);
             }
+            implementation->inputLocks.PhysicalButton(static_cast<MouseButtonBinding>(button),pressed);
             implementation->buttonEventCount.fetch_add(
                 1,
                 std::memory_order_relaxed);
@@ -272,6 +327,7 @@ namespace vanta
 
         void RefreshButtonMaskFromMakcu() noexcept
         {
+            if(activeBackend==InputBackend::medius)return;
             if (!IsMouseButtonInputAvailable())
             {
                 return;
@@ -291,11 +347,13 @@ namespace vanta
             }
 
             std::uint8_t mask = 0;
+            auto previous=monitoredButtonMask.load(std::memory_order_acquire);
+            const auto before=buttonEventCount.load(std::memory_order_acquire);
             if (makcu_get_button_mask(device, &mask) == MAKCU_SUCCESS)
             {
-                monitoredButtonMask.store(
-                    mask,
-                    std::memory_order_release);
+                if(buttonEventCount.load(std::memory_order_acquire)==before &&
+                    monitoredButtonMask.compare_exchange_strong(previous,mask,std::memory_order_acq_rel) && previous!=mask)
+                    inputLocks.PhysicalButtons(mask);
             }
         }
 
@@ -376,12 +434,6 @@ namespace vanta
 
             if (initialConfig != nullptr)
             {
-                outputBackend.store(
-                    std::clamp(
-                        initialConfig->backendIndex,
-                        0,
-                        1),
-                    std::memory_order_release);
                 preferredPort =
                     initialConfig->makcuPort;
                 highPerformanceMode =
@@ -392,6 +444,8 @@ namespace vanta
                         autoDetectAndConnect;
             }
 
+            if(initialConfig)lockSettings=*initialConfig;
+            inputLocks.Configure(lockSettings);
             {
                 std::lock_guard<std::mutex> lock(deviceMutex);
                 device = makcu_device_create();
@@ -422,7 +476,6 @@ namespace vanta
             initialized = true;
             vanta::log::Info(
                 "MAKCU 1.3.5 runtime loaded");
-            rp2040.Initialize();
             if (autoDetectAndConnect)
             {
                 TryAutoDetectAndConnect(true);
@@ -434,24 +487,19 @@ namespace vanta
             return true;
         }
 
-        void SelectOutputBackend(int backend)
-        {
-            const int selected =
-                std::clamp(backend, 0, 1);
-            const int previous =
-                outputBackend.exchange(
-                    selected,
-                    std::memory_order_acq_rel);
-            if (previous != selected)
-            {
-                settingsRevision.fetch_add(
-                    1,
-                    std::memory_order_relaxed);
-            }
-        }
-
         void RefreshDevices()
         {
+            if(lockSettings.backend==InputBackend::medius)
+            {
+                devices.clear();deviceLabels.clear();detectedPorts.clear();selectedDevice=0;
+                for(const auto& port:MediusBackend::Ports())
+                {makcu_device_info_t entry{};strncpy_s(entry.port,port.c_str(),_TRUNCATE);
+                    devices.push_back(entry);deviceLabels.push_back("Medius | "+port);
+                    if(port==preferredPort)selectedDevice=int(devices.size()-1);
+                    if(!detectedPorts.empty())detectedPorts+=", ";detectedPorts+=port;}
+                detectedDeviceCount=devices.size();if(!devices.empty())preferredPort=devices[std::size_t(selectedDevice)].port;
+                status=devices.empty()?"No Medius control device detected":"Medius control devices detected";return;
+            }
             std::string selectedPort;
             if (selectedDevice >= 0 &&
                 selectedDevice <
@@ -473,7 +521,7 @@ namespace vanta
             const int count = makcu_find_devices(
                 discovered.data(),
                 static_cast<int>(discovered.size()));
-            devices.assign(
+            std::vector<makcu_device_info_t> actualDevices(
                 discovered.begin(),
                 discovered.begin() +
                     std::clamp(
@@ -481,9 +529,13 @@ namespace vanta
                         0,
                         maximumDevices));
 
+            auto choices=SelectMakcuPorts(std::move(actualDevices),selectedPort);
+            devices=std::move(choices.devices);
+            detectedDeviceCount=choices.detectedCount;
+            detectedPorts=std::move(choices.detectedPorts);
             deviceLabels.clear();
             deviceLabels.reserve(devices.size());
-            selectedDevice = 0;
+            selectedDevice=choices.selected;
             for (std::size_t index = 0;
                  index < devices.size();
                  ++index)
@@ -493,12 +545,6 @@ namespace vanta
                     std::string(entry.port) +
                     " | " +
                     entry.description);
-                if (!selectedPort.empty() &&
-                    entry.port == selectedPort)
-                {
-                    selectedDevice =
-                        static_cast<int>(index);
-                }
             }
             if (!devices.empty() &&
                 selectedDevice >= 0 &&
@@ -517,19 +563,37 @@ namespace vanta
             {
                 status = devices.empty()
                     ? "No MAKCU device detected"
-                    : std::to_string(devices.size()) +
+                    : std::to_string(detectedDeviceCount) +
                         " MAKCU device" +
-                        (devices.size() == 1 ? "" : "s") +
+                        (detectedDeviceCount == 1 ? "" : "s") +
                         " detected";
             }
 
             vanta::log::Info(
-                "MAKCU scan complete: %zu device(s)",
-                devices.size());
+                "MAKCU scan: detected=%zu ports=[%s] selected=%s",
+                detectedDeviceCount,detectedPorts.c_str(),preferredPort.c_str());
         }
 
         void BeginConnection()
         {
+            if(lockSettings.backend==InputBackend::medius)
+            {
+                if(connectionPending || connected || devices.empty())return;
+                activeBackend=InputBackend::medius;connectionPending=true;connectionPort=devices[std::size_t(selectedDevice)].port;
+                medius.PrepareConnection();
+                status="Connecting Medius / checking native output...";buttonMonitoringReady=false;monitoredButtonMask=0;
+                const auto config=lockSettings;const auto port=connectionPort;
+                connectionFuture=std::async(std::launch::async,[this,config,port]
+                {
+                    ConnectionResult result;strncpy_s(result.device.port,port.c_str(),_TRUNCATE);
+                    auto buttons=[this](std::uint8_t mask){monitoredButtonMask=mask;++buttonEventCount;inputLocks.PhysicalButtons(mask);};
+                    if(medius.Open(port,config,buttons,result.detail) && inputLocks.Attach(medius,port,result.detail))
+                    {result.error=MAKCU_SUCCESS;result.version=medius.Identity();buttonMonitoringReady=true;}
+                    else {const bool clean=inputLocks.Detach();const bool closed=medius.Close();inputLocks.FinishRecovery(clean && closed);}
+                    return result;
+                });return;
+            }
+            activeBackend=InputBackend::makcu;
             if (device == nullptr ||
                 connectionPending ||
                 connected ||
@@ -556,6 +620,7 @@ namespace vanta
                 0,
                 std::memory_order_release);
             connectionPending = true;
+            connectionPort=port;
             status = "Connecting to " + port + "...";
             vanta::log::Info(
                 "MAKCU connection started: %s",
@@ -566,7 +631,7 @@ namespace vanta
                 [this, port, enableHighPerformance]()
                 {
                     ConnectionResult result;
-                    std::lock_guard<std::mutex> lock(deviceMutex);
+                    std::unique_lock<std::mutex> lock(deviceMutex);
                     if (device == nullptr)
                     {
                         result.error = MAKCU_ERROR_INVALID_DEVICE;
@@ -578,12 +643,16 @@ namespace vanta
                             port.c_str());
                     if (result.error != MAKCU_SUCCESS)
                     {
+                        std::array<char,4096> detail{};
+                        if(makcu_get_last_error(device,detail.data(),detail.size())==MAKCU_SUCCESS)
+                            result.detail=detail.data();
                         return result;
                     }
                     if (!ForceReleaseLocked())
                     {
                         result.error =
                             MAKCU_ERROR_COMMAND_FAILED;
+                        result.detail="Connected, but the initial left-button release could not be written";
                         makcu_disconnect(device);
                         return result;
                     }
@@ -609,6 +678,7 @@ namespace vanta
                             MakcuErrorMessage(
                                 buttonMonitorError).c_str());
                         result.error = buttonMonitorError;
+                        result.detail="Connected, but physical-button monitoring setup failed";
                         DisableButtonMonitoringLocked();
                         makcu_disconnect(device);
                         return result;
@@ -641,6 +711,14 @@ namespace vanta
                     {
                         result.version = version.data();
                     }
+                    lock.unlock(); // Recovery and firmware waits must not retain deviceMutex.
+                    if(!inputLocks.Attach(device,port,result.detail))
+                    {
+                        result.error=MAKCU_ERROR_COMMAND_FAILED;
+                        const bool clean=inputLocks.Detach();
+                        {std::lock_guard deviceLock(deviceMutex);DisableButtonMonitoringLocked();makcu_disconnect(device);}
+                        inputLocks.FinishRecovery(clean);
+                    }
                     return result;
                 });
         }
@@ -662,23 +740,8 @@ namespace vanta
             }
             nextAutoDetectTick = now + 2000;
 
-            // Always scan MAKCU first, even while RP2040 is active.
-            // This lets a newly attached MAKCU take priority without
-            // interrupting the currently working fallback device.
             RefreshDevices();
-            if (!devices.empty())
-            {
-                BeginConnection();
-                return;
-            }
-
-            if (!rp2040.IsConnected() &&
-                rp2040.TryAutoConnect())
-            {
-                SelectOutputBackend(1);
-                vanta::log::Info(
-                    "Mouse output auto-selected RP2040 fallback");
-            }
+            if (!devices.empty()) BeginConnection();
         }
 
         void CompleteConnectionIfReady()
@@ -699,9 +762,7 @@ namespace vanta
             }
             catch (const std::exception& error)
             {
-                status =
-                    "Connection failed: " +
-                    std::string(error.what());
+                result.detail=error.what();
                 result.error =
                     MAKCU_ERROR_CONNECTION_FAILED;
             }
@@ -715,11 +776,7 @@ namespace vanta
                 std::memory_order_release);
             if (connectionSucceeded)
             {
-                if (rp2040.IsConnected())
-                {
-                    rp2040.Disconnect();
-                }
-                SelectOutputBackend(0);
+                lastConnectionError.clear();
                 connectedDevice = result.device;
                 firmwareVersion =
                     std::move(result.version);
@@ -735,6 +792,9 @@ namespace vanta
             }
             else
             {
+                // Also cover exceptions from partially completed attachment:
+                // quiesce borrowed-device operations before closing the SDK.
+                const bool clean=inputLocks.Detach();
                 {
                     std::lock_guard<std::mutex> lock(deviceMutex);
                     if (device != nullptr)
@@ -743,31 +803,33 @@ namespace vanta
                         makcu_disconnect(device);
                     }
                 }
+                const bool mediusClean=activeBackend!=InputBackend::medius || medius.Close();
+                inputLocks.FinishRecovery(clean && mediusClean);
                 firmwareVersion.clear();
-                status =
-                    "Connection failed: " +
-                    MakcuErrorMessage(result.error);
+                if(result.detail.empty())result.detail=result.error==MAKCU_SUCCESS
+                    ? "Device disconnected or selected port changed before connection completed"
+                    : MakcuErrorMessage(result.error);
+                lastConnectionError=std::move(result.detail);
+                status="Connection failed on "+connectionPort;
                 vanta::log::Warning(
-                    "MAKCU connection failed: %s",
-                    MakcuErrorMessage(
-                        result.error).c_str());
-                if (autoDetectAndConnect &&
-                    !rp2040.IsConnected() &&
-                    rp2040.TryAutoConnect())
-                {
-                    SelectOutputBackend(1);
-                    vanta::log::Info(
-                        "MAKCU unavailable; mouse output auto-selected RP2040");
-                }
+                    "MAKCU connection failed: port=%s detail=%s",
+                    connectionPort.c_str(),lastConnectionError.c_str());
             }
         }
 
         void Disconnect()
         {
+            if(activeBackend==InputBackend::medius && !connectionPending)
+            {
+                const bool clean=inputLocks.Detach();const bool closed=medius.Close();inputLocks.FinishRecovery(clean && closed);
+                connected=false;buttonMonitoringReady=false;monitoredButtonMask=0;firmwareVersion.clear();connectedDevice={};
+                status="Medius disconnected";return;
+            }
             if (connectionPending)
             {
                 return;
             }
+            const bool clean=inputLocks.Detach();
             {
                 std::lock_guard<std::mutex> lock(deviceMutex);
                 if (device != nullptr &&
@@ -779,6 +841,7 @@ namespace vanta
                     vanta::log::Info("MAKCU disconnected");
                 }
             }
+            inputLocks.FinishRecovery(clean);
             connected.store(false, std::memory_order_release);
             buttonMonitoringReady.store(
                 false,
@@ -833,114 +896,82 @@ namespace vanta
 
         bool DeviceIsConnected() const
         {
+            if(activeBackend==InputBackend::medius)return medius.Healthy();
             std::lock_guard<std::mutex> lock(deviceMutex);
             return
                 device != nullptr &&
                 makcu_is_connected(device);
         }
 
-        bool TryClick()
+        bool TryClick(const OutputContext& context={})
         {
-            std::lock_guard<std::mutex> lock(deviceMutex);
-            if (device == nullptr ||
-                !connected.load(std::memory_order_acquire))
-            {
-                return false;
-            }
-            if (releasePending.load(
-                    std::memory_order_acquire) &&
-                !ForceReleaseLocked())
-            {
-                return false;
-            }
-
-            const makcu_error_t downResult =
-                makcu_mouse_down(
-                    device,
-                    MAKCU_MOUSE_LEFT);
-            if (downResult != MAKCU_SUCCESS)
-            {
-                releasePending.store(
-                    true,
-                    std::memory_order_release);
-                ForceReleaseLocked();
-                if (!makcu_is_connected(device))
-                {
-                    connected.store(
-                        false,
-                        std::memory_order_release);
-                }
-                status =
-                    "MAKCU left-button press failed";
-                return false;
-            }
-
-            releasePending.store(
-                true,
-                std::memory_order_release);
-            Sleep(
-                static_cast<DWORD>(
-                    HumanizedQuickClickHoldMilliseconds()));
-            return ForceReleaseLocked();
+            return inputLocks.TryClick(context,HumanizedQuickClickHoldMilliseconds());
         }
 
-        bool TryMove(int x, int y)
+        bool AllowsMovement(bool pythonSource,std::uint64_t generation) const noexcept
         {
-            std::lock_guard<std::mutex> lock(deviceMutex);
-            if (device == nullptr ||
-                !connected.load(std::memory_order_acquire))
-            {
-                return false;
-            }
-            if (releasePending.load(
-                    std::memory_order_acquire) &&
-                !ForceReleaseLocked())
-            {
-                return false;
-            }
-
-            const makcu_error_t result =
-                makcu_mouse_move(device, x, y);
-            if (result != MAKCU_SUCCESS &&
-                !makcu_is_connected(device))
-            {
-                connected.store(
-                    false,
-                    std::memory_order_release);
-            }
-            return result == MAKCU_SUCCESS;
+            std::lock_guard lock(movementPolicyMutex);
+            return pythonSource==pythonMovementActive.load() &&
+                (!pythonSource || generation==pythonGeneration.load());
         }
 
-        bool ForceReleaseLeftButton()
+        void SetInputPolicy(InputOwner owner,bool enabled,std::uint64_t generation,MouseButtonBinding activation)
         {
-            if (outputBackend.load(
-                    std::memory_order_acquire) == 1)
+            // Publish the same generation to both gates. UI rendering and
+            // connection setup no longer grant Python movement ownership.
+            std::lock_guard lock(movementPolicyMutex);
+            if(owner==InputOwner::python)
             {
-                return rp2040.ForceReleaseLeftButton();
+                if(generation<pythonGeneration)return;
+                pythonMovementActive=enabled;pythonGeneration=generation;
             }
-            std::lock_guard<std::mutex> lock(deviceMutex);
-            return ForceReleaseLocked();
+            inputLocks.SetPolicy(owner,enabled,generation,activation);
+        }
+        bool BlockMove(InputOwner owner,const std::string& why)
+        {
+            const auto index=static_cast<std::size_t>(owner);const auto now=StreamNowUs();bool report{};
+            {std::lock_guard lock(outputStatusMutex);movementBlocks[index]=why;++movementBlockCounts[index];movementBlockAt[index]=now;movementBlocked[index]=true;
+                if(!movementBlockLogUs[index] || now-movementBlockLogUs[index]>=1000000)
+                {movementBlockLogUs[index]=now;report=true;}}
+            constexpr const char* names[]{"Manual","Python","TestMove","TestClick"};
+            if(report)log::Info("Movement blocked: owner=%s reason=%s",names[index],why.c_str());
+            return false;
+        }
+        std::string MovementBlockReason(InputOwner owner) const
+        {
+            {std::lock_guard lock(outputStatusMutex);const auto index=static_cast<std::size_t>(owner);
+                if(movementBlocked[index])return movementBlocks[index];}
+            const auto reason=inputLocks.MovementBlockReason(owner);return reason.empty()?"No rejected movement recorded":reason;
         }
 
-        void ForceReleaseBackendIfConnected(int backend)
+        bool TryMove(int x,int y,const OutputContext& context)
         {
-            if (backend == 1)
+            ++moveAttempts;const auto beforeLock=StreamNowUs();
+            const char* blocked{};
             {
-                if (rp2040.IsConnected())
-                {
-                    rp2040.ForceReleaseLeftButton();
-                }
-                return;
+                std::lock_guard lock(deviceMutex);
+                movementLockWait.Add(double(StreamNowUs()-beforeLock)/1000.0);
+                if(!AllowsMovement(context.owner==InputOwner::python,context.generation))
+                {++ownershipRejections;blocked=context.owner==InputOwner::python?"Python movement ownership or configuration generation does not match":"Python owns movement; disable Python to use another movement source";}
+                else if(!connected.load() || (activeBackend==InputBackend::makcu && !device))
+                {++disconnectedRejections;blocked="Mouse output is disconnected";}
             }
-
-            std::lock_guard<std::mutex> lock(deviceMutex);
-            if (device != nullptr &&
-                connected.load(std::memory_order_acquire) &&
-                makcu_is_connected(device))
-            {
-                ForceReleaseLocked();
-            }
+            if(blocked)return BlockMove(context.owner,blocked);
+            const auto beforeSend=StreamNowUs();
+            const bool success=inputLocks.TryMove(x,y,context);
+            movementSend.Add(double(StreamNowUs()-beforeSend)/1000.0);
+            if(success)
+            {++movesSent;std::lock_guard lock(outputStatusMutex);movementBlocked[static_cast<std::size_t>(context.owner)]=false;}
+            else {++sendFailures;BlockMove(context.owner,inputLocks.MovementBlockReason(context.owner));}
+            return success;
         }
+        bool TryMove(int x,int y,bool pythonSource=false,std::uint64_t generation=0)
+        {
+            OutputContext context;context.owner=pythonSource?InputOwner::python:InputOwner::manual;
+            context.generation=generation;
+            return TryMove(x,y,context);
+        }
+        bool ForceReleaseLeftButton(){return inputLocks.CancelClick();}
 
         void RecoverReleaseIfNeeded()
         {
@@ -957,6 +988,45 @@ namespace vanta
             }
         }
 
+        void RenderManualControls()
+        {
+            const bool isMedius=activeBackend==InputBackend::medius;
+            const bool ready=connected.load() && !connectionPending && !inputLocks.ResetRequired() && (!isMedius || medius.Healthy());
+            constexpr int nativeLimit=500;
+            movementX=std::clamp(movementX,-nativeLimit,nativeLimit);movementY=std::clamp(movementY,-nativeLimit,nativeLimit);
+            ImGui::Spacing();ImGui::TextUnformatted("Manual output tests");
+            ImGui::TextWrapped("Move and left-click affect the PC connected to MAKCU USB1. Capture is not required for these manual controls.");
+            if(!ready)ImGui::TextWrapped("Output is not armed. Resolve the connection/status message before testing.");
+            if(pythonMovementActive)ImGui::TextWrapped("Disable Python movement before a manual movement test.");
+            ImGui::BeginDisabled(!ready);
+            custom::SliderInt("Horizontal movement",&movementX,-nativeLimit,nativeLimit,"%d counts");
+            custom::SliderInt("Vertical movement",&movementY,-nativeLimit,nativeLimit,"%d counts");
+            if(movementX==0 && movementY==0)ImGui::TextDisabled("Choose a nonzero movement before pressing Move.");
+            ImGui::BeginDisabled(pythonMovementActive || (movementX==0 && movementY==0));
+            if(custom::Button(ICON_MOUSE_LINE "  Move",ImVec2(145,36)))
+            {
+                const bool accepted=TryMove(movementX,movementY);
+                manualActionStatus=accepted?"Move command accepted by the output backend":"Move rejected: "+inputLocks.Status();
+                log::Info("%s manual move(%d,%d): %s",isMedius?"Medius":"MAKCU",movementX,movementY,manualActionStatus.c_str());
+            }
+            ImGui::EndDisabled();ImGui::SameLine();
+            if(custom::Button("Left click",ImVec2(130,36)))
+            {
+                const bool completed=TryClick();
+                manualActionStatus=completed?"Left click completed":"Left click failed: "+inputLocks.Status();
+                log::Info("%s manual left click: %s",isMedius?"Medius":"MAKCU",manualActionStatus.c_str());
+            }
+            ImGui::EndDisabled();
+            if(!manualActionStatus.empty())ImGui::TextWrapped("%s",manualActionStatus.c_str());
+            if(isMedius)
+            {
+                const auto mask=monitoredButtonMask.load();
+                ImGui::TextDisabled("Physical buttons: L %s | R %s | X1 %s | X2 %s | Events: %llu",
+                    mask&1?"DOWN":"up",mask&2?"DOWN":"up",mask&8?"DOWN":"up",mask&16?"DOWN":"up",
+                    static_cast<unsigned long long>(buttonEventCount.load()));
+            }
+        }
+
         void Shutdown()
         {
             if (!initialized)
@@ -966,10 +1036,10 @@ namespace vanta
             if (connectionPending &&
                 connectionFuture.valid())
             {
+                if(activeBackend==InputBackend::medius)medius.CancelConnection();
                 connectionFuture.wait();
                 CompleteConnectionIfReady();
             }
-            rp2040.Shutdown();
             Disconnect();
             {
                 std::lock_guard<std::mutex> lock(deviceMutex);
@@ -1030,10 +1100,21 @@ namespace vanta
     void MakcuController::Tick()
     {
         auto& implementation = *implementation_;
-        implementation.rp2040.Tick();
         implementation.CompleteConnectionIfReady();
         implementation.RefreshButtonMaskFromMakcu();
         implementation.RecoverReleaseIfNeeded();
+        if(implementation.inputLocks.ResetRequired() && implementation.connected.load())
+        {
+            if(implementation.activeBackend==InputBackend::medius)
+            {
+                const auto detail=implementation.medius.FailureReason();
+                if(!detail.empty())implementation.lastConnectionError=detail;
+            }
+            implementation.Disconnect();
+            implementation.nextAutoDetectTick=GetTickCount64()+2000;
+        }
+        if(implementation.reconfigurePending && !implementation.connectionPending)
+        {implementation.Disconnect();implementation.reconfigurePending=false;implementation.nextAutoDetectTick=0;}
         if (implementation.connected.load(
                 std::memory_order_acquire) &&
             !implementation.DeviceIsConnected())
@@ -1049,6 +1130,7 @@ namespace vanta
                 std::memory_order_release);
             implementation.connectedDevice = {};
             implementation.firmwareVersion.clear();
+            implementation.Disconnect();
             implementation.status =
                 "MAKCU connection was lost";
             vanta::log::Warning(
@@ -1070,31 +1152,27 @@ namespace vanta
             ImVec2(0.0F, bodyHeight),
             true);
 
-        const char* outputBackends[]{
-            "MAKCU 1.3.5",
-            "RP2040 USB Host"};
-        int selectedBackend =
-            implementation.outputBackend.load(
-                std::memory_order_acquire);
-        if (custom::Combo(
-                "Output backend",
-                &selectedBackend,
-                outputBackends,
-                static_cast<int>(
-                    sizeof(outputBackends) /
-                    sizeof(outputBackends[0]))))
-        {
-            implementation.ForceReleaseBackendIfConnected(
-                implementation.outputBackend.load(
-                    std::memory_order_acquire));
-            implementation.SelectOutputBackend(
-                selectedBackend);
-        }
-
+        auto outputConfig=GetConfig();int backend=int(outputConfig.backend);
+        ImGui::BeginDisabled(implementation.connectionPending);
+        const char* backends[]{"Stock MAKCU","Medius 3.4.6"};
+        if(custom::Combo("Output backend",&backend,backends,2)){outputConfig.backend=static_cast<InputBackend>(backend);ApplyConfig(outputConfig);}
+        ImGui::EndDisabled();
+        auto locks=GetConfig();bool lockChanged=false;
+        lockChanged|=custom::Checkbox("Lock movement while correcting",&locks.lockMovementWhileCorrecting);
+        lockChanged|=custom::Checkbox("Lock generated-click button",&locks.lockGeneratedClick);
+        lockChanged|=custom::Checkbox("Reserve activation side buttons",&locks.reserveActivationSideButtons);
+        if(lockChanged)ApplyConfig(locks);
+        if(!locks.lockMovementWhileCorrecting)
+            ImGui::TextWrapped("Movement locking is DISABLED. Physical mouse movement remains available during corrections.");
+        if(custom::Button("Release all Vanta locks",ImVec2(240,32)))ReleaseAllInput();
+        ImGui::TextWrapped("%s",implementation.inputLocks.Status().c_str());
+        ImGui::TextDisabled("Input lock details are included in Save diagnostics.");
+        if(implementation.pythonMovementActive)
+            ImGui::TextDisabled("Disable Python movement before selecting a different port.");
         bool autoConnect =
             implementation.autoDetectAndConnect;
         if (custom::Checkbox(
-                "Auto detect / connect (MAKCU preferred)",
+                "Auto detect / connect MAKCU",
                 &autoConnect))
         {
             implementation.autoDetectAndConnect =
@@ -1105,12 +1183,21 @@ namespace vanta
                 std::memory_order_relaxed);
         }
         custom::Separator();
-
-        if (selectedBackend == 1)
+        if(GetConfig().backend==InputBackend::medius)
         {
-            implementation.rp2040.RenderPanel();
-            custom::EndChild();
-            return;
+            ImGui::TextWrapped("%s",implementation.status.c_str());
+            if(!implementation.lastConnectionError.empty())ImGui::TextWrapped("Last connection/output error: %s",implementation.lastConnectionError.c_str());
+            implementation.RenderManualControls();
+            custom::Separator();
+            ImGui::TextWrapped("%s",implementation.medius.Status().c_str());
+            ImGui::TextWrapped("%s",implementation.lastConnectionError.c_str());
+            ImGui::TextWrapped("Native Medius movement uses the original Python and TestMove calculations. Mouse polling rate is separate from capture FPS.");
+            auto configuration=GetConfig();
+            if(!implementation.connected && !implementation.connectionPending && ImGui::Button("Connect Medius"))ConnectOnce();
+            if(implementation.connectionPending && ImGui::Button("Cancel connection"))
+            {implementation.medius.CancelConnection();configuration.autoDetectAndConnect=false;ApplyConfig(configuration);}
+            if(implementation.connected && ImGui::Button("Disconnect Medius"))implementation.Disconnect();
+            custom::EndChild();return;
         }
 
         const ImVec4 statusColor =
@@ -1123,6 +1210,8 @@ namespace vanta
             statusColor,
             "%s",
             implementation.status.c_str());
+        if(!implementation.lastConnectionError.empty())
+            ImGui::TextWrapped("Last connection error: %s",implementation.lastConnectionError.c_str());
         ImGui::TextDisabled(
             "Runtime: makcu-cpp 1.3.5 Win64");
         ImGui::Spacing();
@@ -1141,6 +1230,7 @@ namespace vanta
         ImGui::BeginDisabled(
             implementation.connectionPending ||
             implementation.connected ||
+            implementation.pythonMovementActive ||
             deviceItems.empty());
         if (custom::Combo(
             ICON_DEVICE_LINE "  Device",
@@ -1162,6 +1252,8 @@ namespace vanta
                         static_cast<std::size_t>(
                             implementation.selectedDevice)]
                         .port;
+                implementation.lastConnectionError.clear();
+                implementation.nextAutoDetectTick=0;
             }
             implementation.settingsRevision.fetch_add(
                 1,
@@ -1269,49 +1361,7 @@ namespace vanta
                         }));
             }
 
-            ImGui::Spacing();
-            custom::SliderInt(
-                "Horizontal movement",
-                &implementation.movementX,
-                -500,
-                500,
-                "%d px");
-            custom::SliderInt(
-                "Vertical movement",
-                &implementation.movementY,
-                -500,
-                500,
-                "%d px");
-
-            if (custom::Button(
-                    ICON_MOUSE_LINE "  Move",
-                    ImVec2(145.0F, 36.0F)))
-            {
-                implementation.LogCommand(
-                    "mouse move",
-                    implementation.ExecuteCommand(
-                        [&](makcu_device_t* device)
-                        {
-                            return makcu_mouse_move(
-                                device,
-                                implementation.movementX,
-                                implementation.movementY);
-                        }));
-            }
-            ImGui::SameLine();
-            if (custom::Button(
-                    "Left click",
-                    ImVec2(130.0F, 36.0F)))
-            {
-                const bool result =
-                    implementation.TryClick();
-                vanta::log::Info(
-                    "MAKCU left click: %s",
-                    result
-                        ? "success"
-                        : "failed or release recovery pending");
-            }
-            ImGui::SameLine();
+            implementation.RenderManualControls();
             if (custom::Button(
                     "Right click",
                     ImVec2(130.0F, 36.0F)))
@@ -1357,24 +1407,37 @@ namespace vanta
         custom::EndChild();
     }
 
+    bool MakcuController::TryClick(const OutputContext& context)
+    {return implementation_->TryClick(context);}
+    bool MakcuController::TryMove(int x,int y,const OutputContext& context)
+    {return implementation_->TryMove(x,y,context);}
+    std::string MakcuController::MovementBlockReason(InputOwner owner) const
+    {return implementation_->MovementBlockReason(owner);}
+    std::string MakcuController::FuseUnavailableReason() const
+    {
+        const auto& impl=*implementation_;
+        if(GetConfig().backend!=InputBackend::medius)return "Fuse inputs requires Medius; stock MAKCU supports Existing behavior";
+        if(!impl.connected.load() || impl.inputLocks.ResetRequired())return "Connect and verify Medius in Mouse Output before enabling Fuse inputs";
+        return impl.medius.FuseUnavailableReason();
+    }
+    std::string MakcuController::InputControlStatus() const
+    {return implementation_->inputLocks.Status();}
+    void MakcuController::SetInputPolicy(InputOwner owner,bool enabled,std::uint64_t generation,MouseButtonBinding activation)
+    {implementation_->SetInputPolicy(owner,enabled,generation,activation);}
+    void MakcuController::EndCorrection(InputOwner owner,std::uint64_t generation,const char* reason)
+    {implementation_->inputLocks.EndCorrection(owner,generation,reason);}
+    void MakcuController::CancelOutput(InputOwner owner){implementation_->inputLocks.CancelOwner(owner);}
+    void MakcuController::ReleaseAllInput(){implementation_->inputLocks.EmergencyRelease();}
+    std::uint64_t MakcuController::EmergencyRevision() const noexcept{return implementation_->inputLocks.EmergencyRevision();}
+
     bool MakcuController::TryClick()
     {
         auto& impl = *implementation_;
-        if (impl.outputBackend.load(
-                std::memory_order_acquire) == 1)
-        {
-            return impl.rp2040.TryClick();
-        }
         return impl.TryClick();
     }
 
     bool MakcuController::IsConnected() const noexcept
     {
-        if (implementation_->outputBackend.load(
-                std::memory_order_acquire) == 1)
-        {
-            return implementation_->rp2040.IsConnected();
-        }
         return implementation_->connected.load(
             std::memory_order_acquire);
     }
@@ -1394,11 +1457,6 @@ namespace vanta
     bool MakcuController::TryMove(int x, int y)
     {
         auto& impl = *implementation_;
-        if (impl.outputBackend.load(
-                std::memory_order_acquire) == 1)
-        {
-            return impl.rp2040.TryMove(x, y);
-        }
         return impl.TryMove(x, y);
     }
 
@@ -1410,64 +1468,103 @@ namespace vanta
     MouseOutputConfig MakcuController::GetConfig() const
     {
         const auto& impl = *implementation_;
-        MouseOutputConfig result;
-        result.backendIndex =
-            impl.outputBackend.load(
-                std::memory_order_acquire);
+        std::lock_guard configGuard(impl.configMutex);
+        MouseOutputConfig result=impl.lockSettings;
         result.makcuPort =
             impl.preferredPort;
         result.highPerformanceMode =
             impl.highPerformanceMode;
         result.autoDetectAndConnect =
             impl.autoDetectAndConnect;
+        result.lockMovementWhileCorrecting=impl.lockSettings.lockMovementWhileCorrecting;
+        result.lockGeneratedClick=impl.lockSettings.lockGeneratedClick;
+        result.reserveActivationSideButtons=impl.lockSettings.reserveActivationSideButtons;
         return result;
     }
 
-    void MakcuController::ApplyConfig(
-        const MouseOutputConfig& config)
+    void MakcuController::ApplyConfig(const MouseOutputConfig& config)
     {
-        auto& impl = *implementation_;
-        const int configuredBackend =
-            std::clamp(
-                config.backendIndex,
-                0,
-                1);
-        const int previousBackend =
-            impl.outputBackend.load(
-                std::memory_order_acquire);
-        if (impl.initialized &&
-            configuredBackend != previousBackend)
+        auto& impl=*implementation_;
+        const bool autoChanged=impl.autoDetectAndConnect!=config.autoDetectAndConnect;
+        if (!impl.initialized || (!impl.connected && !impl.connectionPending))
+            impl.preferredPort=config.makcuPort;
+        const bool reconnect=impl.lockSettings.backend!=config.backend ||
+            (config.backend==InputBackend::medius && impl.lockSettings.lockMovementWhileCorrecting!=config.lockMovementWhileCorrecting);
+        if(reconnect){impl.inputLocks.CancelOwner(InputOwner::python);impl.inputLocks.CancelOwner(InputOwner::testMove);impl.inputLocks.CancelOwner(InputOwner::testClick);
+            if(!impl.connectionPending)impl.Disconnect();else impl.reconfigurePending=true;}
+        {std::lock_guard configGuard(impl.configMutex);impl.lockSettings=config;}
+        impl.inputLocks.Configure(config);
+        impl.highPerformanceMode=config.highPerformanceMode;
+        impl.autoDetectAndConnect=config.autoDetectAndConnect;
+        if (autoChanged) impl.nextAutoDetectTick=0;
+        if (impl.initialized && !impl.connectionPending && !impl.connected)
+            impl.RefreshDevices();
+        impl.settingsRevision.fetch_add(1,std::memory_order_relaxed);
+    }
+
+    void MakcuController::ConnectOnce()
+    {
+        auto& impl=*implementation_;
+        if (impl.initialized && !impl.connected && !impl.connectionPending)
         {
-            impl.ForceReleaseBackendIfConnected(
-                previousBackend);
+            impl.RefreshDevices();
+            impl.BeginConnection();
         }
-        impl.outputBackend.store(
-            configuredBackend,
-            std::memory_order_release);
-        impl.preferredPort =
-            config.makcuPort;
-        impl.highPerformanceMode =
-            config.highPerformanceMode;
-        const bool autoConnectChanged =
-            impl.autoDetectAndConnect !=
-                config.autoDetectAndConnect;
-        impl.autoDetectAndConnect =
-            config.autoDetectAndConnect;
-        if (impl.initialized)
+    }
+
+    void MakcuController::ActivatePythonMovement(bool autoReconnect,std::uint64_t generation)
+    {
+        auto& impl=*implementation_;
+        auto config=GetConfig();
+        if (config.autoDetectAndConnect!=autoReconnect)
         {
-            if (autoConnectChanged &&
-                impl.autoDetectAndConnect)
-            {
-                impl.nextAutoDetectTick = 0;
-            }
-            else if (!impl.autoDetectAndConnect)
-            {
-                impl.RefreshDevices();
-            }
+            config.autoDetectAndConnect=autoReconnect;
+            ApplyConfig(config);
         }
-        impl.settingsRevision.fetch_add(
-            1,
-            std::memory_order_relaxed);
+        // Movement ownership is published with the feature's activation policy.
+        // Connection/UI work must not revive an older Python generation.
+        if(!impl.connected && !impl.connectionPending)ConnectOnce();
+        impl.pythonConnectionNote=impl.connected
+            ? "Python uses MAKCU on "+std::string(impl.connectedDevice.port)+"."
+            : impl.connectionPending
+                ? "Python is connecting to an automatically detected MAKCU device."
+                : "Python is waiting for an automatically detected MAKCU device.";
+        log::Info("%s generation=%llu",impl.pythonConnectionNote.c_str(),static_cast<unsigned long long>(generation));
+    }
+    std::string MakcuController::PythonConnectionNote() const
+    {return implementation_->pythonConnectionNote;}
+    std::string MakcuController::DiagnosticsJson() const
+    {
+        const auto& impl=*implementation_;
+        const auto wait=impl.movementLockWait.Get(),send=impl.movementSend.Get();
+        // Called by the UI coordinator once per second. Never stall it behind
+        // a connection attempt, click hold or serial write.
+        std::unique_lock lock(impl.deviceMutex,std::try_to_lock);
+        std::ostringstream json;
+        json<<"{\"connected\":"<<(impl.connected?"true":"false")<<",\"connecting\":"<<(impl.connectionPending?"true":"false")
+            <<",\"button_monitor_ready\":"<<(impl.buttonMonitoringReady?"true":"false")
+            <<",\"selected_port\":"<<DiagnosticString(impl.preferredPort)
+            <<",\"detected_device_count\":"<<impl.detectedDeviceCount
+            <<",\"detected_ports\":"<<DiagnosticString(impl.detectedPorts)
+            <<",\"last_connection_error\":"<<DiagnosticString(impl.lastConnectionError)
+            <<",\"connected_port\":"<<DiagnosticString(impl.connectedDevice.port)
+            <<",\"firmware\":"<<DiagnosticString(impl.firmwareVersion)
+            <<",\"python_connection_note\":"<<DiagnosticString(impl.pythonConnectionNote)
+            <<",\"device_busy\":"<<(lock.owns_lock()?"false":"true");
+        {std::lock_guard policyLock(impl.movementPolicyMutex);
+            json<<",\"python_owns_movement\":"<<(impl.pythonMovementActive?"true":"false")<<",\"python_owner_generation\":"<<impl.pythonGeneration.load();}
+        {std::lock_guard outputLock(impl.outputStatusMutex);json<<",\"movement_sources\":[";
+            for(std::size_t i=0;i<impl.movementBlocks.size();++i)
+            {if(i)json<<',';json<<"{\"owner\":"<<i<<",\"rejections\":"<<impl.movementBlockCounts[i]
+                <<",\"last_request_rejected\":"<<(impl.movementBlocked[i]?"true":"false")<<",\"last_block_local_us\":"<<impl.movementBlockAt[i]
+                <<",\"last_block_reason\":"<<DiagnosticString(impl.movementBlocks[i])<<'}';}
+            json<<']';}
+        json<<",\"move_attempts\":"<<impl.moveAttempts.load()<<",\"moves_sent\":"<<impl.movesSent.load()
+            <<",\"move_success_scope\":\"stock: serial write; Medius: generation-checked intent accepted into bounded scheduling; neither acknowledges USB delivery\""
+            <<",\"ownership_rejections\":"<<impl.ownershipRejections.load()
+            <<",\"disconnected_rejections\":"<<impl.disconnectedRejections.load()<<",\"send_failures\":"<<impl.sendFailures.load()
+            <<",\"movement_lock_wait_p95_ms\":"<<wait.p95Ms<<",\"movement_submission_p95_ms\":"<<send.p95Ms<<",\"input_locks\":"<<impl.inputLocks.DiagnosticsJson()<<",\"motion_backend\":"<<(impl.activeBackend==InputBackend::medius?impl.medius.DiagnosticsJson():"{\"backend\":\"makcu\"}")<<'}';
+        return json.str();
     }
 
     std::uint64_t
@@ -1476,5 +1573,34 @@ namespace vanta
         return implementation_->
             settingsRevision.load(
                 std::memory_order_relaxed);
+    }
+
+    bool MakcuController::RunMovementOwnershipSelfTest()
+    {
+        makcu_device_info_t detected{};
+        strcpy_s(detected.port,"COM3");
+        const auto automatic=SelectMakcuPorts({detected},"COM5");
+        if(automatic.devices.size()!=1 || automatic.selected!=0)return false;
+        const auto preserved=SelectMakcuPorts({detected},"COM3");
+        if(preserved.devices.size()!=1 || preserved.selected!=0)return false;
+        // Exercise the same predicate used under deviceMutex before serial
+        // writes. No device is created, opened or sent any input.
+        Implementation impl;
+        if (!impl.AllowsMovement(false,0) || impl.AllowsMovement(true,0)) return false;
+        impl.pythonMovementActive=true;
+        impl.pythonGeneration=7;
+        if (impl.AllowsMovement(false,0) || !impl.AllowsMovement(true,7) ||
+            impl.AllowsMovement(true,6)) return false;
+        impl.pythonGeneration=8;
+        if (impl.AllowsMovement(true,7) || !impl.AllowsMovement(true,8)) return false;
+        impl.pythonMovementActive=false;
+        if(!impl.AllowsMovement(false,0) || impl.AllowsMovement(true,8))return false;
+        impl.SetInputPolicy(InputOwner::python,true,10,MouseButtonBinding::x1);
+        if(!impl.AllowsMovement(true,10) || impl.AllowsMovement(false,0))return false;
+        impl.SetInputPolicy(InputOwner::python,false,11,MouseButtonBinding::x1);
+        impl.SetInputPolicy(InputOwner::python,true,10,MouseButtonBinding::x1);
+        if(impl.pythonGeneration!=11 || !impl.AllowsMovement(false,0) || impl.AllowsMovement(true,10))return false;
+        impl.SetInputPolicy(InputOwner::python,true,12,MouseButtonBinding::x2);
+        return impl.AllowsMovement(true,12) && !impl.AllowsMovement(true,11);
     }
 }

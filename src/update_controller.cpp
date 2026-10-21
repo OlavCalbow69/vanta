@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -59,10 +60,20 @@ namespace
             L"--help",
             L"--self-test",
             L"--config-self-test",
-            L"--capture-test-winrt",
-            L"--capture-test-duplication",
-            L"--capture-test-winrt-window",
-            L"--capture-test-duplication-window"};
+            L"--python-self-test",
+            L"--python-parity-fixtures",
+            L"--detector-self-test",
+            L"--detector-ui-self-test",
+            L"--makcu-self-test",
+            L"--makcu-probe",
+            L"--receiver-self-test",
+            L"--receiver-capture-self-test",
+            L"--receiver-stream-smoke",
+            L"--receiver-discover",
+            L"--receiver-discover-lan"};
+        for (int index=1;index<argumentCount;++index)
+            if (std::wstring_view(arguments[index]).starts_with(L"--capture-test-"))
+                return true;
         for (const wchar_t* argument : bypassArguments)
         {
             if (HasArgument(

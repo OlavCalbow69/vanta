@@ -1,0 +1,153 @@
+use std::time::Duration;
+
+use crate::error::{Error, Result};
+use crate::protocol::opcode::{
+    OPT_BEARING, OPT_EMIT, OPT_IMPERFECT, OPT_MOVE_RIDE, OPT_RENDER, OPT_SPREAD, Q_CAPS, Q_CATCH,
+    Q_DEVICE_INFO, Q_HEALTH, Q_LOCKS, Q_RATE, Q_STATS, Q_VERSION,
+};
+use crate::protocol::{Resp, parse_resp};
+use crate::types::{
+    Bearing, Caps, CatchState, DeviceInfo, EmitPaceStatus, Health, ImperfectStatus, Locks, Rate,
+    RenderStatus, SpreadStatus, Stats, Version,
+};
+
+use super::Device;
+
+impl Device {
+    /// Box version.
+    pub fn query_version(&self) -> Result<Version> {
+        let payload = self.link.query(Q_VERSION)?;
+        match parse_resp(&payload) {
+            Some(Resp::Version(v)) => Ok(v),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Box health flags.
+    pub fn query_health(&self) -> Result<Health> {
+        let payload = self.link.query(Q_HEALTH)?;
+        match parse_resp(&payload) {
+            Some(Resp::Health(h)) => Ok(h),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Cloned device's USB identity (§4.3).
+    pub fn device_info(&self) -> Result<DeviceInfo> {
+        let payload = self.link.query(Q_DEVICE_INFO)?;
+        match parse_resp(&payload) {
+            Some(Resp::DeviceInfo(m)) => Ok(m),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Cloned device's capabilities (§4.4).
+    ///
+    /// Caches the declared button count. A later button blanket lock then covers every declared
+    /// button, and a reconnect re-asserts locks on buttons past the five named ones.
+    pub fn caps(&self) -> Result<Caps> {
+        let payload = self.link.query(Q_CAPS)?;
+        match parse_resp(&payload) {
+            Some(Resp::Caps(c)) => {
+                self.link
+                    .desired()
+                    .lock()
+                    .note_declared_buttons(c.mouse.n_buttons);
+                Ok(c)
+            }
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Live native report rate and clone poll period (§4.5).
+    pub fn query_rate(&self) -> Result<Rate> {
+        let payload = self.link.query(Q_RATE)?;
+        match parse_resp(&payload) {
+            Some(Resp::Rate(r)) => Ok(r),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Delivery and telemetry counters (§4.6).
+    pub fn query_stats(&self) -> Result<Stats> {
+        let payload = self.link.query(Q_STATS)?;
+        match parse_resp(&payload) {
+            Some(Resp::Stats(s)) => Ok(s),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Active locks (§4.8).
+    pub fn query_locks(&self) -> Result<Locks> {
+        let payload = self.link.query(Q_LOCKS)?;
+        match parse_resp(&payload) {
+            Some(Resp::Locks(l)) => Ok(l),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Live catch table, box-side drop counts and inter-chip clock (§4.9).
+    pub fn query_catch(&self) -> Result<CatchState> {
+        let payload = self.link.query(Q_CATCH)?;
+        match parse_resp(&payload) {
+            Some(Resp::Catch(c)) => Ok(c),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Imperfect-clone opt-in and over-capacity status (§4.14).
+    pub fn query_imperfect(&self) -> Result<ImperfectStatus> {
+        let payload = self.link.query_option(OPT_IMPERFECT)?;
+        match parse_resp(&payload) {
+            Some(Resp::Imperfect(i)) => Ok(i),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Movement-riding window (§4.14); `None` = off.
+    pub fn query_movement_riding(&self) -> Result<Option<Duration>> {
+        let payload = self.link.query_option(OPT_MOVE_RIDE)?;
+        match parse_resp(&payload) {
+            Some(Resp::MovementRiding(w)) => Ok(w),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Emit pacing mode and the rate in effect (§4.14).
+    pub fn query_emit_pace(&self) -> Result<EmitPaceStatus> {
+        let payload = self.link.query_option(OPT_EMIT)?;
+        match parse_resp(&payload) {
+            Some(Resp::EmitPace(s)) => Ok(s),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Bearing (§4.14): how long the last injected direction stays the reference for
+    /// `Direction::With`/`Against`, and whether it is read per axis or as one vector.
+    pub fn query_bearing(&self) -> Result<Bearing> {
+        let payload = self.link.query_option(OPT_BEARING)?;
+        match parse_resp(&payload) {
+            Some(Resp::Bearing(b)) => Ok(b),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Render texture, whether native motion is rendered, and whether the box has learned a profile
+    /// (§4.14).
+    pub fn query_render(&self) -> Result<RenderStatus> {
+        let payload = self.link.query_option(OPT_RENDER)?;
+        match parse_resp(&payload) {
+            Some(Resp::Render(s)) => Ok(s),
+            _ => Err(Error::NoReply),
+        }
+    }
+
+    /// Spread percent and release interval (§4.14).
+    pub fn query_spread(&self) -> Result<SpreadStatus> {
+        let payload = self.link.query_option(OPT_SPREAD)?;
+        match parse_resp(&payload) {
+            Some(Resp::Spread(s)) => Ok(s),
+            _ => Err(Error::NoReply),
+        }
+    }
+}

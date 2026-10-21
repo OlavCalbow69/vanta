@@ -7,8 +7,9 @@ purple/yellow/red presets. It is a native Windows x64 build; Python is not neede
 ## Your 1440p Sunshine setup
 
 1. On the Receiver page, pair with Sunshine and connect at 2560x1440. New local
-   settings default to 120 FPS and 150,000 kbps; these settings are saved.
-2. On Capture, select Sunshine stream and a centered ROI (640 pixels by default).
+   settings default to 240 FPS, 150,000 kbps and Auto codec; existing saved
+   stream settings remain unchanged. See [streaming-240](README-STREAMING.md).
+2. Capture now uses Sunshine only; select a centered ROI (640 pixels by default).
    Detection consumes the original decoded pixels; only the UI preview is resized.
 3. On TestMove, enable its controls and select a color. Enable Detector preview
    to tune detection without holding the activation button or sending movement.
@@ -49,9 +50,14 @@ blacklist is not applied to red or yellow. Capture, TestClick and TestMove use
 the same multi-range mask helper.
 
 Before an older file is overwritten, a one-time `.schema-N.bak` copy preserves it.
-Profiles are schema 8; local settings are schema 7. Older profiles keep the
+Profiles use schema 9; local settings use schema 10. Older profiles keep the
 original 4x4 dilation, bounding-box percentage and old tuning. Use this build
 to load the new schemas; earlier executables do not understand them.
+Old local-capture or alternate-output selectors are ignored while ROI, stream,
+MAKCU port, detector and other tuning values are retained. TestMove, TestClick,
+profiles, style and updates remain available. Python replaces the timer page;
+its reference algorithm is independent of this enhanced detector. ROI borders and Kill
+FOV visualization now live inside the Sunshine preview, not on the receiver desktop.
 
 ## MAKCU 4.094
 
@@ -69,17 +75,22 @@ See the [official protocol](https://makcu.com/en/api/) and
 
 ## Verification
 
-On 2026-10-14, Debug/Release x64 builds and all six checks below passed in this
-workspace. Both ZIPs were extracted and retested with PATH restricted to Windows
-directories; their file manifests and archive SHA-256 hashes also matched.
-This is a deployment smoke test, not a separate clean-Windows-machine test.
+The results below describe the earlier detector baseline. The streaming-240
+build's CPU checks and deferred laptop acceptance are documented in
+[README-STREAMING.md](README-STREAMING.md).
+
+On 2026-10-15, Debug/Release x64 builds were checked using the tests below,
+the updater self-test, GUI fixture tests, and native/reference Python parity.
+See [Python mode verification](README-PYTHON.md#verification) for the reference
+comparison and its scope. The original Python source/config are now available.
 No MAKCU serial device was present, so real 4.094 hardware, live 1440p Sunshine
-and practice-scene validation remain pending. The original Python bot files
-are unavailable here; synthetic fixtures do not establish exact Python parity.
+and practice-scene validation remain pending. Synthetic tests do not establish
+real-world precision or stream/hardware timing equivalence.
 
 Run the following against either Debug or Release:
 
 ```powershell
+.\vanta.exe --python-self-test
 .\vanta.exe --detector-self-test
 .\vanta.exe --detector-ui-self-test
 .\vanta.exe --config-self-test

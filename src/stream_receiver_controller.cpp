@@ -1,6 +1,8 @@
 #include "stream_receiver_controller.hpp"
 
 #include "hardware_video_decoder.hpp"
+#include "capture_controller.hpp"
+#include "stream_diagnostics.hpp"
 #include "logger.hpp"
 #include "sunshine_pairing.hpp"
 
@@ -186,7 +188,7 @@ namespace
         if (result != 0)
         {
             ReportStreamStatus(*callbacks.Get(), error.empty() ? "Vanta could not configure its hardware video decoder." : error);
-            vanta::log::Error("Sunshine H.264 decoder setup failed: %s", error.c_str());
+            vanta::log::Error("Sunshine hardware decoder setup failed: %s", error.c_str());
         }
         return result;
     }
@@ -274,6 +276,8 @@ namespace
         {
             callbacks.Get()->terminationError.store(errorCode);
             callbacks.Get()->connectionTerminated.store(true);
+            vanta::log::Info("Sunshine termination: error=%d origin=%s",errorCode,
+                errorCode==ML_ERROR_GRACEFUL_TERMINATION?"host-closed session":"connection termination; see preceding control-stream messages");
             ReportStreamStatus(
                 *callbacks.Get(),
                 errorCode == ML_ERROR_GRACEFUL_TERMINATION
@@ -349,7 +353,8 @@ namespace
         int bitrateKbps;
     };
 
-    constexpr std::array<StreamProfile, 5> kLanStreamProfiles{{
+    constexpr std::array<StreamProfile, 6> kLanStreamProfiles{{
+        {"1440p 240", 2560, 1440, 240, 150000},
         {"1080p 120", 1920, 1080, 120, 80000},
         {"1080p 144", 1920, 1080, 144, 95000},
         {"1080p 240", 1920, 1080, 240, 125000},
@@ -376,17 +381,26 @@ namespace vanta
         bool lanDiscoveryStarted{};
         int requestedWidth{2560};
         int requestedHeight{1440};
-        int requestedFps{120};
+        int requestedFps{240};
         int requestedBitrateKbps{150000};
         std::atomic<std::uint64_t> settingsRevision{0};
         bool requestDisplayMode{true};
+        CodecPreference codecPreference{CodecPreference::Auto};
+        std::string adapterPreference{"auto"},initialAdapterPreference{"auto"};
+        std::vector<VideoAdapterInfo> adapters;
+        CaptureController* capture{};
+        std::uint64_t nextStatsLog{};
+        StreamDiagnostics diagnostics;
+        std::function<std::string()> diagnosticContext;
+        std::uint64_t nextDiagnosticUs{};
+        std::vector<CaptureController::ConsumerPerformance> consumerPerformance;
+        std::uint64_t nextConsumerStatsUs{};
         std::string status{"Enter the LAN address of the Sunshine host, then select Discover."};
         std::optional<sunshine::HostInfo> discoveredHost;
         std::optional<sunshine::PairedHost> pairedHost;
         std::vector<sunshine::HostInfo> lanHosts;
         int selectedLanHost{-1};
         ActiveStreamCallbacks streamCallbacks;
-        ComPtr<ID3D11ShaderResourceView> frameViewForRender;
 
         void JoinWorker()
         {
@@ -647,8 +661,11 @@ namespace vanta
             const int fps = requestedFps;
             const int bitrateKbps = requestedBitrateKbps;
             const bool useRequestedDisplayMode = requestDisplayMode;
-            SetStatus("Preparing Vanta's H.264 hardware receiver...");
-            StartJob([this, requestedHost, width, height, fps, bitrateKbps, useRequestedDisplayMode]()
+            const CodecPreference selectedCodec=codecPreference;
+            if(adapterPreference!=initialAdapterPreference)
+            {SetStatus("Restart Vanta to activate the selected video adapter before connecting");return;}
+            SetStatus("Preparing Vanta's FFmpeg/D3D11 hardware receiver...");
+            StartJob([this, requestedHost, width, height, fps, bitrateKbps, useRequestedDisplayMode,selectedCodec]()
             {
                 StartAttemptGuard startAttempt(moonlightStarting);
                 if (stopping.load())
@@ -657,6 +674,7 @@ namespace vanta
                 }
 
                 std::string error;
+                decoder.SetIdrRequester([]{LiRequestIdrFrame();});
                 if (!decoder.Initialize(device, error))
                 {
                     SetStatus(error);
@@ -675,6 +693,12 @@ namespace vanta
                     decoder.Shutdown();
                     return;
                 }
+                request.supportedVideoFormats=decoder.SupportedFormats(width,height);
+                if(selectedCodec==CodecPreference::H264)request.supportedVideoFormats&=VIDEO_FORMAT_H264;
+                else if(selectedCodec==CodecPreference::HEVC)request.supportedVideoFormats&=VIDEO_FORMAT_H265;
+                else if(selectedCodec==CodecPreference::AV1)request.supportedVideoFormats&=VIDEO_FORMAT_AV1_MAIN8;
+                if(!request.supportedVideoFormats)
+                {SetStatus("The selected codec/resolution has no hardware decoder on this adapter; CPU fallback is disabled");decoder.Shutdown();return;}
                 SetStatus("Launching Sunshine Desktop through Vanta's paired connection...");
                 const sunshine::StreamLaunchResult launch = pairingService.LaunchDesktop(requestedHost, request);
                 if (!launch.succeeded)
@@ -698,10 +722,12 @@ namespace vanta
                 streamConfig.packetSize = request.packetSize;
                 streamConfig.streamingRemotely = STREAM_CFG_LOCAL;
                 streamConfig.audioConfiguration = request.audioConfiguration;
-                // H.264 is selected deliberately for the first Vanta decoder.
-                // Sunshine is free to keep HEVC/AV1 enabled for other clients.
-                streamConfig.supportedVideoFormats = VIDEO_FORMAT_H264;
-                streamConfig.clientRefreshRateX100 = request.fps * 100;
+                // common-c prefers AV1, then HEVC, then H.264 within this
+                // refreshed host/hardware intersection. Forced choices have one bit.
+                streamConfig.supportedVideoFormats = launch.supportedVideoFormats;
+                DEVMODEW localDisplay{};localDisplay.dmSize=sizeof(localDisplay);
+                streamConfig.clientRefreshRateX100=EnumDisplaySettingsW(nullptr,ENUM_CURRENT_SETTINGS,&localDisplay) && localDisplay.dmDisplayFrequency>1
+                    ? int(localDisplay.dmDisplayFrequency)*100 : 0;
                 streamConfig.colorSpace = COLORSPACE_REC_709;
                 streamConfig.colorRange = COLOR_RANGE_LIMITED;
                 streamConfig.encryptionFlags = ENCFLG_ALL;
@@ -796,7 +822,7 @@ namespace vanta
                 }
                 if (!streamCallbacks.connectionTerminated.load())
                 {
-                    SetStatus("Sunshine Desktop is streaming to Vanta's H.264 hardware decoder.");
+                    SetStatus("Sunshine Desktop is streaming to Vanta's FFmpeg/D3D11 hardware decoder.");
                 }
                 vanta::log::Info("Vanta started Sunshine Desktop stream from %s", launch.host.info.address.c_str());
             });
@@ -804,6 +830,8 @@ namespace vanta
 
         void StopStream(const bool preserveTerminationStatus = false)
         {
+            diagnostics.EndSession(preserveTerminationStatus?"automatic_stream_failure_or_disconnect":"automatic_session_end");
+            decoder.Stop(); // Reject outstanding snapshots before transport teardown can block.
             const bool wasStarting = moonlightStarting.load();
             if (wasStarting)
             {
@@ -823,7 +851,6 @@ namespace vanta
             {
                 DeactivateCallbacks(streamCallbacks);
                 decoder.Shutdown();
-                frameViewForRender.Reset();
             }
         }
     };
@@ -831,9 +858,14 @@ namespace vanta
     StreamReceiverController::StreamReceiverController() : implementation_(std::make_unique<Implementation>()) {}
     StreamReceiverController::~StreamReceiverController() { Shutdown(); }
 
-    void StreamReceiverController::Initialize(ID3D11Device* device, const SunshineStreamConfig* config)
+    void StreamReceiverController::Initialize(ID3D11Device* device, const SunshineStreamConfig* config,CaptureController* capture)
     {
         implementation_->device = device;
+        implementation_->capture=capture;
+        implementation_->adapters=HardwareVideoDecoder::EnumerateAdapters();
+        // Reuse startup capability probes. Reports must not create additional
+        // GPU devices or run capability tests during a struggling stream.
+        implementation_->diagnostics.Initialize(StreamHardwareReport(implementation_->adapters));
         if (config)
         {
             implementation_->requestedWidth=config->width;
@@ -841,6 +873,8 @@ namespace vanta
             implementation_->requestedFps=config->fps;
             implementation_->requestedBitrateKbps=config->bitrateKbps;
             implementation_->requestDisplayMode=config->requestDisplayMode;
+            implementation_->codecPreference=config->codec;
+            implementation_->adapterPreference=implementation_->initialAdapterPreference=config->adapter;
         }
         if (!implementation_->GeneratePairingPin())
         {
@@ -854,6 +888,37 @@ namespace vanta
     void StreamReceiverController::Tick()
     {
         auto& impl = *implementation_;
+        const auto decoderStats=impl.decoder.GetStats();
+        if(impl.capture && StreamNowUs()>=impl.nextConsumerStatsUs)
+        {impl.consumerPerformance=impl.capture->ConsumerPerformanceStats();impl.nextConsumerStatsUs=StreamNowUs()+1000000;}
+        if(impl.moonlightStarted && (StreamNowUs()>=impl.nextDiagnosticUs || decoderStats.failed || impl.streamCallbacks.connectionTerminated.load()))
+        {
+            StreamDiagnosticSample sample;sample.nowUs=StreamNowUs();sample.requested=GetConfig();sample.video=decoderStats;
+            sample.connectionTerminated=impl.streamCallbacks.connectionTerminated.load();sample.terminationError=impl.streamCallbacks.terminationError.load();
+            if(impl.capture)
+            {sample.demand=impl.capture->GetDemandStats(decoderStats.width,decoderStats.height);sample.consumers=impl.consumerPerformance;sample.publishedMetadata=impl.capture->LastPublicationMetadata();}
+            if(impl.diagnosticContext)sample.outputJson=impl.diagnosticContext();
+            impl.diagnostics.Observe(std::move(sample));impl.nextDiagnosticUs=StreamNowUs()+1000000;
+        }
+        if(decoderStats.failed && impl.moonlightStarted && !impl.moonlightStarting)
+        {const auto error=decoderStats.status;impl.StopStream(true);impl.SetStatus(error);}
+        if(impl.moonlightStarted && StreamNowUs()>=impl.nextStatsLog)
+        {
+            impl.nextStatsLog=StreamNowUs()+1000000;
+            const auto demand=impl.capture ? impl.capture->GetDemandStats(decoderStats.width,decoderStats.height) : CaptureController::DemandStats{};
+            const char* demandMode=demand.regions.empty()?"none":demand.streamRate?"stream-rate":"capped";
+            log::Info("Stream %s: requested=%d received=%.0f decoded=%.0f CPU=%.0f FPS queue=%zu loss=%llu overload=%llu failures=%llu arrival-to-publication p95=%.2f ms; CPU demand=%s cap=%d ROI=%dx%d readback p95=%.2f ms wake-late p95=%.2f ms; wait=%s",
+                decoderStats.codec.c_str(),impl.requestedFps,decoderStats.receivedFramesPerSecond,decoderStats.decodedFramesPerSecond,
+                decoderStats.publishedFramesPerSecond,decoderStats.queueDepth,static_cast<unsigned long long>(decoderStats.transportLostFrames),
+                static_cast<unsigned long long>(decoderStats.overloadDrops),static_cast<unsigned long long>(decoderStats.decoderFailures),decoderStats.publication.p95Ms,
+                demandMode,demand.maximumFps,demand.readbackUnion.width,demand.readbackUnion.height,
+                decoderStats.readback.p95Ms,demand.schedulerWakeLateness.p95Ms,demand.waitMode.c_str());
+            for(const auto& consumer:impl.consumerPerformance)
+                if(std::any_of(demand.regions.begin(),demand.regions.end(),[&](const auto& region){return region.consumer==consumer.name;}))
+                    log::Info("Consumer %s: processed=%.0f FPS active=%s state=%s algorithm p95=%.2f ms iteration p95=%.2f ms",
+                        consumer.name.c_str(),consumer.fps,consumer.processingExpected?"yes":"no",consumer.state.c_str(),
+                        consumer.algorithm.p95Ms,consumer.processing.p95Ms);
+        }
         // moonlight-common-c invokes connectionTerminated from an auxiliary
         // thread. Complete the non-thread-safe LiStopConnection cleanup on
         // Vanta's main thread, after preserving the useful terminal status.
@@ -869,7 +934,7 @@ namespace vanta
     {
         const auto& impl=*implementation_;
         return {impl.requestedWidth,impl.requestedHeight,impl.requestedFps,
-            impl.requestedBitrateKbps,impl.requestDisplayMode};
+            impl.requestedBitrateKbps,impl.requestDisplayMode,impl.codecPreference,impl.adapterPreference};
     }
 
     std::uint64_t StreamReceiverController::SettingsRevision() const noexcept
@@ -882,7 +947,8 @@ namespace vanta
         auto& impl = *implementation_;
         const SunshineStreamConfig before = GetConfig();
         const float height = std::max(450.0F, ImGui::GetContentRegionAvail().y - 40.0F);
-        custom::Child(ICON_RADIO_LINE "  Sunshine receiver##sunshine-receiver", ImVec2(0.0F, height), true);
+        if(!custom::Child(ICON_RADIO_LINE "  Sunshine receiver##sunshine-receiver", ImVec2(0.0F, height), true))
+        {custom::EndChild();return;}
         ImGui::TextWrapped("Vanta pairs directly with Sunshine, launches Sunshine Desktop through a certificate-pinned HTTPS request, then receives its UDP video with Moonlight common-c. No external Moonlight process is used.");
         ImGui::TextDisabled("To feed the stream into Vanta's capture-based tools, select Sunshine stream on the Capture page.");
         ImGui::Spacing();
@@ -956,6 +1022,11 @@ namespace vanta
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Text("Vanta pairing PIN: %s", impl.pin[0] == '\0' ? "Generating..." : impl.pin);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(impl.pin[0] == '\0');
+        if (custom::Button("Copy##pairing-pin", ImVec2(70.0F, 30.0F)))
+            ImGui::SetClipboardText(impl.pin);
+        ImGui::EndDisabled();
         if (!activeJob && !streamActive)
         {
             ImGui::SameLine();
@@ -988,7 +1059,7 @@ namespace vanta
         for (std::size_t index = 0; index < kLanStreamProfiles.size(); ++index)
         {
             const StreamProfile& profile = kLanStreamProfiles[index];
-            if (index != 0)
+            if (index % 3 != 0)
             {
                 ImGui::SameLine();
             }
@@ -998,9 +1069,10 @@ namespace vanta
                 impl.requestedHeight = profile.height;
                 impl.requestedFps = profile.fps;
                 impl.requestedBitrateKbps = profile.bitrateKbps;
+                if(profile.width==2560 && profile.fps==240)impl.codecPreference=CodecPreference::Auto;
             }
         }
-        ImGui::TextDisabled("240 FPS requires a matching host/virtual-display mode and a 240 Hz receiver display.");
+        ImGui::TextDisabled("240 FPS delivery requires host and receiver capacity. Preview refresh is independent of stream FPS.");
         ImGui::InputInt("Width", &impl.requestedWidth, 0, 0);
         ImGui::SameLine();
         ImGui::InputInt("Height", &impl.requestedHeight, 0, 0);
@@ -1008,6 +1080,35 @@ namespace vanta
         ImGui::InputInt("FPS", &impl.requestedFps, 0, 0);
         ImGui::InputInt("Bitrate (kbps)", &impl.requestedBitrateKbps, 0, 0);
         custom::Checkbox("Ask Sunshine to match this display mode", &impl.requestDisplayMode);
+        const char* codecNames[]{"Auto (AV1 / HEVC / H.264)","H.264","HEVC","AV1"};
+        int codec=int(impl.codecPreference);
+        int adapterFormats{};
+        for(const auto& adapter:impl.adapters)
+            if((impl.adapterPreference=="auto" && !adapterFormats) || impl.adapterPreference==adapter.id)adapterFormats=adapter.supportedFormats;
+        if(ImGui::BeginCombo("Video codec",codecNames[codec]))
+        {
+            const int formats[]{0,VIDEO_FORMAT_H264,VIDEO_FORMAT_H265,VIDEO_FORMAT_AV1_MAIN8};
+            for(int index=0;index<4;++index)
+            {
+                const bool available=index==0 || (adapterFormats&formats[index])!=0;
+                ImGui::BeginDisabled(!available);
+                if(ImGui::Selectable(codecNames[index],index==codec))impl.codecPreference=CodecPreference(index);
+                ImGui::EndDisabled();
+                if(!available && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))ImGui::SetTooltip("Unavailable in this adapter's 1440p hardware capability probe. No CPU decoder fallback.");
+            }
+            ImGui::EndCombo();
+        }
+        if(!(adapterFormats&VIDEO_FORMAT_AV1_MAIN8))ImGui::TextDisabled("AV1 hardware decoding unavailable on the selected adapter.");
+        std::string adapterLabel="Auto (prefer NVIDIA)";
+        for(const auto& adapter:impl.adapters)if(adapter.id==impl.adapterPreference)adapterLabel=adapter.name;
+        if(ImGui::BeginCombo("Video adapter",adapterLabel.c_str()))
+        {
+            if(ImGui::Selectable("Auto (prefer NVIDIA)",impl.adapterPreference=="auto"))impl.adapterPreference="auto";
+            for(const auto& adapter:impl.adapters)if(ImGui::Selectable(adapter.name.c_str(),adapter.id==impl.adapterPreference))impl.adapterPreference=adapter.id;
+            ImGui::EndCombo();
+        }
+        if(impl.adapterPreference!=impl.initialAdapterPreference)ImGui::TextWrapped("Restart Vanta to apply the selected adapter.");
+        ImGui::TextDisabled("Bitrate is the requested stream budget, including FEC allowance.");
         if (before != GetConfig()) impl.settingsRevision.fetch_add(1,std::memory_order_relaxed);
         if (activeJob || streamActive)
         {
@@ -1063,40 +1164,58 @@ namespace vanta
                 decoderStats.receivedFramesPerSecond,
                 decoderStats.decodedFramesPerSecond);
             ImGui::Text(
-                "Hardware H.264: %llu received | %llu queued | %llu decoded | %llu dropped",
+                "Hardware frames: %llu received | %llu submitted | %llu decoded | %llu dropped",
                 static_cast<unsigned long long>(decoderStats.receivedFrames),
                 static_cast<unsigned long long>(decoderStats.submittedFrames),
                 static_cast<unsigned long long>(decoderStats.decodedFrames),
                 static_cast<unsigned long long>(decoderStats.droppedFrames));
-            if (!decoderStats.status.empty())
-            {
-                ImGui::TextDisabled("Decoder: %s", decoderStats.status.c_str());
-            }
         }
+        if(!decoderStats.status.empty())ImGui::TextWrapped("Decoder: %s",decoderStats.status.c_str());
 
-        impl.frameViewForRender.Attach(impl.decoder.AcquireFrameView());
-        if (impl.frameViewForRender && decoderStats.width > 0 && decoderStats.height > 0)
+        ImGui::TextWrapped("%s | %s",decoderStats.adapter.c_str(),decoderStats.synchronization.c_str());
+        ImGui::Text("CPU %.0f FPS | payload %.1f Mbps | packet queue %zu / GPU in flight %zu",decoderStats.publishedFramesPerSecond,decoderStats.encodedMegabitsPerSecond,decoderStats.queueDepth,decoderStats.gpuFramesInFlight);
+        if(decoderStats.network.available)ImGui::Text("Observed Ethernet: %.1f Mbps RX / %.1f Mbps TX (all traffic)",decoderStats.network.receiveMbps,decoderStats.network.transmitMbps);
+        ImGui::Text("Transport gaps %llu | overload events %llu | decode/input errors %llu | replaced output %llu",
+            static_cast<unsigned long long>(decoderStats.transportLostFrames),static_cast<unsigned long long>(decoderStats.overloadDrops),
+            static_cast<unsigned long long>(decoderStats.decoderFailures),static_cast<unsigned long long>(decoderStats.outputSkippedFrames));
+        ImGui::Text("Receiver arrival to publication: median %.2f / p95 %.2f / p99 %.2f ms",
+            decoderStats.publication.medianMs,decoderStats.publication.p95Ms,decoderStats.publication.p99Ms);
+        ImGui::TextDisabled("Timing excludes host-to-receiver transit. GPU conversion/readback %.2f ms p95.",decoderStats.readback.p95Ms);
+        if(decoderStats.hostProcessing.samples)ImGui::Text("Optional host processing: median %.2f / p95 %.2f / p99 %.2f ms",
+            decoderStats.hostProcessing.medianMs,decoderStats.hostProcessing.p95Ms,decoderStats.hostProcessing.p99Ms);
+        for(const auto& consumer:impl.consumerPerformance)
+            ImGui::Text("%s: %.0f FPS | processing p50/p95/p99 %.2f/%.2f/%.2f ms | receiver age p95 %.2f ms",consumer.name.c_str(),consumer.fps,
+                consumer.processing.medianMs,consumer.processing.p95Ms,consumer.processing.p99Ms,consumer.age.p95Ms);
+        ImGui::TextWrapped("FPS diagnosis: %s",impl.diagnostics.Summary().c_str());
+        ImGui::TextDisabled("Auto reports after warm-up and sustained low FPS/latency; summary saved on stop. Previews are capped at 60 FPS.");
+        if(ImGui::Button("Save diagnostics"))impl.diagnostics.SaveManual();
+        const auto diagnosticStatus=impl.diagnostics.Status();
+        if(!diagnosticStatus.empty())ImGui::TextWrapped("%s",diagnosticStatus.c_str());
+        if (impl.moonlightStarted.load() && decoderStats.hardwareActive && decoderStats.width > 0 && decoderStats.height > 0)
         {
             ImGui::Separator();
             const ImVec2 available = ImGui::GetContentRegionAvail();
             const float scale = std::max(
                 0.0F,
                 std::min(
-                    available.x / static_cast<float>(decoderStats.width),
-                    available.y / static_cast<float>(decoderStats.height)));
-            ImGui::Image(
-                reinterpret_cast<ImTextureID>(impl.frameViewForRender.Get()),
-                ImVec2(
-                    std::max(1.0F, static_cast<float>(decoderStats.width) * scale),
-                    std::max(1.0F, static_cast<float>(decoderStats.height) * scale)));
+                    std::min(560.0F,available.x) / static_cast<float>(decoderStats.width),
+                    315.0F / static_cast<float>(decoderStats.height)));
+            const ImVec2 size(std::max(1.0F,float(decoderStats.width)*scale),std::max(1.0F,float(decoderStats.height)*scale));
+            if(ImGui::IsRectVisible(size))impl.decoder.DrawPreview(ImGui::GetWindowDrawList(),ImGui::GetCursorScreenPos(),size);
+            ImGui::Dummy(size);
         }
         else
         {
-            ImGui::TextDisabled("Receiver output: H.264 GPU-decoded preview appears here after Sunshine sends the first frame.");
+            ImGui::TextDisabled("Receiver output: hardware-decoded GPU preview appears after Sunshine sends the first frame.");
         }
         custom::EndChild();
     }
 
+    std::uint64_t StreamReceiverController::CurrentGeneration() const{return implementation_->decoder.CurrentGeneration();}
+    void StreamReceiverController::SetDiagnosticContextProvider(std::function<std::string()> provider)
+    {implementation_->diagnosticContext=std::move(provider);}
+    void StreamReceiverController::RecordPublication(const CapturedFrameMetadata& metadata){implementation_->decoder.RecordPublication(metadata);}
+    void StreamReceiverController::InvalidateFrames(){implementation_->decoder.Stop();}
     void StreamReceiverController::Shutdown()
     {
         if (implementation_ == nullptr)
@@ -1107,7 +1226,7 @@ namespace vanta
         implementation_->StopStream();
         implementation_->JoinWorker();
         implementation_->decoder.Shutdown();
-        implementation_->frameViewForRender.Reset();
+        implementation_->diagnostics.Shutdown();
     }
 
     bool StreamReceiverController::RunLiveStreamSmokeTest(
@@ -1158,10 +1277,8 @@ namespace vanta
         {
             Tick();
             const DecodedVideoStats liveStats = impl.decoder.GetStats();
-            ID3D11ShaderResourceView* frameView = impl.decoder.AcquireFrameView();
-            if (frameView != nullptr)
+            if (liveStats.hardwareActive)
             {
-                frameView->Release();
                 if (liveStats.decodedFrames != 0 && liveStats.width > 0 && liveStats.height > 0)
                 {
                     result.receivedFrame = true;
@@ -1203,7 +1320,7 @@ namespace vanta
         result.droppedFrames = statsBeforeStop.droppedFrames;
         if (result.receivedFrame)
         {
-            result.message = "Vanta received and copied a live Sunshine H.264 frame";
+            result.message = "Vanta received a live Sunshine hardware-decoded GPU frame";
             vanta::log::Info(
                 "Sunshine live smoke test passed: %dx%d, submitted=%llu decoded=%llu dropped=%llu",
                 result.width,
@@ -1225,6 +1342,10 @@ namespace vanta
             static_cast<unsigned long long>(result.droppedFrames));
         return false;
     }
+
+    void StreamReceiverController::FinishPreviewFrame(){implementation_->decoder.FinishPreviewFrame();}
+    bool StreamReceiverController::ReadbackRegions(const FrameReadbackRequest& request,CpuFrameSnapshot& output,std::stop_token stop)
+    {return implementation_->decoder.Readback(request,output,stop);}
 
     bool StreamReceiverController::CopyLatestFrameToBgra(
         const std::uint64_t afterSequence,

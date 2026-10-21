@@ -12,6 +12,13 @@ namespace vanta
     bool RunMakcuCompatibilitySelfTest()
     {
         const auto fail=[](const char* message) { log::Error("MAKCU compatibility self-test: %s",message); return false; };
+        if(!InputLockCoordinator::RunSelfTest())return fail("Input-lock coordinator checks failed");
+        if(!makcu::protocol::IsEchoOrPrompt("km.lock_mx(1)","km.lock_mx()") ||
+            !makcu::protocol::IsEchoOrPrompt("km.left(0)","km.moving()") ||
+            makcu::protocol::IsEchoOrPrompt("0","km.lock_mx()") ||
+            makcu::protocol::IsEchoOrPrompt("km.MAKCU","km.version()"))
+            return fail("Mutation echo was confused with firmware readback");
+        if(!MakcuController::RunMovementOwnershipSelfTest())return fail("Python activation replaced a working/pending MAKCU port or rejected its movement owner");
         const std::vector<std::uint8_t> wire{
             'k','m','.','M','A','K','C','U','\r','\n','>','>','>',' ',
             'k','m','.',0x10,'\r','\n',

@@ -1,0 +1,109 @@
+{
+  "active_preset": "purple",
+  "physical_input_mode": "existing",
+  "presets": {
+    "purple_narrow": {
+      "name": "Purple (narrow)",
+      "hex_variations": [],
+      "hsv_lower": [144, 106, 172],
+      "hsv_upper": [151, 255, 255]
+    },
+    "purple": {
+      "name": "Purple / Magenta (Verified Player Only)",
+      "hex_variations": [
+        "#AC00E6",
+        "#D000FF",
+        "#FE00FE",
+        "#B800E8",
+        "#8A00B8",
+        "#9900CC",
+        "#E600FF",
+        "#C800FF",
+        "#A000E0",
+        "#D800FF"
+      ],
+      "hsv_lower": [
+        130,
+        60,
+        70
+      ],
+      "hsv_upper": [
+        165,
+        255,
+        255
+      ]
+    },
+    "yellow": {
+      "name": "Yellow (Protanopia/Deuteranopia)",
+      "hex_variations": [
+        "#E0FF00",
+        "#FFFF00",
+        "#D4EA00",
+        "#FEFE00",
+        "#CBE000",
+        "#BFFF00",
+        "#E6FF00",
+        "#FFFF33",
+        "#D9FF00",
+        "#F0FF00"
+      ],
+      "hsv_lower": [
+        25,
+        80,
+        80
+      ],
+      "hsv_upper": [
+        35,
+        255,
+        255
+      ]
+    },
+    "red": {
+      "name": "Red (Default)",
+      "hex_variations": [
+        "#FF0000",
+        "#E60000",
+        "#FE0000",
+        "#CC0000",
+        "#FF1A1A",
+        "#E60033",
+        "#FF2222",
+        "#D90000"
+      ],
+      "hsv_lower_1": [
+        0,
+        90,
+        90
+      ],
+      "hsv_upper_1": [
+        10,
+        255,
+        255
+      ],
+      "hsv_lower_2": [
+        170,
+        90,
+        90
+      ],
+      "hsv_upper_2": [
+        180,
+        255,
+        255
+      ]
+    }
+  },
+  "fov_radius": 60,
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "aim_key": "0x05",
+  "smooth_factor": 0.4030150753768844,
+  "axis_mode": "standard",
+  "hybrid_vertical_time_ms": 300,
+  "horizontal_only": false,
+  "min_contour_area": 1.0,
+  "offset_x": 1,
+  "offset_y": 7,
+  "filter_orbs": true,
+  "makcu_debug": false,
+  "makcu_auto_reconnect": true
+}

@@ -1,0 +1,500 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:   # manual run: rebuild + re-upload wheels/tarballs for the current version
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+
+  check:
+    name: Check (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - ""
+          - "async"
+          - "mock"
+          - "tracing"
+          - "async,mock"
+          - "async,mock,tracing"
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ matrix.features }}
+
+    - name: Check
+      run: cargo check --all-targets --features "${{ matrix.features }}" --verbose
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build
+      run: cargo build --all-features --verbose
+
+    - name: Build examples
+      run: cargo build --examples --all-features --verbose
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Test
+      run: cargo test --all-features --verbose
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Run clippy
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+  security_audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+
+    - name: Run security audit
+      run: cargo audit
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check documentation
+      run: cargo doc --no-deps --all-features
+      env:
+        RUSTDOCFLAGS: "-D warnings"
+
+  publish_check:
+    name: Publish Check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check if publishable
+      run: cargo publish -p medius --dry-run --allow-dirty
+
+    - name: Package the C ABI against this medius
+      # Packaged together, the C ABI builds against this medius, not the crates.io one, which
+      # lacks anything new this release adds for the C ABI to call. Cargo never rebuilds a registry
+      # crate it has built at that version, so a cached target would hold the medius an earlier
+      # push packaged.
+      run: cargo package -p medius -p medius-capi --allow-dirty --target-dir "$RUNNER_TEMP/package"
+
+    - name: Check the crate, the C ABI and the Python binding share one version
+      # A release publishes all three. medius 3.4.0 shipped while the Python binding still said
+      # 3.3.1, so PyPI never got that version at all.
+      run: |
+        set -euo pipefail
+        crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+        capi=$(grep -m1 '^version = ' medius-capi/Cargo.toml | cut -d'"' -f2)
+        py=$(grep -m1 '^version = ' bindings/python/pyproject.toml | cut -d'"' -f2)
+        pin=$(grep -m1 '^medius = ' medius-capi/Cargo.toml | sed -n 's/.*version = "=\([^"]*\)".*/\1/p')
+        echo "crate=$crate capi=$capi python=$py capi-pins-medius=$pin"
+        if [ "$crate" != "$capi" ] || [ "$crate" != "$py" ] || [ "$crate" != "$pin" ]; then
+          echo "::error::versions disagree (crate $crate, C ABI $capi, Python $py, C ABI's medius pin $pin)"; exit 1
+        fi
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [check, build, test, fmt, clippy, security_audit, docs, publish_check, capi, capi-lint, cbindgen-drift, python, bindings_sdist, bindings_wheels]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    outputs:
+      should_publish: ${{ steps.check_version.outputs.should_publish }}
+      version: ${{ steps.check_version.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check if version already published
+      id: check_version
+      run: |
+        CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="medius") | .version')
+        echo "version=$CRATE_VERSION" >> $GITHUB_OUTPUT
+
+        # crates.io rejects requests without a User-Agent. Without one the check never matches,
+        # and the job tries to re-publish on every push. A 404 (curl exit 22) means the crate
+        # isn't there yet; any other failure stops the job instead of reading as "not published".
+        published() {
+          local body rc=0
+          body=$(curl -sf -H "User-Agent: medius-ci (github.com/K4HVH/medius)" "https://crates.io/api/v1/crates/$1") || rc=$?
+          if [ "$rc" -eq 22 ]; then return 1; fi
+          if [ "$rc" -ne 0 ]; then echo "::error::crates.io lookup for $1 failed (curl $rc)"; exit 1; fi
+          jq -e --arg v "$CRATE_VERSION" '.versions[] | select(.num == $v)' <<<"$body" > /dev/null
+        }
+        if published medius; then
+          echo "Version $CRATE_VERSION already exists on crates.io"
+          echo "should_publish=false" >> $GITHUB_OUTPUT
+        else
+          echo "Version $CRATE_VERSION not found on crates.io, proceeding with publish"
+          echo "should_publish=true" >> $GITHUB_OUTPUT
+        fi
+        # The C ABI is checked separately: if it failed to publish after medius did, the next push
+        # publishes it.
+        if published medius-capi; then
+          echo "should_publish_capi=false" >> $GITHUB_OUTPUT
+        else
+          echo "should_publish_capi=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Login to crates.io
+      if: steps.check_version.outputs.should_publish == 'true' || steps.check_version.outputs.should_publish_capi == 'true'
+      run: cargo login ${{ secrets.CRATES_IO_TOKEN }}
+
+    - name: Publish to crates.io
+      if: steps.check_version.outputs.should_publish == 'true'
+      run: cargo publish -p medius
+
+    - name: Publish the C ABI to crates.io
+      # After medius: it depends on the version just published, and cargo waits for the index to have it.
+      # A failure here still lets the GitHub release, PyPI and the C archives publish; the next push
+      # publishes the C ABI.
+      if: steps.check_version.outputs.should_publish_capi == 'true'
+      continue-on-error: true
+      run: cargo publish -p medius-capi
+
+    - name: Create GitHub Release
+      if: steps.check_version.outputs.should_publish == 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.check_version.outputs.version }}
+        name: Release v${{ steps.check_version.outputs.version }}
+        body: |
+          Rust: [medius](https://crates.io/crates/medius) and [medius-capi](https://crates.io/crates/medius-capi) on crates.io.
+          Python: [medius](https://pypi.org/project/medius/) on PyPI.
+          C and C++: the `medius-capi-<target>.tar.gz` archives below, each with `include/medius.h` and the library.
+          Docs: https://medius.k4tech.net/library
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- bindings release: only on a new version (gated by the publish job) ---
+
+  bindings_sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Build the self-contained sdist
+      run: |
+        python -m pip install build
+        python -m build --sdist -o dist bindings/python
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dist-sdist
+        path: dist/*.tar.gz
+
+  bindings_wheels:
+    name: Wheels (${{ matrix.os }})
+    needs: bindings_sdist
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 (arm64) also cross-builds the x86_64 wheel (see pyproject's
+        # cibuildwheel macos archs); five wheels total, mirroring the C tarballs.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
+      with:
+        name: dist-sdist
+        path: dist
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Build wheels from the sdist
+      shell: bash
+      run: |
+        python -m pip install 'cibuildwheel~=2.21'
+        python -m cibuildwheel --output-dir wheelhouse dist/medius-*.tar.gz
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dist-wheels-${{ matrix.os }}
+        path: wheelhouse/*.whl
+
+  publish_pypi:
+    name: Publish wheels to PyPI
+    needs: [publish, bindings_sdist, bindings_wheels]
+    # Fires on a real release, or on a manual dispatch (to backfill a version
+    # whose wheels never uploaded). Never on a PR.
+    if: >-
+      always()
+      && needs.bindings_sdist.result == 'success'
+      && needs.bindings_wheels.result == 'success'
+      && (
+           (needs.publish.result == 'success' && needs.publish.outputs.should_publish == 'true')
+           || github.event_name == 'workflow_dispatch'
+         )
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: write   # attach the wheels to the GitHub Release
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: dist-*
+        path: dist
+        merge-multiple: true
+    - uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: dist
+        skip-existing: true   # a re-dispatch for an existing version is a no-op, not an error
+    - name: Resolve the release version
+      id: ver
+      shell: bash
+      run: |
+        v="${{ needs.publish.outputs.version }}"
+        if [ -z "$v" ]; then
+          v=$(ls dist/medius-*.whl | head -1 | sed -E 's#.*/medius-([^-]+)-.*#\1#')
+        fi
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+    - name: Attach the wheels to the release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.ver.outputs.version }}
+        # Wheels only: the sdist is a PyPI-fallback artifact, not a release binary.
+        files: dist/*.whl
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  capi_libs:
+    name: C ABI library (${{ matrix.os }})
+    needs: publish
+    # Real release, or a manual dispatch (to backfill a version's tarballs).
+    if: always() && (needs.publish.outputs.should_publish == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native runners give linux x86_64/arm64, macOS arm64, windows amd64;
+        # the macOS runner also cross-builds the x86_64 (Intel) library below.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install libudev (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+    - uses: Swatinem/rust-cache@v2
+    - name: Resolve the release version
+      id: ver
+      shell: bash
+      run: |
+        v="${{ needs.publish.outputs.version }}"
+        if [ -z "$v" ]; then
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="medius") | .version')
+        fi
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+    - name: Build the C ABI library
+      run: cargo build -p medius-capi --release
+    - name: Build the macOS Intel library (cross)
+      if: runner.os == 'macOS'
+      run: |
+        rustup target add x86_64-apple-darwin
+        cargo build -p medius-capi --release --target x86_64-apple-darwin
+    - name: Package header + libraries
+      shell: bash
+      run: |
+        pkg() {
+          triple="$1"; libdir="$2"
+          out="medius-capi-${triple}"
+          mkdir -p "$out/include" "$out/lib"
+          cp medius-capi/include/medius.h "$out/include/"
+          cp "$libdir"/*medius_capi.{so,dylib,a} "$out/lib/" 2>/dev/null || true
+          cp "$libdir"/medius_capi.dll "$libdir"/medius_capi.dll.lib "$libdir"/medius_capi.lib "$out/lib/" 2>/dev/null || true
+          tar -czf "${out}.tar.gz" "$out"
+        }
+        pkg "$(rustc -vV | sed -n 's/host: //p')" "target/release"
+        if [ "${{ runner.os }}" = "macOS" ]; then
+          pkg "x86_64-apple-darwin" "target/x86_64-apple-darwin/release"
+        fi
+        ls -la medius-capi-*.tar.gz
+    - uses: actions/upload-artifact@v4
+      with:
+        name: capi-${{ matrix.os }}
+        path: medius-capi-*.tar.gz
+    - name: Attach to the release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.ver.outputs.version }}
+        files: medius-capi-*.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --- C ABI + Python binding validation (gates the publish job above) ---
+
+  capi:
+    name: C ABI build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Install libudev (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+    - uses: Swatinem/rust-cache@v2
+    - name: Build (default features)
+      run: cargo build -p medius-capi --verbose
+    - name: Build (mock)
+      run: cargo build -p medius-capi --features mock --verbose
+    - name: Test (mock)
+      run: cargo test -p medius-capi --features mock --verbose
+    - name: Compile and link the header as C99, C23 and C++17 (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        printf '#include <medius.h>\nint main(void) { return medius_abi_version() == MEDIUS_ABI_VERSION ? 0 : 1; }\n' > abi.c
+        cp abi.c abi.cpp
+        flags="-Wall -Wextra -pedantic -Werror -DMEDIUS_FEATURE_MOCK -Imedius-capi/include -Ltarget/debug"
+        for std in c99 c2x; do
+          gcc -std=$std $flags abi.c -lmedius_capi -o abi && LD_LIBRARY_PATH=target/debug ./abi
+        done
+        g++ -std=c++17 $flags abi.cpp -lmedius_capi -o abi && LD_LIBRARY_PATH=target/debug ./abi
+
+  capi-lint:
+    name: C ABI clippy + fmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+    - uses: Swatinem/rust-cache@v2
+    - name: Format
+      run: cargo fmt -p medius-capi -- --check
+    - name: Clippy
+      run: cargo clippy -p medius-capi --all-targets --all-features -- -D warnings
+
+  cbindgen-drift:
+    name: cbindgen header is up to date
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: cbindgen@0.29.4
+    - name: Regenerate the header
+      run: bash tools/gen-header.sh
+    - name: Fail if the committed header is stale
+      run: git diff --exit-code medius-capi/include/medius.h
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Install libudev
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+    - uses: Swatinem/rust-cache@v2
+    - name: Install pytest
+      run: python -m pip install --upgrade pip pytest
+    - name: Run the mock-backed suite
+      # conftest builds the mock cdylib and points MEDIUS_LIB at it.
+      run: python -m pytest bindings/python/tests/ -v

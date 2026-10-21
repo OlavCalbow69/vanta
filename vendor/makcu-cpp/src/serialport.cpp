@@ -13,6 +13,7 @@
 #include <string_view>
 #include <utility>
 #include <limits>
+#include <iterator>
 #include <variant>
 
 #ifdef _WIN32
@@ -95,6 +96,10 @@ bool SerialPort::open(const std::string& port, uint32_t baudRate) {
 
 		m_portName = port;
 		m_baudRate.store(baudRate, std::memory_order_relaxed);
+		{
+			std::lock_guard<std::mutex> errorLock(m_errorMutex);
+			m_lastError.clear();
+		}
 
 		// Unified logic with platform abstraction
 #ifdef _WIN32
@@ -188,12 +193,14 @@ bool SerialPort::isActuallyConnected() const {
 
 #ifdef _WIN32
 	// Windows: Check if handle is still valid
+	std::lock_guard<std::mutex> nativeLock(m_nativeHandleMutex);
 	if (m_handle == INVALID_HANDLE_VALUE) {
 		return false;
 	}
 
 	// Try to get comm state to verify device is still there
-	DCB dcb;
+	DCB dcb{};
+	dcb.DCBlength = sizeof(dcb);
 	return GetCommState(m_handle, &dcb) != 0;
 #else
 	// Linux: Check if file descriptor is still valid
@@ -276,7 +283,7 @@ std::future<std::string> SerialPort::sendTrackedCommand(const std::string& comma
 			try {
 				std::string errorMsg = "Write failed";
 				if (bytesWritten < 0) {
-					errorMsg += " (" + getLastPlatformError() + ")";
+					errorMsg += " (" + getLastError() + ")";
 				}
 				else {
 					errorMsg += " (partial write: " + std::to_string(bytesWritten) +
@@ -637,7 +644,8 @@ uint32_t SerialPort::getTimeout() const noexcept {
 }
 
 std::string SerialPort::getLastError() {
-    return getLastPlatformError();
+    std::lock_guard<std::mutex> lock(m_errorMutex);
+    return m_lastError;
 }
 
 std::vector<std::string> SerialPort::getAvailablePorts() {
@@ -817,9 +825,14 @@ bool SerialPort::platformOpen(const std::string& devicePath) {
 	               FILE_ATTRIBUTE_NORMAL,
 	               nullptr
 	           );
-	return m_handle != INVALID_HANDLE_VALUE;
+	if (m_handle == INVALID_HANDLE_VALUE) {
+		recordPlatformError("CreateFile");
+		return false;
+	}
+	return true;
 #else
 	m_fd = ::open(devicePath.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+	if (m_fd < 0) recordPlatformError("open");
 	return m_fd >= 0;
 #endif
 }
@@ -845,6 +858,7 @@ bool SerialPort::platformConfigurePort() {
 	m_dcb.DCBlength = sizeof(DCB);
 
 	if (!GetCommState(m_handle, &m_dcb)) {
+		recordPlatformError("GetCommState");
 		return false;
 	}
 
@@ -867,14 +881,15 @@ bool SerialPort::platformConfigurePort() {
 	m_dcb.fAbortOnError = FALSE;
 
 	if (!SetCommState(m_handle, &m_dcb)) {
+		recordPlatformError("SetCommState");
 		return false;
 	}
 
-	platformUpdateTimeoutsUnlocked();
-	return true;
+	return platformUpdateTimeoutsUnlocked();
 #else
 	// Linux implementation using termios
 	if (tcgetattr(m_fd, &m_oldTermios) != 0) {
+		recordPlatformError("tcgetattr");
 		return false;
 	}
 
@@ -967,6 +982,7 @@ bool SerialPort::platformConfigurePort() {
 	cfsetospeed(&m_newTermios, speed);
 
 	if (tcsetattr(m_fd, TCSANOW, &m_newTermios) != 0) {
+		recordPlatformError("tcsetattr");
 		return false;
 	}
 
@@ -979,10 +995,10 @@ bool SerialPort::platformConfigurePort() {
 
 void SerialPort::platformUpdateTimeouts() {
 	std::lock_guard<std::mutex> nativeLock(m_nativeHandleMutex);
-	platformUpdateTimeoutsUnlocked();
+	(void)platformUpdateTimeoutsUnlocked();
 }
 
-void SerialPort::platformUpdateTimeoutsUnlocked() {
+bool SerialPort::platformUpdateTimeoutsUnlocked() {
 #ifdef _WIN32
 	// Gaming-optimized timeouts - much faster than original
 	m_timeouts.ReadIntervalTimeout = 1;          // 1ms between bytes
@@ -991,7 +1007,10 @@ void SerialPort::platformUpdateTimeoutsUnlocked() {
 	m_timeouts.WriteTotalTimeoutConstant = 10;   // 10ms write timeout
 	m_timeouts.WriteTotalTimeoutMultiplier = 1;  // 1ms per byte
 
-	SetCommTimeouts(m_handle, &m_timeouts);
+	if (!SetCommTimeouts(m_handle, &m_timeouts)) {
+		recordPlatformError("SetCommTimeouts");
+		return false;
+	}
 #else
 	// Linux gaming-optimized timeouts - match Windows performance
 	if (m_isOpen.load(std::memory_order_acquire) && m_fd >= 0) {
@@ -1006,6 +1025,7 @@ void SerialPort::platformUpdateTimeoutsUnlocked() {
 		}
 	}
 #endif
+	return true;
 }
 
 ssize_t SerialPort::platformWrite(const void* data, size_t length) {
@@ -1013,6 +1033,7 @@ ssize_t SerialPort::platformWrite(const void* data, size_t length) {
 #ifdef _WIN32
 	DWORD bytesWritten = 0;
 	bool success = WriteFile(m_handle, data, static_cast<DWORD>(length), &bytesWritten, nullptr);
+	if (!success) recordPlatformError("WriteFile");
 	return success ? static_cast<ssize_t>(bytesWritten) : -1;
 #else
 	if (length == 0) {
@@ -1081,6 +1102,7 @@ ssize_t SerialPort::platformRead(void* buffer, size_t maxBytes) {
 #ifdef _WIN32
 	DWORD bytesRead = 0;
 	bool success = ReadFile(m_handle, buffer, static_cast<DWORD>(maxBytes), &bytesRead, nullptr);
+	if (!success) recordPlatformError("ReadFile");
 	return success ? static_cast<ssize_t>(bytesRead) : -1;
 #else
 	return ::read(m_fd, buffer, maxBytes);
@@ -1108,19 +1130,42 @@ size_t SerialPort::platformBytesAvailable() const {
 bool SerialPort::platformFlush() {
 	std::lock_guard<std::mutex> nativeLock(m_nativeHandleMutex);
 #ifdef _WIN32
-	return FlushFileBuffers(m_handle) != 0;
+	if (!FlushFileBuffers(m_handle)) {
+		recordPlatformError("FlushFileBuffers");
+		return false;
+	}
+	return true;
 #else
 	return tcdrain(m_fd) == 0;
 #endif
 }
 
-std::string SerialPort::getLastPlatformError() {
+void SerialPort::recordPlatformError(const char* operation) const {
 #ifdef _WIN32
-	DWORD error = GetLastError();
-	return "Windows error: " + std::to_string(error);
+	// GetLastError is thread-local and can be overwritten by cleanup or other
+	// calls. Capture it at the failing API, before formatting or releasing it.
+	const DWORD error = GetLastError();
+	wchar_t description[512]{};
+	const DWORD count=FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr,error,0,description,static_cast<DWORD>(std::size(description)),nullptr);
+	std::string detail;
+	if (count) {
+		const int bytes=WideCharToMultiByte(CP_UTF8,0,description,static_cast<int>(count),nullptr,0,nullptr,nullptr);
+		if (bytes>0) {
+			detail.resize(static_cast<size_t>(bytes));
+			WideCharToMultiByte(CP_UTF8,0,description,static_cast<int>(count),detail.data(),bytes,nullptr,nullptr);
+			for (char& c:detail) if (c=='\r' || c=='\n' || c=='\t') c=' ';
+			while (!detail.empty() && detail.back()==' ') detail.pop_back();
+		}
+	}
+	std::string message=std::string(operation)+" failed (Windows error "+std::to_string(error)+")";
+	if (!detail.empty()) message+=": "+detail;
 #else
-	return "errno: " + std::to_string(errno);
+	const int error=errno;
+	const std::string message=std::string(operation)+" failed (errno "+std::to_string(error)+"): "+std::strerror(error);
 #endif
+	std::lock_guard<std::mutex> lock(m_errorMutex);
+	m_lastError=message;
 }
 
 } // namespace makcu

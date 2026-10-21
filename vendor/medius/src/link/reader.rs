@@ -1,0 +1,154 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+
+use parking_lot::Mutex;
+
+use crate::protocol::opcode::Q_VERSION;
+use crate::protocol::{DecodedFrame, FrameDecoder, FrameType, parse_log};
+use crate::types::LogLine;
+
+use super::catch::{self, CatchReg};
+use super::correlation::{self, HELLO_SEQ, PendingEntry};
+use super::counters::Counters;
+use super::logs;
+use super::reconnect::{self, ReconnectCtx};
+use super::restart::RestartWatch;
+use super::slot::TransportSlot;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_reader(
+    transport: Arc<TransportSlot>,
+    pending: Arc<Mutex<HashMap<u8, PendingEntry>>>,
+    logs_tx: flume::Sender<LogLine>,
+    logs_rx: flume::Receiver<LogLine>,
+    updates_tx: flume::Sender<Vec<u8>>,
+    events: Arc<Mutex<CatchReg>>,
+    counters: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+    restart: Arc<RestartWatch>,
+    reconnect_ctx: ReconnectCtx,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("medius-reader".into())
+        .spawn(move || {
+            reader_loop(
+                &transport,
+                &pending,
+                &logs_tx,
+                &logs_rx,
+                &updates_tx,
+                &events,
+                &counters,
+                &stop,
+                &restart,
+                &reconnect_ctx,
+            )
+        })
+        .expect("spawn medius-reader thread")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reader_loop(
+    transport: &TransportSlot,
+    pending: &Mutex<HashMap<u8, PendingEntry>>,
+    logs_tx: &flume::Sender<LogLine>,
+    logs_rx: &flume::Receiver<LogLine>,
+    updates_tx: &flume::Sender<Vec<u8>>,
+    events: &Mutex<CatchReg>,
+    counters: &Counters,
+    stop: &AtomicBool,
+    restart: &RestartWatch,
+    reconnect_ctx: &ReconnectCtx,
+) {
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0u8; 1024];
+    let mut seen_generation = transport.generation();
+
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            transport.current().release_read();
+            return;
+        }
+        let generation = transport.generation();
+        if generation != seen_generation {
+            decoder = FrameDecoder::new();
+            seen_generation = generation;
+        }
+        let current = transport.current();
+        match current.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                decoder.feed(&buf[..n], |frame| {
+                    route_frame(
+                        frame, pending, logs_tx, logs_rx, updates_tx, events, counters, restart,
+                        transport, &reconnect_ctx.manual_recovery,
+                    );
+                });
+                counters.set_crc_drops(decoder.crc_error_count());
+            }
+            Err(_) => {
+                drop(current);
+                reconnect::auto_reconnect(reconnect_ctx, stop);
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_frame(
+    frame: DecodedFrame,
+    pending: &Mutex<HashMap<u8, PendingEntry>>,
+    logs_tx: &flume::Sender<LogLine>,
+    logs_rx: &flume::Receiver<LogLine>,
+    updates_tx: &flume::Sender<Vec<u8>>,
+    events: &Mutex<CatchReg>,
+    counters: &Counters,
+    restart: &RestartWatch,
+    transport: &TransportSlot,
+    manual_recovery: &AtomicBool,
+) {
+    counters.inc_rx();
+    trace_event!(
+        target: "medius::transport",
+        tracing::Level::TRACE,
+        dir = "rx",
+        opcode = u8::from(frame.ty),
+        seq = frame.seq,
+        len = frame.payload.len(),
+    );
+    match frame.ty {
+        // The box's hello: no query the crate waits on takes its `SEQ`.
+        FrameType::Resp if frame.seq == HELLO_SEQ && frame.payload.first() == Some(&Q_VERSION) => {
+            if manual_recovery.load(Ordering::Acquire) {
+                // A new firmware generation must never receive the old host's cached input.
+                transport.swap(Arc::new(crate::transport::Disconnected));
+                return;
+            }
+            restart.note_hello(&frame.payload, transport);
+        }
+        // `TRANSFER_RESP` shares the `RESP` pending map by `SEQ`; its opcode and echoed endpoint
+        // tell it apart from a query reply on the same `SEQ`.
+        FrameType::Resp | FrameType::TransferResp => {
+            restart.note_reply();
+            correlation::deliver(pending, frame.ty, frame.seq, frame.payload)
+        }
+        FrameType::Log => {
+            let line = parse_log(&frame.payload);
+            #[cfg(feature = "tracing")]
+            crate::trace::emit_device_log(&line);
+            logs::push(logs_tx, logs_rx, line);
+        }
+        FrameType::MotionEvent | FrameType::UsageEvent | FrameType::TrafficEvent => {
+            catch::deliver_event(events, frame.ty, &frame.payload)
+        }
+        // One acknowledgement covers a window of DATA frames with a rolling SEQ, so the caller
+        // matches on the op byte.
+        FrameType::UpdateResp => {
+            restart.note_reply();
+            let _ = updates_tx.send(frame.payload);
+        }
+        _ => {}
+    }
+}

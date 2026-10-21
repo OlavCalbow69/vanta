@@ -1,5 +1,6 @@
 #pragma once
 #include "app_settings.hpp"
+#include "stream_frame.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -11,10 +12,11 @@ struct ID3D11Device;
 
 namespace vanta
 {
+    class CaptureController;
     // A deliberately short, opt-in check for a host that has already been
     // paired with this Windows user. It launches the configured Sunshine
     // Desktop session with display-mode switching disabled, waits for Vanta's
-    // own H.264 decoder to publish a BGRA frame, and stops the session again.
+    // hardware decoder to verify a D3D11 frame, and stops the session again.
     // It is used by the command-line live smoke test; normal UI streaming
     // remains long-running.
     struct SunshineStreamSmokeTestResult
@@ -40,10 +42,16 @@ namespace vanta
         StreamReceiverController(const StreamReceiverController&) = delete;
         StreamReceiverController& operator=(const StreamReceiverController&) = delete;
 
-        void Initialize(ID3D11Device* device, const SunshineStreamConfig* config = nullptr);
+        void Initialize(ID3D11Device* device, const SunshineStreamConfig* config = nullptr,CaptureController* capture = nullptr);
         SunshineStreamConfig GetConfig() const;
         std::uint64_t SettingsRevision() const noexcept;
         void Tick();
+        void SetDiagnosticContextProvider(std::function<std::string()> provider);
+        void FinishPreviewFrame();
+        std::uint64_t CurrentGeneration() const;
+        void RecordPublication(const CapturedFrameMetadata& metadata);
+        void InvalidateFrames();
+        bool ReadbackRegions(const FrameReadbackRequest& request,CpuFrameSnapshot& output,std::stop_token stop);
         void RenderPanel();
         void Shutdown();
 

@@ -41,6 +41,7 @@ namespace vanta
     {
         left = 0,
         right = 1,
+        middle = 2,
         x1 = 3,
         x2 = 4
     };
@@ -52,6 +53,7 @@ namespace vanta
         {
         case MouseButtonBinding::left:
         case MouseButtonBinding::right:
+        case MouseButtonBinding::middle:
         case MouseButtonBinding::x1:
         case MouseButtonBinding::x2:
             return true;
@@ -62,8 +64,6 @@ namespace vanta
 
     struct CaptureConfig
     {
-        int backendIndex{};
-        int sourceIndex{1};
         int regionIndex{1};
         int regionSize{640};
         bool drawOutline{true};
@@ -72,18 +72,21 @@ namespace vanta
         bool applyFilter{};
         bool binaryMask{};
         int colorTargetIndex{};
-        std::string monitorDevice;
-        std::string windowExecutable;
-        std::string windowClass;
-        std::string windowTitle;
     };
 
+    enum class InputBackend : int { makcu=0,medius=1 };
+    enum class PythonPhysicalInputMode : std::uint8_t { existing, fuse };
+    constexpr const char* PythonPhysicalInputModeJsonName(PythonPhysicalInputMode mode) noexcept
+    {return mode==PythonPhysicalInputMode::fuse?"fuse":"existing";}
     struct MouseOutputConfig
     {
-        int backendIndex{};
+        InputBackend backend{InputBackend::makcu};
         std::string makcuPort;
         bool highPerformanceMode{true};
         bool autoDetectAndConnect{true};
+        bool lockMovementWhileCorrecting{true};
+        bool lockGeneratedClick{true};
+        bool reserveActivationSideButtons{true};
     };
 
     struct UpdateConfig
@@ -93,46 +96,17 @@ namespace vanta
         bool silentAutomaticInstallation{true};
     };
 
-    struct BombTimerConfig
-    {
-        bool enabled{};
-        RgbaColor targetColor{
-            170.0F / 255.0F,
-            0.0F,
-            0.0F,
-            1.0F};
-        int colorTolerance{30};
-        float regionLeft{918.0F / 1920.0F};
-        float regionTop{6.0F / 1080.0F};
-        float regionWidth{79.0F / 1920.0F};
-        float regionHeight{68.0F / 1080.0F};
-        int requiredMatchingPixels{3};
-        int requiredConsecutiveFrames{3};
-        RgbaColor safeColor{
-            120.0F / 255.0F,
-            1.0F,
-            120.0F / 255.0F,
-            1.0F};
-        RgbaColor warningColor{
-            1.0F,
-            100.0F / 255.0F,
-            100.0F / 255.0F,
-            1.0F};
-        float widgetOpacity{0.80F};
-        int widgetStyle{};
-        int widgetFont{};
-        bool hasWidgetPosition{};
-        float widgetPositionX{};
-        float widgetPositionY{};
-    };
+    enum class CodecPreference : int { Auto, H264, HEVC, AV1 };
 
     struct SunshineStreamConfig
     {
         int width{2560};
         int height{1440};
-        int fps{120};
+        int fps{240};
         int bitrateKbps{150000};
         bool requestDisplayMode{true};
+        CodecPreference codec{CodecPreference::Auto};
+        std::string adapter{"auto"};
         bool operator==(const SunshineStreamConfig&) const = default;
     };
 
@@ -286,20 +260,21 @@ namespace vanta
 
     struct LocalConfig
     {
-        static constexpr int schemaVersion = 7;
+        static constexpr int schemaVersion = 10;
         CaptureConfig capture;
         SunshineStreamConfig sunshine;
         MouseOutputConfig mouseOutput;
         UpdateConfig updates;
-        BombTimerConfig bombTimer;
+        std::string pythonConfigJson;
         MenuConfig menu;
     };
 
     struct SharedProfile
     {
-        static constexpr int schemaVersion = 8;
+        static constexpr int schemaVersion = 9;
         std::string name;
         TestClickConfig testClick;
         TestMoveConfig testMove;
+        std::string pythonConfigJson;
     };
 }

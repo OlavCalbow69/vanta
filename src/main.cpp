@@ -2,6 +2,7 @@
 #include "overlay_app.hpp"
 #include "update_controller.hpp"
 #include "version.hpp"
+#include "input_recovery.hpp"
 
 #include <Windows.h>
 
@@ -36,11 +37,13 @@ namespace
 
 int wmain(int argumentCount, wchar_t** arguments)
 {
+    int recoveryResult{};
+    if(vanta::RunInputRecoveryMode(argumentCount,arguments,recoveryResult))return recoveryResult;
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     vanta::log::Initialize(instance);
     vanta::log::Info(
         "vanta external overlay %s starting",
-        VANTA_VERSION_STRING);
+        VANTA_VERSION_FILE_STRING);
 
     bool updaterLaunched = false;
     vanta::LaunchUpdateBootstrapIfNeeded(

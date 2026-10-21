@@ -3,11 +3,14 @@
 #include "capture_controller.hpp"
 #include "target_detection.hpp"
 #include "target_detection_ui.hpp"
-#include "bomb_timer_controller.hpp"
+#include "python_bot_controller.hpp"
 #include "config_manager.hpp"
 #include "hardware_video_decoder.hpp"
+#include "preview_mask.hpp"
 #include "logger.hpp"
 #include "makcu_controller.hpp"
+#include "medius_backend.hpp"
+#include "stream_diagnostics.hpp"
 #include "pretty_menu.hpp"
 #include "sunshine_pairing.hpp"
 #include "testclick_controller.hpp"
@@ -22,7 +25,8 @@
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dxgi1_3.h>
-#include <gdiplus.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -46,6 +50,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -67,12 +72,11 @@ namespace
     constexpr int kMenuToggleHotkeyId = 0x5601;
     constexpr int kExitEndHotkeyId = 0x5602;
     constexpr int kExitDeleteHotkeyId = 0x5603;
-    constexpr int kBombTimerResetHotkeyId = 0x5604;
 
     struct Options
     {
         std::uint64_t selfTestFrames{};
-        int captureTestBackend{};
+        int selfTestPage{-1};
         bool updatePageTest{};
     };
 
@@ -123,34 +127,8 @@ namespace
             options.selfTestFrames =
                 std::wcstoull(value->c_str(), nullptr, 10);
         }
-        if (HasArgument(
-                argumentCount,
-                arguments,
-                L"--capture-test-winrt"))
-        {
-            options.captureTestBackend = 1;
-        }
-        if (HasArgument(
-                argumentCount,
-                arguments,
-                L"--capture-test-duplication"))
-        {
-            options.captureTestBackend = 2;
-        }
-        if (HasArgument(
-                argumentCount,
-                arguments,
-                L"--capture-test-winrt-window"))
-        {
-            options.captureTestBackend = 3;
-        }
-        if (HasArgument(
-                argumentCount,
-                arguments,
-                L"--capture-test-duplication-window"))
-        {
-            options.captureTestBackend = 4;
-        }
+        if (const auto page=ArgumentValue(argumentCount,arguments,L"--page-test"))
+            options.selfTestPage=std::clamp(static_cast<int>(std::wcstol(page->c_str(),nullptr,10)),0,9);
         options.updatePageTest = HasArgument(
             argumentCount,
             arguments,
@@ -789,36 +767,17 @@ namespace
                 HResultText(apartment.Result()).c_str());
             return false;
         }
-        constexpr D3D_FEATURE_LEVEL levels[]{
-            D3D_FEATURE_LEVEL_11_1,
-            D3D_FEATURE_LEVEL_11_0,
-            D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_10_0};
         ComPtr<ID3D11Device> device;
         ComPtr<ID3D11DeviceContext> context;
-        D3D_FEATURE_LEVEL selected{};
-        const HRESULT result = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels,
-            static_cast<UINT>(std::size(levels)),
-            D3D11_SDK_VERSION,
-            &device,
-            &selected,
-            &context);
-        if (FAILED(result))
+        std::string error;
+        if (!vanta::HardwareVideoDecoder::CreateRenderDevice("auto",&device,&context,error))
         {
             vanta::log::Error(
-                "receiver self-test could not create a hardware D3D11 video device: 0x%08lX",
-                static_cast<unsigned long>(result));
+                "receiver self-test could not create a hardware D3D11 video device: %s",error.c_str());
             return false;
         }
 
         vanta::HardwareVideoDecoder decoder;
-        std::string error;
         if (!decoder.Initialize(device.Get(), error) ||
             decoder.Configure(
                 VIDEO_FORMAT_H264,
@@ -850,6 +809,7 @@ namespace
                 H264NaluTypeSummary(accessUnits[index]).c_str());
         }
         decoder.Start();
+        std::uint64_t fixtureSequence{};vanta::CpuFrameSnapshot fixtureFrame;
         for (std::size_t index = 0; index < accessUnits.size(); ++index)
         {
             // common-c delivers each completed picture as an LENTRY chain.
@@ -879,6 +839,8 @@ namespace
                     : nullptr;
             }
             DECODE_UNIT decodeUnit{};
+            decodeUnit.frameNumber=int(index+1);
+            decodeUnit.receiveTimeUs=decodeUnit.enqueueTimeUs=vanta::StreamNowUs();
             decodeUnit.frameType = index == 0 ? FRAME_TYPE_IDR : FRAME_TYPE_PFRAME;
             decodeUnit.presentationTimeUs = static_cast<std::uint64_t>(index) * 1000000ULL / kReceiverSelfTestFps;
             decodeUnit.fullLength = static_cast<int>(accessUnits[index].size());
@@ -898,6 +860,17 @@ namespace
                 decoder.Shutdown();
                 return false;
             }
+            const auto deadline=vanta::StreamNowUs()+3000000;
+            bool published{};
+            do
+            {
+                published=decoder.Readback({fixtureSequence,{{vanta::FrameRegionKind::fullSource}}},fixtureFrame,{});
+                if(published)break;
+                if(decoder.GetStats().failed)break;
+            }while(vanta::StreamNowUs()<deadline);
+            if(!published || fixtureFrame.metadata.frameNumber!=int(index+1) || fixtureFrame.bgra.type()!=CV_8UC4)
+            {vanta::log::Error("Receiver fixture could not read back the associated native hardware frame");decoder.Shutdown();return false;}
+            fixtureSequence=fixtureFrame.metadata.sequence;
         }
 
         bool decoded{};
@@ -906,15 +879,10 @@ namespace
             const vanta::DecodedVideoStats stats = decoder.GetStats();
             if (stats.decodedFrames != 0)
             {
-                ID3D11ShaderResourceView* frameView = decoder.AcquireFrameView();
                 decoded =
-                    frameView != nullptr &&
+                    stats.hardwareActive && !fixtureFrame.bgra.empty() &&
                     stats.width == static_cast<int>(kReceiverSelfTestWidth) &&
                     stats.height == static_cast<int>(kReceiverSelfTestHeight);
-                if (frameView != nullptr)
-                {
-                    frameView->Release();
-                }
                 if (!decoded)
                 {
                     error = "The H.264 decoder did not publish a GPU presentation frame";
@@ -1125,23 +1093,21 @@ namespace
 
         int Run()
         {
-            if (!CreateOverlayWindow() ||
-                !CreateGraphics() ||
-                !CreateLogoTexture() ||
-                !InitializeImGui())
+            if (!CreateOverlayWindow())
             {
                 Shutdown();
                 return 1;
             }
 
             vanta::LocalConfig defaultConfig;
+            defaultConfig.pythonConfigJson=vanta::DefaultPythonBotJson();
             defaultConfig.menu =
                 vanta::menu::GetConfig();
             if (options_.selfTestFrames != 0)
             {
                 defaultConfig.menu.activePage =
-                    options_.updatePageTest ? 8 : 7;
-                defaultConfig.bombTimer.enabled = true;
+                    options_.selfTestPage>=0 ? options_.selfTestPage : options_.updatePageTest ? 8 : 7;
+                defaultConfig.mouseOutput.autoDetectAndConnect=false;
             }
             if (!configManager_.Initialize(
                     options_.selfTestFrames == 0,
@@ -1152,36 +1118,56 @@ namespace
             }
             const vanta::LocalConfig& initialConfig =
                 configManager_.InitialLocalConfig();
+            graphicsAdapterPreference_=initialConfig.sunshine.adapter;
+            if (!CreateGraphics() || !CreateLogoTexture() || !InitializeImGui())
+            { Shutdown(); return 1; }
+            vanta::SetMaskPreviewDevice(device_.Get(),context_.Get());
             vanta::menu::ApplyConfig(
                 initialConfig.menu);
             updates_.Initialize(
                 initialConfig.updates,
                 options_.selfTestFrames == 0 &&
-                    options_.captureTestBackend == 0 &&
                     VANTA_AUTOMATED_RELEASE_BUILD != 0);
-            streamReceiver_.Initialize(device_.Get(), &initialConfig.sunshine);
-            capture_.SetSunshineVideoFrameProvider(
-                [this](
-                    const std::uint64_t afterSequence,
-                    cv::Mat& frame,
-                    std::uint64_t& sequence)
-                {
-                    return streamReceiver_.CopyLatestFrameToBgra(
-                        afterSequence,
-                        frame,
-                        sequence);
-                });
+            streamReceiver_.Initialize(device_.Get(), &initialConfig.sunshine,&capture_);
+            if (options_.selfTestFrames != 0)
+            {
+                // Test fixture only: no local capture and no Sunshine launch,
+                // pairing, settings writes, serial connection or mouse output.
+                capture_.SetRegionFrameProvider(
+                    [sequence=std::uint64_t{}](const vanta::FrameReadbackRequest& request,vanta::CpuFrameSnapshot& frame,std::stop_token stop) mutable
+                    {
+                        std::mutex mutex;std::condition_variable_any condition;std::unique_lock lock(mutex);
+                        condition.wait_for(lock,stop,std::chrono::microseconds(4167),[]{return false;});
+                        if(stop.stop_requested())return false;
+                        const auto roi=vanta::MergeFrameRegions(request.regions,2560,1440);if(roi.empty())return false;
+                        frame.bgra=cv::Mat(roi.height,roi.width,CV_8UC4,cv::Scalar(20,20,20,255));
+                        const auto paint=[&](const cv::Rect& rectangle,const cv::Scalar& fill)
+                        {const auto visible=rectangle&roi;if(!visible.empty())frame.bgra(cv::Rect(visible.x-roi.x,visible.y-roi.y,visible.width,visible.height)).setTo(fill);};
+                        paint({1220,0,120,120},{0,0,170,255});paint({1270,680,8,40},{255,0,255,255});
+                        auto& metadata=frame.metadata;metadata.sequence=++sequence;metadata.generation=metadata.session=1;
+                        metadata.sourceWidth=metadata.textureWidth=2560;metadata.sourceHeight=metadata.textureHeight=1440;
+                        metadata.cropX=roi.x;metadata.cropY=roi.y;metadata.cropWidth=roi.width;metadata.cropHeight=roi.height;
+                        metadata.timing.receivedUs=metadata.timing.readbackUs=vanta::StreamNowUs();
+                        metadata.captureTimestampNanoseconds=std::int64_t(metadata.timing.readbackUs*1000);
+                        return true;
+                    });
+            }
+            else
+            {
+                capture_.SetGenerationProvider([this]{return streamReceiver_.CurrentGeneration();});
+                capture_.SetPublicationObserver([this](const auto& metadata){streamReceiver_.RecordPublication(metadata);});
+                capture_.SetRegionFrameProvider([this](const vanta::FrameReadbackRequest& request,
+                    vanta::CpuFrameSnapshot& frame,std::stop_token stop)
+                    { return streamReceiver_.ReadbackRegions(request,frame,stop); });
+            }
 
             if (
                 !capture_.Initialize(
                     device_.Get(),
                     context_.Get(),
-                    GetCurrentProcessId(),
                     &initialConfig.capture) ||
                 !makcu_.Initialize(
-                    &initialConfig.mouseOutput) ||
-                !CreateOutlineWindow() ||
-                !CreateFovWindow())
+                    &initialConfig.mouseOutput))
             {
                 Shutdown();
                 return 1;
@@ -1189,20 +1175,40 @@ namespace
 
             testClick_.Initialize(&capture_, &makcu_);
             testMove_.Initialize(&capture_, &makcu_);
-            bombTimer_.Initialize(
-                &capture_,
-                device_.Get(),
-                context_.Get(),
-                window_,
-                &initialConfig.bombTimer);
-            if (options_.selfTestFrames != 0)
+            if (options_.selfTestFrames!=0 && options_.selfTestPage==4)
             {
-                bombTimer_.StartManualCountdown();
+                auto config=testClick_.GetConfig();
+                config.enabled=true;
+                testClick_.ApplyConfig(config);
             }
+            if (options_.selfTestFrames!=0 && options_.selfTestPage==5)
+            {
+                auto config=testMove_.GetConfig();
+                config.enabled=true;
+                testMove_.ApplyConfig(config);
+            }
+            pythonBot_.Initialize(&capture_,&makcu_,initialConfig.pythonConfigJson);
+            streamReceiver_.SetDiagnosticContextProvider([this]
+            {
+                const auto python=pythonBot_.GetConfig();
+                return std::string("{\"makcu\":")+makcu_.DiagnosticsJson()+",\"python_enabled\":"+(pythonBot_.IsEnabled()?"true":"false")
+                    +",\"python_fov_radius\":"+std::to_string(python.fovRadius)+",\"python_crop_side\":"+std::to_string(python.fovRadius*2)
+                    +",\"python_debug_move_logging\":"+(python.makcuDebug?"true":"false")
+                    +",\"python_axis_mode\":\""+PythonAxisModeJsonName(python.axisMode)+"\""
+                    +",\"python_hybrid_vertical_time_ms\":"+std::to_string(python.hybridVerticalTimeMilliseconds)
+                    +",\"python_processed_total\":"+std::to_string(pythonBot_.ProcessedFrames())
+                    +",\"python_output\":"+pythonBot_.DiagnosticsJson()
+                    +",\"testmove_enabled\":"+(testMove_.GetConfig().enabled?"true":"false")
+                    +",\"testclick_enabled\":"+(testClick_.GetConfig().enabled?"true":"false")
+                    +",\"ui_visible\":"+(overlayVisible_?"true":"false")+",\"ui_rendered_total\":"+std::to_string(renderedFrames_)
+                    +",\"ui_fps_cap\":60}";
+            });
+            if (options_.selfTestFrames!=0 && options_.selfTestPage==7)
+                pythonBot_.SetEnabled(true);
             configManager_.PrimeRevisions(
                 capture_,
                 makcu_,
-                bombTimer_,
+                pythonBot_,
                 updates_, streamReceiver_);
             if (options_.selfTestFrames == 0)
             {
@@ -1210,29 +1216,18 @@ namespace
             }
 
             vanta::log::Info(
-                "overlay ready; Insert toggles the menu, Home resets the Bomb Timer, End/Delete close Vanta");
+                "overlay ready; Insert toggles the menu, End/Delete close Vanta");
             vanta::log::Info(
                 "mode: always-on-top virtual desktop (all applications)");
-            if (options_.captureTestBackend != 0 &&
-                !capture_.StartAutomatedCapture(
-                    options_.captureTestBackend == 2 ||
-                        options_.captureTestBackend == 4,
-                    options_.captureTestBackend >= 3))
-            {
-                vanta::log::Error(
-                    "automated capture test could not start");
-                Shutdown();
-                return 1;
-            }
-
             while (!exitRequested_)
             {
-                if (g_externalExitRequested.load(
-                        std::memory_order_acquire))
-                {
-                    RequestExit(
-                        "console or system exit requested");
-                }
+                // Capture and consumers have their own notification-driven workers.
+                // UI status/presentation runs at most 60 Hz and sleeps while hidden.
+                const auto uiNow=vanta::StreamNowUs();
+                const DWORD waitMs=overlayVisible_ ? DWORD(uiNow<nextUiFrameUs_ ? (nextUiFrameUs_-uiNow+999)/1000 : 0) : 50;
+                MsgWaitForMultipleObjectsEx(0,nullptr,waitMs,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+                if (g_externalExitRequested.load(std::memory_order_acquire))
+                    RequestExit("console or system exit requested");
 
                 MSG message{};
                 while (PeekMessageW(
@@ -1256,23 +1251,54 @@ namespace
 
                 UpdateDesktopBounds();
                 ResizeIfNeeded();
+                if(exitRequested_)break;
+                if (options_.selfTestFrames!=0 && options_.selfTestPage==7)
+                {
+                    if (renderedFrames_==10)
+                    {
+                        auto test=testMove_.GetConfig();
+                        test.enabled=true;
+                        testMove_.ApplyConfig(test);
+                    }
+                    if (renderedFrames_==20 || renderedFrames_==40) pythonBot_.SetEnabled(true);
+                    if (renderedFrames_==30)
+                    {
+                        std::string error;
+                        if (!pythonBot_.ApplyConfigJson(pythonBot_.GetConfigJson(),error))
+                            movementSelfTestFailed_=true;
+                    }
+                }
                 streamReceiver_.Tick();
                 capture_.Tick();
                 makcu_.Tick();
                 testClick_.Tick();
                 testMove_.Tick();
-                bombTimer_.Tick();
-                UpdateCaptureOutline();
-                UpdateFovOutline();
+                CoordinateMovementModes();
+                if (options_.selfTestFrames!=0 && options_.selfTestPage==7)
+                {
+                    const bool python=pythonBot_.IsEnabled(),test=testMove_.GetConfig().enabled;
+                    if ((renderedFrames_==10 && (python || !test)) ||
+                        ((renderedFrames_==20 || renderedFrames_==40) && (!python || test)) ||
+                        (renderedFrames_==30 && (python || test)) || (python && test))
+                    {
+                        movementSelfTestFailed_=true;
+                        vanta::log::Error("Python/TestMove self-test ownership or load-disarm invariant failed");
+                    }
+                }
+                UpdateStreamPreviewFov();
 
-                if (overlayVisible_)
+                if (overlayVisible_ && vanta::StreamNowUs()>=nextUiFrameUs_ &&
+                    (!presentationReady_ || WaitForSingleObject(presentationReady_,0)==WAIT_OBJECT_0))
                 {
                     RenderFrame();
+                    nextUiFrameUs_=vanta::StreamNowUs()+16667;
                 }
+                else if (overlayVisible_ && vanta::StreamNowUs()>=nextUiFrameUs_)
+                    nextUiFrameUs_=vanta::StreamNowUs()+2000;
                 configManager_.AutoSaveLocal(
                     capture_,
                     makcu_,
-                    bombTimer_,
+                    pythonBot_,
                     updates_, streamReceiver_);
 
                 if (options_.selfTestFrames != 0 &&
@@ -1289,12 +1315,13 @@ namespace
                 options_.selfTestFrames == 0 ||
                 (renderedFrames_ >=
                     options_.selfTestFrames &&
-                 bombTimer_.HasCaptureFrame());
+                 (options_.selfTestPage!=7 || pythonBot_.ProcessedFrames()>0) && !movementSelfTestFailed_);
             if (options_.selfTestFrames != 0 &&
-                !bombTimer_.HasCaptureFrame())
+                options_.selfTestPage==7 &&
+                pythonBot_.ProcessedFrames()==0)
             {
                 vanta::log::Error(
-                    "self-test did not receive a Bomb Timer auxiliary frame");
+                    "self-test did not process a Python region subscription frame");
             }
             Shutdown();
             return selfTestPassed ? 0 : 1;
@@ -1436,49 +1463,10 @@ namespace
 
         bool CreateGraphics()
         {
-            constexpr D3D_FEATURE_LEVEL levels[]{
-                D3D_FEATURE_LEVEL_11_1,
-                D3D_FEATURE_LEVEL_11_0,
-                D3D_FEATURE_LEVEL_10_1,
-                D3D_FEATURE_LEVEL_10_0};
-
-            D3D_FEATURE_LEVEL selected{};
-            HRESULT result = D3D11CreateDevice(
-                nullptr,
-                D3D_DRIVER_TYPE_HARDWARE,
-                nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-                levels,
-                static_cast<UINT>(std::size(levels)),
-                D3D11_SDK_VERSION,
-                &device_,
-                &selected,
-                &context_);
-            if (FAILED(result))
-            {
-                vanta::log::Warning(
-                    "hardware D3D11 device failed (0x%08lX); trying WARP",
-                    static_cast<unsigned long>(result));
-                result = D3D11CreateDevice(
-                    nullptr,
-                    D3D_DRIVER_TYPE_WARP,
-                    nullptr,
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    levels,
-                    static_cast<UINT>(std::size(levels)),
-                    D3D11_SDK_VERSION,
-                    &device_,
-                    &selected,
-                    &context_);
-            }
-            if (FAILED(result))
-            {
-                vanta::log::Error(
-                    "D3D11CreateDevice failed: 0x%08lX",
-                    static_cast<unsigned long>(result));
-                return false;
-            }
+            std::string error;
+            if (!vanta::HardwareVideoDecoder::CreateRenderDevice(graphicsAdapterPreference_,&device_,&context_,error))
+            { vanta::log::Error("D3D11 adapter selection failed: %s",error.c_str()); return false; }
+            HRESULT result=S_OK;
 
             ComPtr<IDXGIDevice> dxgiDevice;
             ComPtr<IDXGIAdapter> adapter;
@@ -1501,6 +1489,7 @@ namespace
             description.Scaling = DXGI_SCALING_STRETCH;
             description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
             description.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            description.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
             ComPtr<IDXGISwapChain1> swapChain1;
             result = factory->CreateSwapChainForComposition(
@@ -1521,7 +1510,12 @@ namespace
                     "IDXGISwapChain2 is unavailable");
                 return false;
             }
-            swapChain_->SetMaximumFrameLatency(1);
+            result=swapChain_->SetMaximumFrameLatency(1);
+            if (FAILED(result))
+            { vanta::log::Error("SetMaximumFrameLatency failed: 0x%08lX",static_cast<unsigned long>(result)); return false; }
+            presentationReady_=swapChain_->GetFrameLatencyWaitableObject();
+            if (!presentationReady_)
+            { vanta::log::Error("The composition swap chain did not expose its presentation wait handle"); return false; }
 
             result = DCompositionCreateDevice(
                 dxgiDevice.Get(),
@@ -1567,132 +1561,6 @@ namespace
 
             vanta::log::Info(
                 "D3D11 DirectComposition surface initialized");
-            return true;
-        }
-
-        bool CreateOutlineWindow()
-        {
-            WNDCLASSEXW windowClass{
-                sizeof(WNDCLASSEXW),
-                0,
-                &StaticOutlineWindowProcedure,
-                0,
-                0,
-                instance_,
-                nullptr,
-                LoadCursorW(nullptr, IDC_ARROW),
-                nullptr,
-                nullptr,
-                L"VantaCaptureOutline",
-                nullptr};
-            if (RegisterClassExW(&windowClass) == 0)
-            {
-                vanta::log::Error(
-                    "outline RegisterClassExW failed: %lu",
-                    GetLastError());
-                return false;
-            }
-            outlineClassRegistered_ = true;
-
-            outlineWindow_ = CreateWindowExW(
-                WS_EX_TOPMOST |
-                    WS_EX_TOOLWINDOW |
-                    WS_EX_LAYERED |
-                    WS_EX_TRANSPARENT |
-                    WS_EX_NOACTIVATE,
-                windowClass.lpszClassName,
-                L"vanta capture region",
-                WS_POPUP,
-                0,
-                0,
-                1,
-                1,
-                nullptr,
-                nullptr,
-                instance_,
-                this);
-            if (outlineWindow_ == nullptr)
-            {
-                vanta::log::Error(
-                    "capture outline CreateWindowExW failed: %lu",
-                    GetLastError());
-                return false;
-            }
-
-            SetLayeredWindowAttributes(
-                outlineWindow_,
-                outlineTransparencyKey_,
-                255,
-                LWA_COLORKEY | LWA_ALPHA);
-            SetWindowDisplayAffinity(
-                outlineWindow_,
-                WDA_EXCLUDEFROMCAPTURE);
-            return true;
-        }
-
-        bool CreateFovWindow()
-        {
-            Gdiplus::GdiplusStartupInput startupInput;
-            if (Gdiplus::GdiplusStartup(
-                    &gdiplusToken_,
-                    &startupInput,
-                    nullptr) != Gdiplus::Ok)
-            {
-                vanta::log::Error(
-                    "FOV anti-aliasing initialization failed");
-                return false;
-            }
-
-            WNDCLASSEXW windowClass{
-                sizeof(WNDCLASSEXW),
-                0,
-                &StaticFovWindowProcedure,
-                0,
-                0,
-                instance_,
-                nullptr,
-                LoadCursorW(nullptr, IDC_ARROW),
-                nullptr,
-                nullptr,
-                L"VantaKillFovOutline",
-                nullptr};
-            if (RegisterClassExW(&windowClass) == 0)
-            {
-                vanta::log::Error(
-                    "FOV outline RegisterClassExW failed: %lu",
-                    GetLastError());
-                return false;
-            }
-            fovClassRegistered_ = true;
-
-            fovWindow_ = CreateWindowExW(
-                WS_EX_TOPMOST |
-                    WS_EX_TOOLWINDOW |
-                    WS_EX_LAYERED |
-                    WS_EX_TRANSPARENT |
-                    WS_EX_NOACTIVATE,
-                windowClass.lpszClassName,
-                L"vanta kill FOV",
-                WS_POPUP,
-                0,
-                0,
-                1,
-                1,
-                nullptr,
-                nullptr,
-                instance_,
-                this);
-            if (fovWindow_ == nullptr)
-            {
-                vanta::log::Error(
-                    "FOV outline CreateWindowExW failed: %lu",
-                    GetLastError());
-                return false;
-            }
-
-            SetWindowDisplayAffinity(
-                fovWindow_,
-                WDA_EXCLUDEFROMCAPTURE);
             return true;
         }
 
@@ -1988,11 +1856,6 @@ namespace
                 VK_DELETE,
                 "Delete",
                 deleteExitHotkeyRegistered_);
-            registerHotkey(
-                kBombTimerResetHotkeyId,
-                VK_HOME,
-                "Home",
-                bombTimerResetHotkeyRegistered_);
         }
 
         void UnregisterHotkeys()
@@ -2018,9 +1881,6 @@ namespace
             unregisterHotkey(
                 kExitDeleteHotkeyId,
                 deleteExitHotkeyRegistered_);
-            unregisterHotkey(
-                kBombTimerResetHotkeyId,
-                bombTimerResetHotkeyRegistered_);
         }
 
         void HandleHotkey(const int identifier)
@@ -2035,10 +1895,6 @@ namespace
                 break;
             case kExitDeleteHotkeyId:
                 RequestExit("Delete hotkey pressed");
-                break;
-            case kBombTimerResetHotkeyId:
-                bombTimer_.ResetCountdown();
-                vanta::log::Info("Bomb Timer reset with Home hotkey");
                 break;
             default:
                 break;
@@ -2169,567 +2025,56 @@ namespace
 
         void UpdateMenuRegion()
         {
-            // Hit testing already restricts input to the menu and timer
-            // widget. Keep the native window region unrestricted so
+            // Hit testing already restricts input to the menu.
+            // Keep the native window region unrestricted so
             // click-through calibration graphics can render elsewhere.
             ClearMenuRegion();
         }
 
-        void UpdateCaptureOutline()
+        void CoordinateMovementModes()
         {
-            if (outlineWindow_ == nullptr)
+            if(const auto current=makcu_.EmergencyRevision();current!=lastInputEmergencyRevision_)
             {
-                return;
+                lastInputEmergencyRevision_=current;pythonBot_.SetEnabled(false);
+                auto movement=testMove_.GetConfig();movement.enabled=false;testMove_.ApplyConfig(movement);
+                auto clicks=testClick_.GetConfig();clicks.enabled=false;testClick_.ApplyConfig(clicks);
             }
-
-            const vanta::CaptureOutline outline =
-                capture_.GetOutline();
-            const bool valid =
-                outline.visible &&
-                outline.screenRectangle.right >
-                    outline.screenRectangle.left &&
-                outline.screenRectangle.bottom >
-                    outline.screenRectangle.top;
-            if (!valid)
+            bool python=pythonBot_.IsEnabled();
+            auto movement=testMove_.GetConfig();
+            if (python && movement.enabled)
             {
-                if (outlineVisible_)
+                if (lastPythonEnabled_ && !lastTestMoveEnabled_)
                 {
-                    ShowWindow(outlineWindow_, SW_HIDE);
-                    outlineVisible_ = false;
+                    pythonBot_.SetEnabled(false);
+                    python=false;
                 }
-                return;
-            }
-
-            const auto channel = [](float value)
-            {
-                return static_cast<BYTE>(std::lround(
-                    std::clamp(value, 0.0F, 1.0F) *
-                    255.0F));
-            };
-            COLORREF color = RGB(
-                channel(outline.color[0]),
-                channel(outline.color[1]),
-                channel(outline.color[2]));
-            if (color == outlineTransparencyKey_)
-            {
-                color = RGB(2, 2, 4);
-            }
-            const BYTE alpha = channel(outline.color[3]);
-            const int thickness =
-                std::clamp(outline.thickness, 1, 10);
-            const bool colorOrAlphaChanged =
-                color != outlineColor_ ||
-                alpha != outlineAlpha_;
-            const bool thicknessChanged =
-                thickness != outlineThickness_;
-            if (colorOrAlphaChanged)
-            {
-                outlineColor_ = color;
-                outlineAlpha_ = alpha;
-                SetLayeredWindowAttributes(
-                    outlineWindow_,
-                    outlineTransparencyKey_,
-                    outlineAlpha_,
-                    LWA_COLORKEY | LWA_ALPHA);
-            }
-            if (thicknessChanged)
-            {
-                outlineThickness_ = thickness;
-            }
-            if (colorOrAlphaChanged ||
-                thicknessChanged)
-            {
-                InvalidateRect(outlineWindow_, nullptr, TRUE);
-            }
-
-            const bool rectangleChanged =
-                !SameRectangle(
-                    outline.screenRectangle,
-                    outlineRectangle_);
-            const ULONGLONG now = GetTickCount64();
-            if (rectangleChanged ||
-                !outlineVisible_ ||
-                now >= nextOutlineZOrderRefresh_)
-            {
-                outlineRectangle_ =
-                    outline.screenRectangle;
-                UINT flags =
-                    SWP_NOACTIVATE |
-                    SWP_SHOWWINDOW |
-                    SWP_NOOWNERZORDER;
-                if (!rectangleChanged)
+                else
                 {
-                    flags |= SWP_NOMOVE | SWP_NOSIZE;
+                    movement.enabled=false;
+                    testMove_.ApplyConfig(movement);
                 }
-                SetWindowPos(
-                    outlineWindow_,
-                    vanta::menu::IsVisible() &&
-                            IsWindowVisible(window_)
-                        ? window_
-                        : HWND_TOPMOST,
-                    outlineRectangle_.left,
-                    outlineRectangle_.top,
-                    outlineRectangle_.right -
-                        outlineRectangle_.left,
-                    outlineRectangle_.bottom -
-                        outlineRectangle_.top,
-                    flags);
-                nextOutlineZOrderRefresh_ = now + 500;
             }
-            outlineVisible_ = true;
+            const auto revision=pythonBot_.SettingsRevision();
+            if (python && (!lastPythonEnabled_ || revision!=lastPythonRevision_))
+            {
+                // No hardware connection or input output during GUI fixtures.
+                const auto config=pythonBot_.GetConfig();
+                if (options_.selfTestFrames==0)
+                {
+                    makcu_.ActivatePythonMovement(config.makcuAutoReconnect,revision);
+                }
+            }
+            lastPythonEnabled_=python;
+            lastTestMoveEnabled_=movement.enabled;
+            lastPythonRevision_=revision;
         }
 
-        void UpdateFovOutline()
+        void UpdateStreamPreviewFov()
         {
-            if (fovWindow_ == nullptr)
-            {
-                return;
-            }
-
-            RECT captureRectangle{};
-            vanta::TestMoveFovOutline outline =
-                testMove_.GetFovOutline();
-            if (options_.selfTestFrames != 0)
-            {
-                outline.visible = true;
-                outline.radius = 100;
-                outline.color = {
-                    0.68F,
-                    0.56F,
-                    0.91F,
-                    1.0F};
-            }
-            const bool hasCapture =
-                capture_.GetCaptureScreenRectangle(
-                    captureRectangle);
-            const int captureWidth =
-                captureRectangle.right -
-                captureRectangle.left;
-            const int captureHeight =
-                captureRectangle.bottom -
-                captureRectangle.top;
-            constexpr int margin = 3;
-            const int maximumRadius =
-                std::max(
-                    0,
-                    std::min(
-                        captureWidth,
-                        captureHeight) /
-                        2 -
-                        margin);
-            const int radius =
-                std::clamp(
-                    outline.radius,
-                    0,
-                    maximumRadius);
-            if (!outline.visible ||
-                !hasCapture ||
-                radius <= 0)
-            {
-                if (fovVisible_)
-                {
-                    ShowWindow(fovWindow_, SW_HIDE);
-                    fovVisible_ = false;
-                }
-                return;
-            }
-
-            const auto channel = [](float value)
-            {
-                return static_cast<BYTE>(
-                    std::lround(
-                        std::clamp(
-                            value,
-                            0.0F,
-                            1.0F) *
-                        255.0F));
-            };
-            COLORREF color = RGB(
-                channel(outline.color.red),
-                channel(outline.color.green),
-                channel(outline.color.blue));
-            const BYTE alpha =
-                channel(outline.color.alpha);
-            const bool appearanceChanged =
-                color != fovColor_ ||
-                alpha != fovAlpha_ ||
-                radius != fovRadius_;
-            if (appearanceChanged)
-            {
-                fovColor_ = color;
-                fovAlpha_ = alpha;
-                fovRadius_ = radius;
-                fovSurfaceDirty_ = true;
-            }
-
-            const int centerX =
-                captureRectangle.left +
-                captureWidth / 2;
-            const int centerY =
-                captureRectangle.top +
-                captureHeight / 2;
-            const RECT desired{
-                centerX - radius - margin,
-                centerY - radius - margin,
-                centerX + radius + margin,
-                centerY + radius + margin};
-            const bool rectangleChanged =
-                !SameRectangle(
-                    desired,
-                    fovRectangle_);
-            if (appearanceChanged ||
-                rectangleChanged ||
-                !fovVisible_ ||
-                fovSurfaceDirty_)
-            {
-                if (!RenderFovSurface(desired))
-                {
-                    fovSurfaceDirty_ = true;
-                    if (fovVisible_)
-                    {
-                        ShowWindow(
-                            fovWindow_,
-                            SW_HIDE);
-                        fovVisible_ = false;
-                    }
-                    return;
-                }
-                fovSurfaceDirty_ = false;
-            }
-            const ULONGLONG now =
-                GetTickCount64();
-            if (rectangleChanged ||
-                !fovVisible_ ||
-                now >= nextFovZOrderRefresh_)
-            {
-                fovRectangle_ = desired;
-                UINT flags =
-                    SWP_NOACTIVATE |
-                    SWP_SHOWWINDOW |
-                    SWP_NOOWNERZORDER;
-                if (!rectangleChanged)
-                {
-                    flags |=
-                        SWP_NOMOVE |
-                        SWP_NOSIZE;
-                }
-                SetWindowPos(
-                    fovWindow_,
-                    vanta::menu::IsVisible() &&
-                            IsWindowVisible(window_)
-                        ? window_
-                        : HWND_TOPMOST,
-                    desired.left,
-                    desired.top,
-                    desired.right - desired.left,
-                    desired.bottom - desired.top,
-                    flags);
-                nextFovZOrderRefresh_ =
-                    now + 500;
-            }
-            fovVisible_ = true;
-        }
-
-        bool RenderFovSurface(const RECT& screenRectangle)
-        {
-            const int width =
-                screenRectangle.right -
-                screenRectangle.left;
-            const int height =
-                screenRectangle.bottom -
-                screenRectangle.top;
-            if (width <= 0 || height <= 0)
-            {
-                return false;
-            }
-
-            HDC screenContext = GetDC(nullptr);
-            if (screenContext == nullptr)
-            {
-                return false;
-            }
-            HDC memoryContext =
-                CreateCompatibleDC(screenContext);
-            if (memoryContext == nullptr)
-            {
-                ReleaseDC(nullptr, screenContext);
-                return false;
-            }
-
-            BITMAPINFO bitmapInfo{};
-            bitmapInfo.bmiHeader.biSize =
-                sizeof(bitmapInfo.bmiHeader);
-            bitmapInfo.bmiHeader.biWidth = width;
-            bitmapInfo.bmiHeader.biHeight = -height;
-            bitmapInfo.bmiHeader.biPlanes = 1;
-            bitmapInfo.bmiHeader.biBitCount = 32;
-            bitmapInfo.bmiHeader.biCompression =
-                BI_RGB;
-
-            void* pixels = nullptr;
-            HBITMAP bitmap = CreateDIBSection(
-                screenContext,
-                &bitmapInfo,
-                DIB_RGB_COLORS,
-                &pixels,
-                nullptr,
-                0);
-            if (bitmap == nullptr || pixels == nullptr)
-            {
-                if (bitmap != nullptr)
-                {
-                    DeleteObject(bitmap);
-                }
-                DeleteDC(memoryContext);
-                ReleaseDC(nullptr, screenContext);
-                return false;
-            }
-
-            HGDIOBJ previousBitmap =
-                SelectObject(memoryContext, bitmap);
-            bool rendered = false;
-            {
-                Gdiplus::Bitmap surface(
-                    width,
-                    height,
-                    width * 4,
-                    PixelFormat32bppPARGB,
-                    static_cast<BYTE*>(pixels));
-                Gdiplus::Graphics graphics(&surface);
-                graphics.SetSmoothingMode(
-                    Gdiplus::SmoothingModeAntiAlias);
-                graphics.SetPixelOffsetMode(
-                    Gdiplus::PixelOffsetModeHighQuality);
-                graphics.SetCompositingQuality(
-                    Gdiplus::CompositingQualityHighQuality);
-                graphics.Clear(
-                    Gdiplus::Color(0, 0, 0, 0));
-
-                const Gdiplus::RectF bounds(
-                    3.0F,
-                    3.0F,
-                    static_cast<Gdiplus::REAL>(
-                        width - 6),
-                    static_cast<Gdiplus::REAL>(
-                        height - 6));
-                Gdiplus::Pen blackPen(
-                    Gdiplus::Color(
-                        fovAlpha_,
-                        0,
-                        0,
-                        0),
-                    3.0F);
-                Gdiplus::Pen colorPen(
-                    Gdiplus::Color(
-                        fovAlpha_,
-                        GetRValue(fovColor_),
-                        GetGValue(fovColor_),
-                        GetBValue(fovColor_)),
-                    1.0F);
-                blackPen.SetAlignment(
-                    Gdiplus::PenAlignmentCenter);
-                colorPen.SetAlignment(
-                    Gdiplus::PenAlignmentCenter);
-
-                rendered =
-                    graphics.DrawEllipse(
-                        &blackPen,
-                        bounds) == Gdiplus::Ok &&
-                    graphics.DrawEllipse(
-                        &colorPen,
-                        bounds) == Gdiplus::Ok;
-            }
-
-            if (rendered)
-            {
-                POINT destination{
-                    screenRectangle.left,
-                    screenRectangle.top};
-                SIZE size{width, height};
-                POINT source{0, 0};
-                BLENDFUNCTION blend{
-                    AC_SRC_OVER,
-                    0,
-                    255,
-                    AC_SRC_ALPHA};
-                rendered =
-                    UpdateLayeredWindow(
-                        fovWindow_,
-                        screenContext,
-                        &destination,
-                        &size,
-                        memoryContext,
-                        &source,
-                        0,
-                        &blend,
-                        ULW_ALPHA) != FALSE;
-            }
-
-            SelectObject(
-                memoryContext,
-                previousBitmap);
-            DeleteObject(bitmap);
-            DeleteDC(memoryContext);
-            ReleaseDC(nullptr, screenContext);
-
-            if (!rendered)
-            {
-                vanta::log::Warning(
-                    "could not render anti-aliased FOV outline: %lu",
-                    GetLastError());
-            }
-            return rendered;
-        }
-
-        LRESULT OutlineWindowProcedure(
-            HWND window,
-            UINT message,
-            WPARAM wParam,
-            LPARAM lParam)
-        {
-            switch (message)
-            {
-            case WM_NCHITTEST:
-                return HTTRANSPARENT;
-            case WM_ERASEBKGND:
-                return 1;
-            case WM_PAINT:
-            {
-                PAINTSTRUCT paint{};
-                HDC deviceContext =
-                    BeginPaint(window, &paint);
-                RECT client{};
-                GetClientRect(window, &client);
-
-                HBRUSH transparentBrush =
-                    CreateSolidBrush(
-                        outlineTransparencyKey_);
-                FillRect(
-                    deviceContext,
-                    &client,
-                    transparentBrush);
-                DeleteObject(transparentBrush);
-
-                const auto fillFrame = [](
-                    HDC target,
-                    const RECT& rectangle,
-                    LONG requestedThickness,
-                    HBRUSH brush)
-                {
-                    const LONG width =
-                        rectangle.right -
-                        rectangle.left;
-                    const LONG height =
-                        rectangle.bottom -
-                        rectangle.top;
-                    if (width <= 0 ||
-                        height <= 0 ||
-                        requestedThickness <= 0)
-                    {
-                        return;
-                    }
-
-                    const LONG thickness =
-                        std::min(
-                            requestedThickness,
-                            std::max<LONG>(
-                                1,
-                                std::min(width, height)));
-                    const RECT top{
-                        rectangle.left,
-                        rectangle.top,
-                        rectangle.right,
-                        std::min(
-                            rectangle.bottom,
-                            rectangle.top + thickness)};
-                    const RECT bottom{
-                        rectangle.left,
-                        std::max(
-                            rectangle.top,
-                            rectangle.bottom - thickness),
-                        rectangle.right,
-                        rectangle.bottom};
-                    const RECT left{
-                        rectangle.left,
-                        rectangle.top,
-                        std::min(
-                            rectangle.right,
-                            rectangle.left + thickness),
-                        rectangle.bottom};
-                    const RECT right{
-                        std::max(
-                            rectangle.left,
-                            rectangle.right - thickness),
-                        rectangle.top,
-                        rectangle.right,
-                        rectangle.bottom};
-
-                    FillRect(target, &top, brush);
-                    FillRect(target, &bottom, brush);
-                    FillRect(target, &left, brush);
-                    FillRect(target, &right, brush);
-                };
-
-                HBRUSH blackBrush =
-                    CreateSolidBrush(RGB(0, 0, 0));
-                fillFrame(
-                    deviceContext,
-                    client,
-                    outlineThickness_ + 2,
-                    blackBrush);
-                DeleteObject(blackBrush);
-
-                const RECT colorRectangle{
-                    client.left + 1,
-                    client.top + 1,
-                    client.right - 1,
-                    client.bottom - 1};
-                HBRUSH outlineBrush =
-                    CreateSolidBrush(outlineColor_);
-                fillFrame(
-                    deviceContext,
-                    colorRectangle,
-                    outlineThickness_,
-                    outlineBrush);
-                DeleteObject(outlineBrush);
-                EndPaint(window, &paint);
-                return 0;
-            }
-            default:
-                return DefWindowProcW(
-                    window,
-                    message,
-                    wParam,
-                    lParam);
-            }
-        }
-
-        LRESULT FovWindowProcedure(
-            HWND window,
-            UINT message,
-            WPARAM wParam,
-            LPARAM lParam)
-        {
-            switch (message)
-            {
-            case WM_NCHITTEST:
-                return HTTRANSPARENT;
-            case WM_ERASEBKGND:
-                return 1;
-            case WM_PAINT:
-            {
-                PAINTSTRUCT paint{};
-                BeginPaint(window, &paint);
-                EndPaint(window, &paint);
-                return 0;
-            }
-            default:
-                return DefWindowProcW(
-                    window,
-                    message,
-                    wParam,
-                    lParam);
-            }
+            auto outline=testMove_.GetFovOutline();
+            if (pythonBot_.IsEnabled()) { outline.visible=true; outline.radius=pythonBot_.GetConfig().fovRadius; }
+            if (options_.selfTestFrames!=0) outline.visible=true;
+            capture_.SetFovPreview(outline.visible,outline.radius,outline.color);
         }
 
         void ResizeIfNeeded()
@@ -2742,18 +2087,21 @@ namespace
                 return;
             }
 
+            context_->OMSetRenderTargets(0,nullptr,nullptr);
             renderTarget_.Reset();
             const HRESULT result = swapChain_->ResizeBuffers(
                 0,
                 pendingWidth_,
                 pendingHeight_,
                 DXGI_FORMAT_UNKNOWN,
-                0);
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
             if (FAILED(result) || !CreateRenderTarget())
             {
                 vanta::log::Error(
                     "swap-chain resize failed: 0x%08lX",
                     static_cast<unsigned long>(result));
+                streamReceiver_.InvalidateFrames();
+                RequestExit("Swap-chain resize failed; graphics resources will be released safely");
                 return;
             }
 
@@ -2771,7 +2119,7 @@ namespace
                 "Always-on-top virtual desktop | all applications",
                 window_,
                 capture_,
-                bombTimer_,
+                pythonBot_,
                 configManager_,
                 makcu_,
                 testClick_,
@@ -2787,15 +2135,18 @@ namespace
             context_->OMSetRenderTargets(1, &target, nullptr);
             context_->ClearRenderTargetView(target, clearColor);
             ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            streamReceiver_.FinishPreviewFrame();
 
-            const HRESULT result = swapChain_->Present(0, 0);
-            if (FAILED(result))
+            const HRESULT result = swapChain_->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+            if (FAILED(result) && result!=DXGI_ERROR_WAS_STILL_DRAWING)
             {
                 vanta::log::Warning(
                     "Present failed: 0x%08lX",
                     static_cast<unsigned long>(result));
+                if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET || result==DXGI_ERROR_DEVICE_HUNG)
+                {streamReceiver_.InvalidateFrames();RequestExit("Graphics device lost; restart Vanta to recreate its devices");}
             }
-            else
+            else if (SUCCEEDED(result))
             {
                 ++renderedFrames_;
             }
@@ -2819,43 +2170,17 @@ namespace
             {
                 ShowWindow(window_, SW_HIDE);
             }
-            if (outlineWindow_ != nullptr &&
-                IsWindow(outlineWindow_))
-            {
-                ShowWindow(outlineWindow_, SW_HIDE);
-            }
-            if (fovWindow_ != nullptr &&
-                IsWindow(fovWindow_))
-            {
-                ShowWindow(fovWindow_, SW_HIDE);
-            }
-
+            // Stop consumers before releasing the Sunshine provider, serial
+            // device, JSON apartment, or graphics resources they depend on.
+            makcu_.ReleaseAllInput();
             testClick_.Shutdown();
             testMove_.Shutdown();
-            bombTimer_.Shutdown();
+            pythonBot_.Shutdown();
             capture_.Shutdown();
             streamReceiver_.Shutdown();
             makcu_.Shutdown();
             configManager_.Shutdown();
-
-            if (outlineWindow_ != nullptr &&
-                IsWindow(outlineWindow_))
-            {
-                DestroyWindow(outlineWindow_);
-                outlineWindow_ = nullptr;
-            }
-            if (fovWindow_ != nullptr &&
-                IsWindow(fovWindow_))
-            {
-                DestroyWindow(fovWindow_);
-                fovWindow_ = nullptr;
-            }
-            if (gdiplusToken_ != 0)
-            {
-                Gdiplus::GdiplusShutdown(
-                    gdiplusToken_);
-                gdiplusToken_ = 0;
-            }
+            vanta::SetMaskPreviewDevice(nullptr,nullptr);
 
             if (imguiDx11Ready_)
             {
@@ -2891,6 +2216,7 @@ namespace
             compositionVisual_.Reset();
             compositionTarget_.Reset();
             compositionDevice_.Reset();
+            if (presentationReady_) { CloseHandle(presentationReady_); presentationReady_=nullptr; }
             swapChain_.Reset();
             if (context_ != nullptr)
             {
@@ -2904,30 +2230,6 @@ namespace
             {
                 DestroyWindow(window_);
                 window_ = nullptr;
-            }
-            if (outlineClassRegistered_)
-            {
-                if (!UnregisterClassW(
-                        L"VantaCaptureOutline",
-                        instance_))
-                {
-                    vanta::log::Warning(
-                        "could not unregister the capture-outline class: %lu",
-                        GetLastError());
-                }
-                outlineClassRegistered_ = false;
-            }
-            if (fovClassRegistered_)
-            {
-                if (!UnregisterClassW(
-                        L"VantaKillFovOutline",
-                        instance_))
-                {
-                    vanta::log::Warning(
-                        "could not unregister the FOV-outline class: %lu",
-                        GetLastError());
-                }
-                fovClassRegistered_ = false;
             }
             if (classRegistered_)
             {
@@ -2979,87 +2281,15 @@ namespace
             return DefWindowProcW(window, message, wParam, lParam);
         }
 
-        static LRESULT CALLBACK StaticOutlineWindowProcedure(
-            HWND window,
-            UINT message,
-            WPARAM wParam,
-            LPARAM lParam)
-        {
-            auto* application =
-                reinterpret_cast<OverlayApplication*>(
-                    GetWindowLongPtrW(window, GWLP_USERDATA));
-            if (message == WM_NCCREATE)
-            {
-                const auto* create =
-                    reinterpret_cast<CREATESTRUCTW*>(lParam);
-                application =
-                    static_cast<OverlayApplication*>(
-                        create->lpCreateParams);
-                SetWindowLongPtrW(
-                    window,
-                    GWLP_USERDATA,
-                    reinterpret_cast<LONG_PTR>(application));
-            }
-            if (application != nullptr)
-            {
-                return application->OutlineWindowProcedure(
-                    window,
-                    message,
-                    wParam,
-                    lParam);
-            }
-            return DefWindowProcW(
-                window,
-                message,
-                wParam,
-                lParam);
-        }
-
-        static LRESULT CALLBACK StaticFovWindowProcedure(
-            HWND window,
-            UINT message,
-            WPARAM wParam,
-            LPARAM lParam)
-        {
-            auto* application =
-                reinterpret_cast<OverlayApplication*>(
-                    GetWindowLongPtrW(
-                        window,
-                        GWLP_USERDATA));
-            if (message == WM_NCCREATE)
-            {
-                const auto* create =
-                    reinterpret_cast<CREATESTRUCTW*>(
-                        lParam);
-                application =
-                    static_cast<OverlayApplication*>(
-                        create->lpCreateParams);
-                SetWindowLongPtrW(
-                    window,
-                    GWLP_USERDATA,
-                    reinterpret_cast<LONG_PTR>(
-                        application));
-            }
-            if (application != nullptr)
-            {
-                return application->
-                    FovWindowProcedure(
-                        window,
-                        message,
-                        wParam,
-                        lParam);
-            }
-            return DefWindowProcW(
-                window,
-                message,
-                wParam,
-                lParam);
-        }
-
         HINSTANCE instance_{};
         Options options_;
         vanta::CaptureController capture_;
-        vanta::BombTimerController bombTimer_;
+        vanta::PythonBotController pythonBot_;
+        std::uint64_t lastInputEmergencyRevision_{};
+        bool lastPythonEnabled_{};
+        bool lastTestMoveEnabled_{};
+        std::uint64_t lastPythonRevision_{};
+        bool movementSelfTestFailed_{};
         vanta::ConfigManager configManager_;
         vanta::MakcuController makcu_;
         vanta::TestClickController testClick_;
@@ -3067,11 +2297,7 @@ namespace
         vanta::UpdateController updates_;
         vanta::StreamReceiverController streamReceiver_;
         HWND window_{};
-        HWND outlineWindow_{};
-        HWND fovWindow_{};
         bool classRegistered_ = false;
-        bool outlineClassRegistered_ = false;
-        bool fovClassRegistered_ = false;
         bool exitRequested_ = false;
         bool shutdownStarted_ = false;
         bool imguiContextReady_ = false;
@@ -3081,40 +2307,25 @@ namespace
         bool menuToggleHotkeyRegistered_ = false;
         bool endExitHotkeyRegistered_ = false;
         bool deleteExitHotkeyRegistered_ = false;
-        bool bombTimerResetHotkeyRegistered_ = false;
         bool overlayVisible_ = false;
         bool clickThrough_ = false;
         bool menuRegionApplied_ = false;
-        bool outlineVisible_ = false;
-        bool fovVisible_ = false;
-        bool fovSurfaceDirty_ = true;
         UINT pendingWidth_ = 1280;
         UINT pendingHeight_ = 720;
         UINT swapChainWidth_ = 1280;
         UINT swapChainHeight_ = 720;
         std::uint64_t renderedFrames_{};
         ULONGLONG nextTopmostRefresh_{};
-        ULONGLONG nextOutlineZOrderRefresh_{};
-        ULONGLONG nextFovZOrderRefresh_{};
         RECT overlayRectangle_{};
         RECT menuRegionRectangle_{};
-        RECT outlineRectangle_{};
-        RECT fovRectangle_{};
-        static constexpr COLORREF outlineTransparencyKey_ =
-            RGB(1, 2, 3);
-        COLORREF outlineColor_ = RGB(173, 143, 233);
-        BYTE outlineAlpha_ = 255;
-        int outlineThickness_ = 1;
-        COLORREF fovColor_ = RGB(173, 143, 233);
-        BYTE fovAlpha_ = 255;
-        int fovRadius_ = 100;
-        ULONG_PTR gdiplusToken_{};
-
         ComPtr<ID3D11Device> device_;
         ComPtr<ID3D11DeviceContext> context_;
         ComPtr<ID3D11ShaderResourceView>
             logoShaderResource_;
         ComPtr<IDXGISwapChain2> swapChain_;
+        HANDLE presentationReady_{};
+        std::uint64_t nextUiFrameUs_{};
+        std::string graphicsAdapterPreference_{"auto"};
         ComPtr<ID3D11RenderTargetView> renderTarget_;
         ComPtr<IDCompositionDevice> compositionDevice_;
         ComPtr<IDCompositionTarget> compositionTarget_;
@@ -3136,13 +2347,23 @@ namespace vanta
         int argumentCount,
         wchar_t** arguments)
     {
+        for (int index=1;index<argumentCount;++index)
+            if (std::wstring_view(arguments[index]).starts_with(L"--capture-test-"))
+            {
+                log::Error("Local capture backends have been removed; use --receiver-capture-self-test for Sunshine");
+                return 1;
+            }
         if (HasArgument(argumentCount, arguments, L"--help"))
         {
             std::printf(
                 "vanta external overlay\n"
                 "  vanta.exe                 always-on-top desktop overlay\n"
                 "  vanta.exe --self-test N   render N frames and exit\n"
+                "  vanta.exe --python-self-test validate supplied Python mode without hardware\n"
+                "  vanta.exe --python-parity-fixtures INPUT OUTPUT native reference fixture runner\n"
                 "  vanta.exe --config-self-test validate JSON in a temporary folder\n"
+                "  vanta.exe --stream-pipeline-self-test validate CPU geometry/ownership/recovery/cancellation\n"
+                "  vanta.exe --fps-diagnostics-self-test validate FPS classification and report policy (CPU only)\n"
                 "  vanta.exe --receiver-self-test validate H.264 D3D11 hardware decoding\n"
                 "  vanta.exe --detector-self-test validate contour/color/aim/resolution handling\n"
                 "  vanta.exe --detector-ui-self-test validate detector controls and preview draw lists\n"
@@ -3151,14 +2372,25 @@ namespace vanta
                 "  vanta.exe --receiver-capture-self-test validate Sunshine-to-capture frame delivery\n"
                 "  vanta.exe --receiver-discover-lan auto-discover Sunshine hosts on this LAN\n"
                 "  vanta.exe --receiver-discover HOST verify a Sunshine host without pairing\n"
-                "  vanta.exe --receiver-stream-smoke HOST verify a pre-paired host sends a live H.264 frame\n"
+                "  vanta.exe --receiver-stream-smoke HOST verify a pre-paired host sends a hardware frame\n"
                 "  --update-page-test       render Updates during --self-test\n"
-                "  --capture-test-winrt      test WinRT monitor capture\n"
-                "  --capture-test-duplication test DXGI monitor capture\n"
-                "  --capture-test-winrt-window test WinRT window capture\n"
-                "  --capture-test-duplication-window test DXGI window crop\n");
+                "  --page-test N            select page 0..9 during --self-test\n");
             return 0;
         }
+        if (HasArgument(argumentCount,arguments,L"--stream-pipeline-self-test"))
+            return RunStreamPipelineSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount,arguments,L"--fps-diagnostics-self-test"))
+            return RunStreamDiagnosticsSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount,arguments,L"--medius-self-test"))
+            return MediusBackend::RunSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount,arguments,L"--input-lock-self-test"))
+            return InputLockCoordinator::RunSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount,arguments,L"--python-self-test"))
+            return RunPythonBotSelfTest() ? 0 : 1;
+        for (int index=1;index<argumentCount;++index)
+            if (wcscmp(arguments[index],L"--python-parity-fixtures")==0)
+                return index+2<argumentCount &&
+                    RunPythonParityFixtures(Utf8FromWide(arguments[index+1]),Utf8FromWide(arguments[index+2])) ? 0 : 1;
         if (HasArgument(argumentCount, arguments, L"--detector-self-test"))
             return RunTargetDetectionSelfTest() ? 0 : 1;
         if (HasArgument(argumentCount, arguments, L"--detector-ui-self-test"))
