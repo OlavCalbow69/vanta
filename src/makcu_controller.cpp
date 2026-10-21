@@ -1413,6 +1413,8 @@ namespace vanta
     {return implementation_->TryMove(x,y,context);}
     std::string MakcuController::MovementBlockReason(InputOwner owner) const
     {return implementation_->MovementBlockReason(owner);}
+    ClickOutputStatus MakcuController::ClickStatus(InputOwner owner) const
+    {return implementation_->inputLocks.ClickStatus(owner);}
     std::string MakcuController::FuseUnavailableReason() const
     {
         const auto& impl=*implementation_;

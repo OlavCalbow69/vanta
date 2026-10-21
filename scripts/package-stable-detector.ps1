@@ -16,7 +16,7 @@ foreach ($name in $runtimeFiles) {
 }
 if (-not $SkipTests) {
     foreach ($check in @('--stream-pipeline-self-test','--fps-diagnostics-self-test','--python-self-test','--detector-self-test','--detector-ui-self-test','--config-self-test','--makcu-self-test','--input-lock-self-test','--medius-self-test',
-        '--receiver-capture-self-test','--receiver-self-test')) {
+        '--testclick-self-test','--receiver-capture-self-test','--receiver-self-test')) {
         & (Join-Path $buildRoot 'vanta.exe') $check
         if ($LASTEXITCODE -ne 0) { throw "$Configuration $check failed" }
         Write-Host "$Configuration $check passed"
@@ -38,7 +38,7 @@ foreach ($name in $runtimeFiles) {
 & (Join-Path $PSScriptRoot 'prepare-medius-package.ps1')
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'work\medius-package\DEPENDENCIES-MEDIUS.json') -Destination $packageRoot
 & (Join-Path $PSScriptRoot 'copy-vc-runtime.ps1') -Destination $packageRoot
-foreach ($name in @('README.md','README-DETECTOR.md','README-PYTHON.md','README-PYTHON-FUSE.md','README-STREAMING.md','README-INPUT-LOCKS.md','README-MEDIUS.md','NOTICE.md','LICENSE')) {
+foreach ($name in @('README.md','README-DETECTOR.md','README-PYTHON.md','README-PYTHON-FUSE.md','README-STREAMING.md','README-INPUT-LOCKS.md','README-MEDIUS.md','README-TESTCLICK.md','NOTICE.md','LICENSE')) {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot $name) -Destination $packageRoot
 }
 $licenseRoot=Join-Path $packageRoot 'licenses'
@@ -57,7 +57,7 @@ foreach ($entry in $licenses.GetEnumerator()) {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot $entry.Value) -Destination (Join-Path $licenseRoot $entry.Key)
 }
 @(
-    'Vanta Python Fuse Inputs / Narrow Purple / Verified Input Locks / Medius Native (local, not an official release)'
+    'Vanta TestClick Repeat / Medius Native / Python Fuse Inputs (local, not an official release)'
     "Binary file version: $((Get-Item -LiteralPath (Join-Path $buildRoot 'vanta.exe')).VersionInfo.FileVersion)"
     "Configuration: $Configuration x64"
     "Branch: $((& git -C $repositoryRoot branch --show-current).Trim())"
@@ -67,7 +67,7 @@ foreach ($entry in $licenses.GetEnumerator()) {
     "vcpkg: $((& git -C (Join-Path $repositoryRoot 'work\vcpkg') rev-parse HEAD).Trim())"
     'FFmpeg: 9.0.2#1, features core,avcodec; x64-windows-static; /MT'
     "vanta.exe SHA256: $((Get-FileHash -LiteralPath (Join-Path $buildRoot 'vanta.exe') -Algorithm SHA256).Hash.ToLowerInvariant())"
-    'Includes uncommitted feature-branch changes from this workspace.'
+    "Source tree: $(if (@(& git -C $repositoryRoot status --porcelain --untracked-files=no).Count) {'includes uncommitted tracked changes'} else {'clean tracked tree'})"
     'MAKCU identity, baud and physical-button protocol retained; hardware validation is separate.'
     'MAKCU protocol checked against MCP reference (official 4.102); no firmware flashed.'
     'MAKCU COM-port lock removed; a saved port is only preferred when detected, with automatic fallback to an available detected device.'
@@ -102,6 +102,12 @@ foreach ($entry in $licenses.GetEnumerator()) {
     'Medius uses ordinary MOVE for each accepted correction, with full signed-16-bit deltas; no four-millisecond host streaming loop.'
     'Firmware render, spread and riding are captured, disabled/verified while owned, then restored during cleanup/recovery.'
     'Generated clicks use a separate finalized firmware clip with 14-34 ms hold; no periodic host refill.'
+    'TestClick repeats on fresh valid frames while physical activation remains held; burst settings remain optional.'
+    'Click upload/finalization and both content edges are checked; release completion uses a bounded 100 ms sequence with 20 ms individual query timeouts.'
+    'Activation or settings changes during preparation cancel the click without falsely declaring a healthy link failed.'
+    'Enable/binding edits publish a new configuration generation immediately, including explicit rearm after emergency release.'
+    'TestClick shows backend and exact click status; JSON/logs include requests, starts, confirmations, rejections, cancellations, faults and clip readback.'
+    'TestClick repeat, ownership, cancellation and Medius playback checks are opt-in and compiled only. Laptop checks: README-TESTCLICK.md.'
     'Pending movement uses conservative actual HEALTH injection-active readback, which can also include an independent click.'
     'Native sends measure serial acceptance; firmware does not acknowledge per-command USB delivery or expose an XY queue length.'
     'Python output: activation policy and movement ownership publish one generation together; stale workers cannot overwrite newer disable/configuration changes.'

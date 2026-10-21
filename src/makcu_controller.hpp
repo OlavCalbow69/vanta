@@ -24,12 +24,13 @@ namespace vanta
         void Shutdown();
         void Tick();
         void RenderPanel();
-        // Attempts one left-click through the connected MAKCU device.
-        // Returns true when the serial press/release writes succeed.
+        // Attempts one left-click through the selected output backend.
+        // Returns true after release/readback and physical-mask restoration.
         bool TryClick();
         bool TryClick(const OutputContext& context);
         bool TryMove(int x,int y,const OutputContext& context);
         std::string MovementBlockReason(InputOwner owner) const;
+        ClickOutputStatus ClickStatus(InputOwner owner) const;
         std::string FuseUnavailableReason() const;
         std::string InputControlStatus() const;
         void SetInputPolicy(InputOwner owner,bool enabled,std::uint64_t generation,MouseButtonBinding activation);

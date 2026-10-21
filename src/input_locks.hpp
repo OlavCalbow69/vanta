@@ -21,6 +21,13 @@ namespace vanta
         std::function<bool()> isCurrent;
     };
     enum class InputQuery { lockX,lockY,lockLeft,lockSide1,lockSide2,leftState,moving };
+    enum class ClickOutputPhase { idle,preparing,playing,completed,blocked,cancelled,failed };
+    struct ClickOutputStatus
+    {
+        ClickOutputPhase phase{ClickOutputPhase::idle};
+        std::uint64_t attempts{},started{},completed{},rejected{},cancelled{},failed{},updatedAtUs{};
+        std::string message{"No generated click requested yet"};
+    };
     inline constexpr std::array<std::uint32_t,5> kManagedInputBits{
         InputLockX,InputLockY,InputLockLeft,InputLockSide1,InputLockSide2};
     struct DirectionalInputScales
@@ -62,6 +69,7 @@ namespace vanta
         std::function<bool(int,const OutputContext&)> beginClick;
         std::function<bool(bool)> endClick;
         std::function<bool()> clickSucceeded;
+        std::function<std::string()> failureReason;
         std::function<bool(InputMaskReadback&)> readMasks;
         std::function<void(const std::string&)> invalidate;
         std::function<bool(std::uint32_t,const DirectionalInputScales&)> axisPolicy;
@@ -91,6 +99,7 @@ namespace vanta
         std::uint64_t EmergencyRevision() const noexcept;
         std::string Status() const;
         std::string MovementBlockReason(InputOwner owner) const;
+        ClickOutputStatus ClickStatus(InputOwner owner) const;
         std::string DiagnosticsJson() const;
         static bool RunSelfTest();
     private:

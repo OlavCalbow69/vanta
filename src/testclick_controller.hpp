@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 namespace vanta
 {
@@ -28,6 +29,8 @@ namespace vanta
         TestClickConfig GetConfig() const;
         void ApplyConfig(const TestClickConfig& config);
         std::uint64_t SettingsRevision() const noexcept;
+        std::string DiagnosticsJson() const;
+        static bool RunSelfTest();
 
     private:
         struct Implementation;

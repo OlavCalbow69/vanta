@@ -106,6 +106,21 @@ namespace vanta
         {return medius_clip_status_is_held(&status,medius_usage_button(MEDIUS_BUTTON_LEFT));}
         bool ClickIdle(const MediusClipStatus& status)
         {return status.state==MEDIUS_CLIP_STATE_IDLE && status.total==0 && !HeldLeft(status);}
+        bool ClickEdgesPlayed(const MediusClipStatus& status,std::uint32_t baselineTicks)
+        {
+            // Firmware ticks count content entries, not the gap's elapsed frames.
+            // The counter is cumulative since boot and wraps at 32 bits.
+            return static_cast<std::uint32_t>(status.ticks-baselineTicks)==2 && status.total==0 && !HeldLeft(status);
+        }
+        bool ClickSettingsMatch(const MediusClipSettings& settings)
+        {return settings.finalized && !settings.loop_ && !settings.retain && !settings.ride &&
+            !settings.autolock_bits && !settings.n && !settings.packet_n;}
+        std::string ClickReadbackText(const MediusClipStatus& status,std::uint32_t baselineTicks)
+        {
+            std::ostringstream text;text<<"state="<<unsigned(status.state)<<", buffered_bytes="<<status.total
+                <<", content_edges="<<static_cast<std::uint32_t>(status.ticks-baselineTicks)
+                <<", left_held="<<(HeldLeft(status)?"yes":"no");return text.str();
+        }
         bool Current(const OutputContext& c,std::uint64_t now)
         {
             if(c.frameTimeUs && (now<c.frameTimeUs || now-c.frameTimeUs>100000))return false;
@@ -146,6 +161,10 @@ namespace vanta
         std::uint64_t lastFailureUs{};unsigned protocol{},nativePeriodUs{},pollPeriodUs{};bool rateConfirmed{};
         MediusCaps capabilities{};MediusStats baseline{};std::uint16_t session{};
         unsigned baselineOverruns{},baselineGaps{};
+        std::uint32_t clickBaselineTicks{};
+        MediusClipStatus lastClickReadback{};
+        std::uint64_t lastClickReadbackUs{};
+        std::atomic_uint64_t drainedClickStops{};
         std::atomic_uint64_t moves{},clicks{},completedClicks{},cancelledClicks{},cancellations{},faults{},inputDrops{};
         RollingStreamMetric serialWrite,healthQueries,clipQueries;
         std::deque<std::uint64_t> moveTimes;
@@ -158,6 +177,12 @@ namespace vanta
         }
         bool Good(MediusStatus result,const char* operation)
         {if(result==kOk)return true;Fail(std::string(operation)+": "+LastMediusError()+"; reconnect required before more queries");return false;}
+        void ObserveClick(const MediusClipStatus& value)
+        {
+            std::lock_guard guard(state);lastClickReadback=value;lastClickReadbackUs=StreamNowUs();
+            if(clickActive && ClickIdle(value) && ClickEdgesPlayed(value,clickBaselineTicks))
+            {clickActive=false;clickCompleted=!clickAborted;if(clickCompleted)++completedClicks;}
+        }
         bool SnapshotLocked(MediusClipStatus& clipState,MediusHealth& health)
         {
             if(!healthy || !clip)return false;
@@ -170,9 +195,8 @@ namespace vanta
             {Fail("Medius session changed or output delivery became uncertain; reconnect required");return false;}
             if(NewClipFault(clipState,baselineOverruns,baselineGaps,medius_clip_lost(clip)))
             {Fail("Medius finite click clip fault; pending input invalidated");return false;}
-            std::lock_guard guard(state);motionPending=health.injection_active!=0;
-            if(clickActive && ClickIdle(clipState))
-            {clickActive=false;clickCompleted=!clickAborted;if(clickCompleted)++completedClicks;}
+            {std::lock_guard guard(state);motionPending=health.injection_active!=0;}
+            ObserveClick(clipState);
             return true;
         }
         bool ClipStatusLocked(MediusClipStatus& result)
@@ -183,9 +207,7 @@ namespace vanta
             if(!Good(queried,"Generated-click release query"))return false;
             if(NewClipFault(result,baselineOverruns,baselineGaps,medius_clip_lost(clip)))
             {Fail("Medius finite click playback failed");return false;}
-            std::lock_guard guard(state);
-            if(clickActive && ClickIdle(result))
-            {clickActive=false;clickCompleted=!clickAborted;if(clickCompleted)++completedClicks;}
+            ObserveClick(result);
             return true;
         }
         bool ClearClickLocked()
@@ -200,7 +222,9 @@ namespace vanta
             MediusClipStatus check{};
             if(!Good(medius_clip_query_status(clip,&check),"Generated-click cancellation readback"))return false;
             if(!ClickIdle(check)){Fail("Generated click remained active after cancellation");return false;}
-            baselineOverruns=check.overruns;baselineGaps=check.seq_gaps;return true;
+            baselineOverruns=check.overruns;baselineGaps=check.seq_gaps;
+            {std::lock_guard guard(state);clickBaselineTicks=check.ticks;lastClickReadback=check;lastClickReadbackUs=StreamNowUs();}
+            return true;
         }
         void Watch(std::stop_token stop)
         {
@@ -432,23 +456,46 @@ namespace vanta
         {std::lock_guard guard(s.state);s.clickAborted=false;}
         if(!BuildClick(s.builder,hold) || !Current(c,StreamNowUs()))return false;
         if(!s.Good(medius_clip_append(s.clip,s.builder),"Finite click upload") ||
-            !s.Good(medius_clip_finalize(s.clip),"Finite click finalize") || !Current(c,StreamNowUs()) ||
-            !s.Good(medius_clip_start(s.clip),"Finite click start"))return false;
+            !s.Good(medius_clip_finalize(s.clip),"Finite click finalize"))return false;
+        // These commands have no delivery acknowledgement. Confirm the complete
+        // finite upload/settings before START, rather than accepting an empty
+        // idle ring as evidence that a click was played.
+        MediusClipSettings config{};MediusClipStatus uploaded{};
+        if(!s.Good(medius_clip_query_config(s.clip,&config),"Finite click settings readback") ||
+            !s.ClipStatusLocked(uploaded))return false;
+        if(!ClickSettingsMatch(config) || uploaded.state!=MEDIUS_CLIP_STATE_IDLE || HeldLeft(uploaded) ||
+            uploaded.total!=medius_clip_builder_byte_len(s.builder))
+        {s.Fail("Finite click upload/settings did not verify: "+ClickReadbackText(uploaded,s.clickBaselineTicks));return false;}
+        if(!Current(c,StreamNowUs()) || !s.Good(medius_clip_start(s.clip),"Finite click start"))return false;
         {std::lock_guard guard(s.state);s.clickActive=true;++s.clicks;}return true;
     }
     bool MediusBackend::FinishClick(bool cancelled)
     {
         auto& s=*state_;
         if(cancelled){std::lock_guard transaction(s.io);return s.device && s.ClearClickLocked();}
-        const auto until=StreamNowUs()+20000;
+        // Per-query timeout remains 20 ms. This bounds the whole completion
+        // sequence, allowing native playback/serial scheduling to settle.
+        const auto until=StreamNowUs()+100000;
+        MediusClipStatus last{};
         do
         {
-            {std::lock_guard transaction(s.io);MediusClipStatus clip{};if(!s.ClipStatusLocked(clip))return false;
-                if(ClickIdle(clip))return true;}
+            {std::lock_guard transaction(s.io);if(!s.ClipStatusLocked(last))return false;
+                if(ClickEdgesPlayed(last,s.clickBaselineTicks))
+                {
+                    if(ClickIdle(last))return true;
+                    // Normalize a drained engine only after both button edges
+                    // actually played. STOP never cancels ordinary MOVE output.
+                    if(last.state==MEDIUS_CLIP_STATE_PLAYING)
+                    {
+                        if(!s.Good(medius_clip_stop(s.clip),"Drained click stop") || !s.ClipStatusLocked(last))return false;
+                        ++s.drainedClickStops;
+                        if(ClickIdle(last) && ClickEdgesPlayed(last,s.clickBaselineTicks))return true;
+                    }
+                }}
             // Never retain the serial mutex while waiting for firmware playback.
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }while(StreamNowUs()<until);
-        s.Fail("Finite click did not confirm release within its bounded deadline");return false;
+        s.Fail("Finite click completion exceeded 100 ms: "+ClickReadbackText(last,s.clickBaselineTicks));return false;
     }
     bool MediusBackend::ClickCompleted() const
     {std::lock_guard guard(state_->state);return state_->clickCompleted && !state_->clickAborted;}
@@ -491,6 +538,10 @@ namespace vanta
             <<",\"original_bearing_window_ms\":"<<s.saved.bearingWindowMs<<",\"original_bearing_mode\":"<<unsigned(s.saved.bearingMode)
             <<",\"clicks_started\":"<<s.clicks.load()<<",\"clicks_completed\":"<<s.completedClicks.load()<<",\"clicks_cancelled\":"<<s.cancelledClicks.load()
             <<",\"click_active\":"<<(s.clickActive?"true":"false")<<",\"correction_active\":"<<(s.moving?"true":"false")
+            <<",\"click_completion_deadline_ms\":100,\"click_query_timeout_ms\":20,\"drained_click_stops\":"<<s.drainedClickStops.load()
+            <<",\"click_readback\":{\"at_local_us\":"<<s.lastClickReadbackUs<<",\"state\":"<<unsigned(s.lastClickReadback.state)
+            <<",\"buffered_bytes\":"<<s.lastClickReadback.total<<",\"content_edges\":"<<static_cast<std::uint32_t>(s.lastClickReadback.ticks-s.clickBaselineTicks)
+            <<",\"left_held\":"<<(HeldLeft(s.lastClickReadback)?"true":"false")<<'}'
             <<",\"injection_active_last_readback\":"<<(s.motionPending?"true":"false")
             <<",\"faults\":"<<s.faults.load()<<",\"cancellations\":"<<s.cancellations.load()<<",\"physical_events_dropped\":"<<s.inputDrops.load()
             <<",\"last_failure\":"<<InputJsonString(s.lastFailure)<<",\"last_failure_local_us\":"<<s.lastFailureUs
@@ -570,6 +621,29 @@ namespace vanta
         status.total=1;if(ClickIdle(status))return false;
         status.total=0;status.overruns=7;status.seq_gaps=11;
         if(NewClipFault(status,7,11,false) || !NewClipFault(status,6,11,false))return false;
+        status={};status.state=MEDIUS_CLIP_STATE_IDLE;status.ticks=12;
+        if(!ClickEdgesPlayed(status,10) || ClickEdgesPlayed(status,12) || ClickEdgesPlayed(status,11))return false;
+        status.ticks=0;if(!ClickEdgesPlayed(status,0xfffffffeU))return false;
+        status.total=1;if(ClickEdgesPlayed(status,0xfffffffeU))return false;
+        status.total=0;status.held_n=1;status.held[0]=medius_usage_button(MEDIUS_BUTTON_LEFT);
+        if(ClickEdgesPlayed(status,0xfffffffeU))return false;
+        MediusClipSettings finite{};finite.finalized=1;if(!ClickSettingsMatch(finite))return false;
+        finite.loop_=1;if(ClickSettingsMatch(finite))return false;finite.loop_=0;finite.retain=1;
+        if(ClickSettingsMatch(finite))return false;finite.retain=0;finite.finalized=0;
+        if(ClickSettingsMatch(finite))return false;
+        // Idle alone is not success. Count each confirmed press/release once,
+        // including consecutive clips with a cumulative tick baseline.
+        Implementation playback;status={};status.state=MEDIUS_CLIP_STATE_IDLE;
+        for(std::uint32_t base=10;base<18;base+=2)
+        {
+            playback.clickActive=true;playback.clickAborted=playback.clickCompleted=false;playback.clickBaselineTicks=base;
+            status.ticks=base;playback.ObserveClick(status);if(playback.clickCompleted)return false;
+            status.ticks=base+2;status.state=MEDIUS_CLIP_STATE_PLAYING;playback.ObserveClick(status);
+            if(playback.clickCompleted)return false;
+            status.state=MEDIUS_CLIP_STATE_IDLE;playback.ObserveClick(status);playback.ObserveClick(status);
+            if(!playback.clickCompleted || playback.clickActive)return false;
+        }
+        if(playback.completedClicks!=4)return false;
         auto* builder=medius_clip_builder_new();if(!builder)return false;
         const bool valid=BuildClick(builder,14) && medius_clip_builder_byte_len(builder)>0 && BuildClick(builder,34);
         medius_clip_builder_free(builder);

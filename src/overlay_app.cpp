@@ -1200,6 +1200,7 @@ namespace
                     +",\"python_output\":"+pythonBot_.DiagnosticsJson()
                     +",\"testmove_enabled\":"+(testMove_.GetConfig().enabled?"true":"false")
                     +",\"testclick_enabled\":"+(testClick_.GetConfig().enabled?"true":"false")
+                    +",\"testclick_output\":"+testClick_.DiagnosticsJson()
                     +",\"ui_visible\":"+(overlayVisible_?"true":"false")+",\"ui_rendered_total\":"+std::to_string(renderedFrames_)
                     +",\"ui_fps_cap\":60}";
             });
@@ -2368,6 +2369,7 @@ namespace vanta
                 "  vanta.exe --detector-self-test validate contour/color/aim/resolution handling\n"
                 "  vanta.exe --detector-ui-self-test validate detector controls and preview draw lists\n"
                 "  vanta.exe --makcu-self-test validate serial framing and baud handshake\n"
+                "  vanta.exe --testclick-self-test validate repeat and burst scheduling without hardware\n"
                 "  vanta.exe --makcu-probe COMn query connected firmware without injecting moves\n"
                 "  vanta.exe --receiver-capture-self-test validate Sunshine-to-capture frame delivery\n"
                 "  vanta.exe --receiver-discover-lan auto-discover Sunshine hosts on this LAN\n"
@@ -2385,6 +2387,8 @@ namespace vanta
             return MediusBackend::RunSelfTest() ? 0 : 1;
         if (HasArgument(argumentCount,arguments,L"--input-lock-self-test"))
             return InputLockCoordinator::RunSelfTest() ? 0 : 1;
+        if (HasArgument(argumentCount,arguments,L"--testclick-self-test"))
+            return TestClickController::RunSelfTest() ? 0 : 1;
         if (HasArgument(argumentCount,arguments,L"--python-self-test"))
             return RunPythonBotSelfTest() ? 0 : 1;
         for (int index=1;index<argumentCount;++index)

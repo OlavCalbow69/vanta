@@ -1,4 +1,8 @@
-# Medius native output — build 1.1.0.13
+# Medius native output — build 1.1.0.14
+
+Build 1.1.0.14 improves TestClick completion/repeat handling and shows its backend
+and exact click status directly in the panel. See [TestClick changes and laptop
+checks](README-TESTCLICK.md).
 
 Build 1.1.0.13 adds optional [Python Fuse inputs](README-PYTHON-FUSE.md) for
 per-axis shared control. It retains narrow purple and ongoing actual firmware mask

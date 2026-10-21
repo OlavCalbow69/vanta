@@ -22,6 +22,19 @@ namespace
     constexpr auto kMaskVerifyUs=100000ULL;
     std::size_t Index(vanta::InputOwner owner){return static_cast<std::size_t>(owner);}
     std::uint8_t Button(vanta::MouseButtonBinding b){return static_cast<std::uint8_t>(1U<<static_cast<unsigned>(b));}
+    const char* QueryName(vanta::InputQuery query)
+    {
+        switch(query)
+        {
+        case vanta::InputQuery::lockX:return "physical X mask";
+        case vanta::InputQuery::lockY:return "physical Y mask";
+        case vanta::InputQuery::lockLeft:return "physical left-button mask";
+        case vanta::InputQuery::lockSide1:return "physical X1 mask";
+        case vanta::InputQuery::lockSide2:return "physical X2 mask";
+        case vanta::InputQuery::leftState:return "injected left-button release";
+        default:return "pending movement";
+        }
+    }
     struct Policy {bool enabled{};std::uint64_t generation{};vanta::MouseButtonBinding button{};};
     std::uint32_t Reserved(const std::array<Policy,4>& policies)
     {
@@ -126,6 +139,9 @@ namespace vanta
         std::array<std::string,4> movementBlocks;
         std::array<std::uint64_t,4> movementBlockCounts{},movementBlockAt{};
         std::array<bool,4> movementBlocked{};
+        std::array<ClickOutputStatus,4> clickStatus;
+        std::array<std::string,4> clickLogMessages;
+        std::array<std::uint64_t,4> clickLogAt{};
         InputMaskReadback firmwareMasks;
         bool refreshMasks{true},verificationValid{};
         ManagedInputPolicy verifiedExpected,requestedPolicy;
@@ -184,18 +200,47 @@ namespace vanta
             return nullptr;
         }
         bool Valid(const OutputContext& c,std::uint64_t now){return !InvalidReason(c,now);}
+        const char* InvalidClickReason(const OutputContext& c,std::uint64_t now)
+        {
+            if(const auto reason=InvalidReason(c,now))return reason;
+            std::lock_guard guard(state);
+            if(injectedLeft && clickCancelled && SameSession(c,click))return "Activation or settings changed during this click; use a fresh frame";
+            return nullptr;
+        }
         bool BlockUnlocked(InputOwner owner,const std::string& why)
         {const auto i=Index(owner);movementBlocks[i]=why;++movementBlockCounts[i];movementBlockAt[i]=StreamNowUs();movementBlocked[i]=true;return false;}
         bool Block(InputOwner owner,const std::string& why)
         {std::lock_guard guard(state);return BlockUnlocked(owner,why);}
-        OutputContext Checked(const OutputContext& c,std::uint64_t emergency)
+        void RecordClick(InputOwner owner,ClickOutputPhase phase,const std::string& message,bool report=false)
+        {
+            const auto i=Index(owner),now=StreamNowUs();bool writeLog{};
+            std::uint64_t attempts{},completed{};
+            {std::lock_guard guard(state);auto& value=clickStatus[i];value.phase=phase;value.message=message;value.updatedAtUs=now;
+                if(phase==ClickOutputPhase::blocked)++value.rejected;
+                if(phase==ClickOutputPhase::completed)++value.completed;
+                if(phase==ClickOutputPhase::cancelled)++value.cancelled;
+                if(phase==ClickOutputPhase::failed)++value.failed;
+                if(report && (clickLogMessages[i]!=message || !clickLogAt[i] || now-clickLogAt[i]>=1000000))
+                {writeLog=true;clickLogMessages[i]=message;clickLogAt[i]=now;}
+                attempts=value.attempts;completed=value.completed;}
+            if(writeLog)log::Info("Click output: owner=%u attempts=%llu completed=%llu reason=%s",unsigned(owner),
+                static_cast<unsigned long long>(attempts),static_cast<unsigned long long>(completed),message.c_str());
+        }
+        bool BlockClick(InputOwner owner,const std::string& why)
+        {RecordClick(owner,ClickOutputPhase::blocked,why,true);return false;}
+        std::string BackendFailure(const char* fallback)
+        {const auto reason=transport.failureReason?transport.failureReason():std::string{};return reason.empty()?fallback:reason;}
+        OutputContext Checked(const OutputContext& c,std::uint64_t emergency,bool forClick=false)
         {
             OutputContext result=c;
-            result.isCurrent=[this,c,emergency]
+            result.isCurrent=[this,c,emergency,forClick]
             {
-                if(emergencyRevision.load()!=emergency)return Block(c.owner,"Emergency release cancelled pending output");
-                if(resetRequired)return Block(c.owner,"Mouse output recovery is required");
-                if(const auto reason=InvalidReason(c,StreamNowUs()))return Block(c.owner,reason);
+                // Click cancellation is reported by the owning click transaction,
+                // rather than mixing it into movement rejection diagnostics.
+                if(emergencyRevision.load()!=emergency)return forClick?false:Block(c.owner,"Emergency release cancelled pending output");
+                if(resetRequired)return forClick?false:Block(c.owner,"Mouse output recovery is required");
+                if(const auto reason=forClick?InvalidClickReason(c,StreamNowUs()):InvalidReason(c,StreamNowUs()))
+                    return forClick?false:Block(c.owner,reason);
                 return true;
             };
             return result;
@@ -223,7 +268,7 @@ namespace vanta
                 if(motion){releaseReason="Recovery: "+why;releaseRequestedUs=StreamNowUs();}}
             ready=false;resetRequired=true;faultCleaned=false;++failures;
             if(transport.invalidate)transport.invalidate(why);
-            log::Warning("MAKCU input-lock recovery required: %s",why.c_str());changed.notify_all();
+            log::Warning("Mouse output recovery required: %s",why.c_str());changed.notify_all();
         }
         bool Query(InputQuery command,int& value)
         {
@@ -231,7 +276,8 @@ namespace vanta
             const bool success=transport.query && transport.query(command,value);
             firmwareQuery.Add(double(StreamNowUs()-started)/1000.0);
             if(!success)
-            {Fail(std::string("Firmware query failed: ")+std::to_string(int(command))+"; serial reset required before another query");return false;}
+            {const auto why=std::string("Firmware ")+QueryName(command)+" query failed; serial reset required before another query";
+                Fail(BackendFailure(why.c_str()));return false;}
             return true;
         }
         bool VerifyMasks(std::uint32_t desired,bool force=false)
@@ -313,20 +359,26 @@ namespace vanta
                 MaskText(previous).c_str(),MaskText(desired).c_str(),MaskText(expected.guidedAxes).c_str());
             return true;
         }
-        void CompleteClick(bool success)
+        void CompleteClick(bool success,const std::string& reason={})
         {
-            std::shared_ptr<std::promise<bool>> completion;
-            {std::lock_guard guard(state);injectedLeft=false;clickCancelled=false;click={};completion=std::move(clickResult);}
+            std::shared_ptr<std::promise<bool>> completion;InputOwner owner{};std::string detail;
+            {std::lock_guard guard(state);owner=click.owner;detail=reason.empty()?(resetRequired?status:"Click cancelled before confirmed completion"):reason;
+                injectedLeft=false;clickCancelled=false;click={};completion=std::move(clickResult);}
             Mark();
-            if(completion){try{completion->set_value(success);}catch(...){}}
+            if(completion)
+            {
+                RecordClick(owner,success?ClickOutputPhase::completed:resetRequired?ClickOutputPhase::failed:ClickOutputPhase::cancelled,
+                    success?"Press and release confirmed; ready for the next matching frame":detail,true);
+                try{completion->set_value(success);}catch(...){}
+            }
         }
-        bool ReleaseClick(bool success)
+        bool ReleaseClick(bool success,const std::string& reason={})
         {
             bool active{};{std::lock_guard guard(state);active=injectedLeft;}
             if(!active)return true;
             bool written=false;
             for(int i=0;i<3 && !written;++i)written=transport.endClick?transport.endClick(!success):(transport.left && transport.left(false));
-            if(!written){Fail("Injected left-button release write failed");CompleteClick(false);return false;}
+            if(!written){Fail(BackendFailure("Injected left-button release write failed"));CompleteClick(false);return false;}
             int held{};
             if(!resetRequired && probed && (!Query(InputQuery::leftState,held) || (held&2)))
             {if(!resetRequired)Fail("Injected left button remained held after release");CompleteClick(false);return false;}
@@ -334,7 +386,12 @@ namespace vanta
             // Do not complete the synchronous caller until the physical mask is restored.
             uncertainLeft=false;
             {std::lock_guard guard(state);injectedLeft=false;}
-            const bool ok=Reconcile(Desired());CompleteClick(success && ok && (!transport.clickSucceeded || transport.clickSucceeded()));return ok;
+            bool cancelled{};{std::lock_guard guard(state);cancelled=clickCancelled;}
+            const bool ok=Reconcile(Desired());
+            const bool completed=!transport.clickSucceeded || transport.clickSucceeded();
+            if(success && ok && !cancelled && !completed)
+            {Fail(BackendFailure("Backend released the click without confirming playback completion"));CompleteClick(false);return false;}
+            CompleteClick(success && ok && !cancelled && completed,reason);return ok;
         }
         void BlindCleanup()
         {
@@ -404,13 +461,14 @@ namespace vanta
             if(cancelAllPending.exchange(false) && transport.cancelAll)transport.cancelAll();
             bool left{},moving{};
             {std::lock_guard guard(state);left=injectedLeft;moving=motion;}
-            if(left && !Valid(c,now))finishClick=true;
+            const auto invalidClick=left?InvalidClickReason(c,now):nullptr;
+            if(invalidClick)finishClick=true;
             const auto invalidMotion=moving?InvalidReason(m,now):nullptr;
             if(invalidMotion)cancelMotion=true;
             if(finishClick)
             {
-                bool normal{};{std::lock_guard guard(state);normal=!clickCancelled && now>=clickDeadlineUs;}
-                if(!ReleaseClick(normal))return;
+                bool normal{};{std::lock_guard guard(state);normal=!clickCancelled && !invalidClick && now>=clickDeadlineUs;}
+                if(!ReleaseClick(normal,invalidClick?invalidClick:"Activation, settings or output session cancelled the click"))return;
             }
             if(cancelMotion)
             {
@@ -515,6 +573,7 @@ namespace vanta
         s.transport.beginClick=[&device](int hold,const OutputContext& context){return device.BeginClick(hold,context);};
         s.transport.endClick=[&device](bool cancel){return device.FinishClick(cancel);};
         s.transport.clickSucceeded=[&device]{return device.ClickCompleted();};
+        s.transport.failureReason=[&device]{return device.FailureReason();};
         s.transport.readMasks=[&device](InputMaskReadback& result){return device.ReadMasks(result);};
         s.transport.invalidate=[&device](const std::string& reason){device.InvalidateOutput(reason);};
         s.transport.axisPolicy=[&device](std::uint32_t bit,const DirectionalInputScales& policy){return device.SetAxisPolicy(bit,policy);};
@@ -669,26 +728,55 @@ namespace vanta
     bool InputLockCoordinator::TryClick(const OutputContext& c,int hold)
     {
         auto& s=*state_;const auto emergency=s.emergencyRevision.load();auto completion=std::make_shared<std::promise<bool>>();auto result=completion->get_future();
+        {std::lock_guard guard(s.state);++s.clickStatus[Index(c.owner)].attempts;}
         {
-            std::lock_guard transaction(s.io);bool protectedMode{};
-            {std::lock_guard guard(s.state);if(!s.attached || s.injectedLeft || s.resetRequired ||
-                (s.settings.backend==InputBackend::medius && (s.draining || s.motionCancelled)))return false;protectedMode=s.Protected();}
-            if(protectedMode && (!s.ready || !s.transport.helperReady || !s.transport.helperReady()))return false;
-            if(emergency!=s.emergencyRevision.load() || !s.Valid(c,StreamNowUs())){++s.staleRejections;return false;}
+            std::lock_guard transaction(s.io);bool protectedMode{};std::string blocked;
+            {std::lock_guard guard(s.state);
+                if(!s.attached)blocked="Mouse output is disconnected";
+                else if(s.resetRequired)blocked="Recovery required: "+s.status;
+                else if(s.injectedLeft)blocked="Another generated click is still completing";
+                else if(s.settings.backend==InputBackend::medius && (s.draining || s.motionCancelled))
+                    blocked="Waiting for the previous movement correction to drain";
+                protectedMode=s.Protected();}
+            if(!blocked.empty())return s.BlockClick(c.owner,blocked);
+            if(protectedMode && (!s.ready || !s.transport.helperReady || !s.transport.helperReady()))
+                return s.BlockClick(c.owner,"Input-lock verification or crash-recovery helper is not ready; reconnect Mouse Output");
+            if(emergency!=s.emergencyRevision.load())return s.BlockClick(c.owner,"Emergency release cancelled this click request");
+            if(const auto reason=s.InvalidReason(c,StreamNowUs())){++s.staleRejections;return s.BlockClick(c.owner,reason);}
             {std::lock_guard guard(s.state);s.injectedLeft=true;s.clickCancelled=false;s.click=c;s.clickResult=completion;
                 s.clickMask=s.settings.lockGeneratedClick?InputLockLeft:0U;
                 s.clickDeadlineUs=StreamNowUs()+static_cast<std::uint64_t>(std::clamp(hold,14,34))*1000;}
+            s.RecordClick(c.owner,ClickOutputPhase::preparing,"Verifying the physical left-button mask");
             s.uncertainLeft=true;s.Mark();
-            if(!s.Reconcile(s.Desired()) || !s.VerifyMasks(s.Desired()) || emergency!=s.emergencyRevision.load() || !s.Valid(c,StreamNowUs()))
+            if(!s.Reconcile(s.Desired()) || !s.VerifyMasks(s.Desired()))
             {s.ReleaseClick(false);return false;}
-            const auto checked=s.Checked(c,emergency);
-            if(!(s.transport.beginClick?s.transport.beginClick(hold,checked):s.transport.left(true))){s.Fail("Injected left-button press failed");s.CompleteClick(false);return false;}
-            {std::lock_guard guard(s.state);s.clickDeadlineUs=StreamNowUs()+static_cast<std::uint64_t>(std::clamp(hold,14,34))*1000;}
+            const auto invalid=s.InvalidClickReason(c,StreamNowUs());
+            if(emergency!=s.emergencyRevision.load() || invalid)
+            {s.ReleaseClick(false,invalid?invalid:"Emergency release cancelled the prepared click");return false;}
+            const auto checked=s.Checked(c,emergency,true);
+            if(!(s.transport.beginClick?s.transport.beginClick(hold,checked):(s.transport.left && s.transport.left(true))))
+            {
+                // Losing activation/freshness during preparation is cancellation,
+                // not a failed serial link. Clean up and accept a new fresh frame.
+                const auto cancelled=s.InvalidClickReason(c,StreamNowUs());
+                const bool healthy=!s.transport.healthy || s.transport.healthy();
+                if(healthy && (cancelled || emergency!=s.emergencyRevision.load()))
+                {s.ReleaseClick(false,cancelled?cancelled:"Emergency release cancelled the prepared click");return false;}
+                s.Fail(s.BackendFailure("Injected left-button press failed"));s.BlindCleanup();return false;
+            }
+            {std::lock_guard guard(s.state);s.clickDeadlineUs=StreamNowUs()+static_cast<std::uint64_t>(std::clamp(hold,14,34))*1000;
+                ++s.clickStatus[Index(c.owner)].started;}
+            s.RecordClick(c.owner,ClickOutputPhase::playing,"Waiting for firmware press/release completion");
         }
         s.changed.notify_all();
         // Synchronous completion is preserved, without holding either device mutex.
         if(result.wait_for(std::chrono::milliseconds(750))!=std::future_status::ready)
-        {CancelOwner(c.owner);return false;}
+        {
+            std::lock_guard transaction(s.io);bool stillOwned{};
+            {std::lock_guard guard(s.state);stillOwned=s.clickResult==completion;}
+            if(!stillOwned)return result.wait_for(std::chrono::milliseconds(0))==std::future_status::ready && result.get();
+            s.Fail("Generated click completion exceeded 750 ms; reconnect required");s.BlindCleanup();return false;
+        }
         return result.get();
     }
     void InputLockCoordinator::EndCorrection(InputOwner owner,std::uint64_t generation,const char* reason)
@@ -726,6 +814,8 @@ namespace vanta
     std::uint64_t InputLockCoordinator::EmergencyRevision() const noexcept{return state_->emergencyRevision;}
     std::string InputLockCoordinator::MovementBlockReason(InputOwner owner) const
     {std::lock_guard guard(state_->state);return state_->movementBlocked[Index(owner)]?state_->movementBlocks[Index(owner)]:std::string{};}
+    ClickOutputStatus InputLockCoordinator::ClickStatus(InputOwner owner) const
+    {std::lock_guard guard(state_->state);return state_->clickStatus[Index(owner)];}
     std::string InputLockCoordinator::Status() const
     {
         const auto& s=*state_;std::lock_guard guard(s.state);std::ostringstream out;
@@ -758,6 +848,7 @@ namespace vanta
         if(s.firmwareMasks.bearingKnown)out<<"\nBearing readback: "<<s.firmwareMasks.bearingWindowMs<<" ms / "
             <<(s.firmwareMasks.bearingMode==0?"per axis":"vector");
         if(!s.verificationError.empty())out<<"\nMask verification: "<<s.verificationError;
+        if(s.injectedLeft)out<<"\nClick: "<<names[Index(s.click.owner)]<<" | "<<s.clickStatus[Index(s.click.owner)].message;
         if(!s.releaseReason.empty())out<<"\nEnding: "<<s.releaseReason;
         else if(!s.lastReleaseReason.empty())out<<"\nLast correction release: "<<s.lastReleaseReason;
         out<<" | Enabled owners:";bool owners=false;
@@ -831,7 +922,11 @@ namespace vanta
                <<",\"activation\":"<<static_cast<int>(p.button)<<",\"output_rejections\":"<<s.movementBlockCounts[i]
                <<",\"last_output_check_rejected\":"<<(s.movementBlocked[i]?"true":"false")
                <<",\"last_output_block_local_us\":"<<s.movementBlockAt[i]
-               <<",\"last_output_block_reason\":"<<Escape(s.movementBlocks[i])<<'}';}
+               <<",\"last_output_block_reason\":"<<Escape(s.movementBlocks[i]);
+            const auto& click=s.clickStatus[i];
+            out<<",\"click_output\":{\"phase\":"<<int(click.phase)<<",\"attempts\":"<<click.attempts<<",\"started\":"<<click.started
+                <<",\"completed\":"<<click.completed<<",\"rejected\":"<<click.rejected<<",\"cancelled\":"<<click.cancelled
+                <<",\"failed\":"<<click.failed<<",\"updated_at_local_us\":"<<click.updatedAtUs<<",\"message\":"<<Escape(click.message)<<"}}";}
         return out.str()+"]}";
     }
     bool InputLockCoordinator::RunSelfTest()
@@ -1033,6 +1128,69 @@ namespace vanta
             state.attached=state.probed=true;state.ready=true;state.helperHealthy=true;
             state.policies[1]={true,7,MouseButtonBinding::x1};state.physical=Button(MouseButtonBinding::x1);state.observedReleased=state.physical;
         };
+        // Repeated public TryClick calls use the same held activation, with no
+        // release edge required between completed finite clicks. Service is
+        // driven explicitly; these opt-in checks never open a device.
+        FakeMasks clickDevice;InputLockCoordinator repeated;setup(repeated,clickDevice);auto& clicks=*repeated.state_;
+        repeated.SetPolicy(InputOwner::testClick,true,41,MouseButtonBinding::x1);
+        OutputContext clickFrame;clickFrame.owner=InputOwner::testClick;clickFrame.generation=41;
+        clickFrame.activation=MouseButtonBinding::x1;clickFrame.streamGeneration=3;clickFrame.streamSession=4;
+        bool clickConfirmed{};
+        clicks.transport.endClick=[&](bool cancel)
+        {clickDevice.events.push_back(cancel?"cancel click":"finish click");clickDevice.click=false;clickConfirmed=!cancel;return true;};
+        clicks.transport.clickSucceeded=[&]{return clickConfirmed;};
+        const auto completeOneClick=[&]
+        {
+            auto entered=std::make_shared<std::promise<void>>();auto begun=entered->get_future();
+            clicks.transport.beginClick=[&,entered](int hold,const OutputContext& context)
+            {
+                if(hold!=14 || !context.isCurrent || !context.isCurrent())return false;
+                if(!(clickDevice.mask&InputLockLeft) || !clicks.verificationValid)return false;
+                clickDevice.events.push_back("begin click");clickDevice.click=true;clickConfirmed=false;entered->set_value();return true;
+            };
+            ++clickFrame.sequence;auto result=std::async(std::launch::async,[&]{return repeated.TryClick(clickFrame,14);});
+            if(begun.wait_for(std::chrono::milliseconds(500))!=std::future_status::ready)return false;
+            {std::lock_guard transaction(clicks.io);std::lock_guard guard(clicks.state);clicks.clickDeadlineUs=0;}
+            clicks.Service();return result.get();
+        };
+        for(int i=0;i<4;++i)if(!completeOneClick())return false;
+        const auto repeatedStatus=repeated.ClickStatus(InputOwner::testClick);
+        if(repeatedStatus.attempts!=4 || repeatedStatus.completed!=4 || repeatedStatus.started!=4 ||
+            clickDevice.click || (clickDevice.mask&InputLockLeft) || !(clickDevice.mask&InputLockSide1))return false;
+        const auto clickBegin=std::find(clickDevice.events.begin(),clickDevice.events.end(),"begin click");
+        const auto clickEnd=std::find(clickDevice.events.begin(),clickDevice.events.end(),"finish click");
+        const auto clickUnmask=std::find(clickDevice.events.begin(),clickDevice.events.end(),"unlock 4");
+        if(clickBegin>=clickEnd || clickEnd>=clickUnmask)return false;
+        // The old enable generation cannot undo emergency release. A new
+        // generation plus a fresh physical release/press explicitly rearms it.
+        repeated.EmergencyRelease();clicks.Service();
+        repeated.SetPolicy(InputOwner::testClick,true,41,MouseButtonBinding::x1);
+        if(repeated.TryClick(clickFrame,14) || repeated.ClickStatus(InputOwner::testClick).rejected!=1)return false;
+        repeated.SetPolicy(InputOwner::testClick,true,42,MouseButtonBinding::x1);clickFrame.generation=42;
+        repeated.PhysicalButtons(0);repeated.PhysicalButtons(Button(MouseButtonBinding::x1));
+        if(!completeOneClick() || repeated.ResetRequired())return false;
+        // Release/repress while preparing a click must latch cancellation; the
+        // newly held button cannot revive the old request or poison the link.
+        clicks.transport.beginClick=[&](int,const OutputContext& context)
+        {repeated.PhysicalButtons(0);repeated.PhysicalButtons(Button(MouseButtonBinding::x1));return context.isCurrent();};
+        if(repeated.TryClick(clickFrame,14) || repeated.ResetRequired() || clickDevice.click ||
+            repeated.ClickStatus(InputOwner::testClick).phase!=ClickOutputPhase::cancelled)return false;
+        if(!completeOneClick())return false;
+        // A settings change during actual firmware-mask readback is another
+        // ordinary cancellation. It restores left without starting playback.
+        clicks.refreshMasks=true;clickDevice.beforeRead=[&]
+        {repeated.SetPolicy(InputOwner::testClick,false,43,MouseButtonBinding::x1);};
+        if(repeated.TryClick(clickFrame,14) || repeated.ResetRequired() || clickDevice.click || (clickDevice.mask&InputLockLeft))return false;
+        repeated.SetPolicy(InputOwner::testClick,true,44,MouseButtonBinding::x1);clickFrame.generation=44;
+        if(!completeOneClick())return false;
+        // A release query failure is a real fault, not a confirmed shot.
+        const auto confirmedBeforeTimeout=repeated.ClickStatus(InputOwner::testClick).completed;
+        const auto originalQuery=clicks.transport.query;
+        clicks.transport.query=[&](InputQuery query,int& value)
+        {return query!=InputQuery::leftState && originalQuery(query,value);};
+        if(completeOneClick() || !repeated.ResetRequired() ||
+            repeated.ClickStatus(InputOwner::testClick).completed!=confirmedBeforeTimeout)return false;
+        clicks.Service();
         OutputContext frame;frame.owner=InputOwner::python;frame.generation=7;frame.streamGeneration=8;frame.streamSession=9;
         frame.activation=MouseButtonBinding::x1;frame.physicalInputMode=PythonPhysicalInputMode::fuse;
         const auto fresh=[](OutputContext& value){++value.sequence;value.frameTimeUs=StreamNowUs();};

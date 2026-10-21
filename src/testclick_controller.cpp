@@ -6,6 +6,7 @@
 #include "color_targets.hpp"
 #include "makcu_controller.hpp"
 #include "logger.hpp"
+#include "input_backend_utils.hpp"
 
 #include "imgui.h"
 #include "imgui_settings.h"
@@ -23,6 +24,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 
@@ -34,7 +36,7 @@ namespace
         disabled,
         waitingForKey,
         waitingForCapture,
-        waitingForMakcu,
+        waitingForOutput,
         watching,
         firing
     };
@@ -49,8 +51,8 @@ namespace
             return "WAITING FOR HOLD BUTTON";
         case TestClickState::waitingForCapture:
             return "WAITING FOR CAPTURE";
-        case TestClickState::waitingForMakcu:
-            return "WAITING FOR MAKCU";
+        case TestClickState::waitingForOutput:
+            return "OUTPUT BLOCKED";
         case TestClickState::watching:
             return "WATCHING";
         case TestClickState::firing:
@@ -59,6 +61,24 @@ namespace
             return "OFFLINE";
         }
     }
+
+    struct ClickRepeatState
+    {
+        int burstCount{};
+        double lastShotTime{};
+        void Reset(){burstCount=0;lastShotTime=0.0;}
+        bool Due(bool limited,int size,double delay,double pause,double now)
+        {
+            if(!limited)return true;
+            if(burstCount>=size)
+            {
+                if(now-lastShotTime<=pause)return false;
+                burstCount=0;
+            }
+            return now-lastShotTime>delay;
+        }
+        void Completed(bool limited,double now){lastShotTime=now;if(limited)++burstCount;}
+    };
 
     // Packed 24-bit key for BGR: B | (G<<8) | (R<<16)
     inline std::uint32_t BgrKey(std::uint8_t b, std::uint8_t g, std::uint8_t r)
@@ -296,8 +316,7 @@ namespace vanta
         std::atomic<TestClickState> state{TestClickState::offline};
         std::atomic<std::uint64_t> settingsRevision{0};
 
-        int    burstCount{0};
-        double lastShotTime{0.0};
+        ClickRepeatState repeat;
 
         static double NowSeconds()
         {
@@ -317,6 +336,7 @@ namespace vanta
             std::uint64_t sequence = 0;
             std::int64_t timestamp = 0;
             double nextPixelSampleTime = 0.0;
+            std::uint64_t repeatRevision=~0ULL;
 
             while (running.load(std::memory_order_acquire))
             {
@@ -341,11 +361,13 @@ namespace vanta
                     outputGeneration=settingsRevision.load();
                 }
 
+                if(repeatRevision!=outputGeneration){repeat.Reset();repeatRevision=outputGeneration;}
                 if(makcu)makcu->SetInputPolicy(InputOwner::testClick,snapEnabled,outputGeneration,snapHoldButton);
                 frameSubscription.Update({FrameRegionKind::configuredCapture,640,{},0,snapEnabled});
-                if(capture)capture->SetConsumerState("TestClick",false,snapEnabled ? "Waiting for activation / MAKCU" : "Disabled");
+                if(capture)capture->SetConsumerState("TestClick",false,snapEnabled ? "Waiting for activation / mouse output" : "Disabled");
                 if (!snapEnabled)
                 {
+                    repeat.Reset();
                     state.store(TestClickState::disabled);
                     triggerActive.store(false);
                     lastHits.store(0);
@@ -360,15 +382,14 @@ namespace vanta
                 if (makcu == nullptr ||
                     !makcu->IsMouseButtonInputAvailable())
                 {
-                    state.store(TestClickState::waitingForMakcu);
+                    state.store(TestClickState::waitingForOutput);
                     triggerActive.store(false);
                     lastHits.store(0);
                     matchingPixels.store(0);
                     hitUpState.store(false);
                     hitLeftState.store(false);
                     hitRightState.store(false);
-                    burstCount   = 0;
-                    lastShotTime = 0.0;
+                    repeat.Reset();
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
                 }
@@ -382,8 +403,7 @@ namespace vanta
                     hitUpState.store(false);
                     hitLeftState.store(false);
                     hitRightState.store(false);
-                    burstCount = 0;
-                    lastShotTime = 0.0;
+                    repeat.Reset();
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                     continue;
                 }
@@ -475,24 +495,7 @@ namespace vanta
                 if (matchFound)
                 {
                     const double now = NowSeconds();
-                    bool shouldClick = !snapBurstLimiter;
-                    if (snapBurstLimiter &&
-                        burstCount < snapBurstSize)
-                    {
-                        if (now - lastShotTime > static_cast<double>(snapBurstDelay))
-                        {
-                            shouldClick = true;
-                        }
-                    }
-                    else if (snapBurstLimiter &&
-                             now - lastShotTime >
-                                 static_cast<double>(
-                                     snapBurstPause))
-                    {
-                        burstCount = 0;
-                    }
-
-                    if (shouldClick)
+                    if (repeat.Due(snapBurstLimiter,snapBurstSize,snapBurstDelay,snapBurstPause,now))
                     {
                         OutputContext output;output.owner=InputOwner::testClick;output.generation=outputGeneration;
                         const auto metadata=snapshot.metadata;
@@ -500,14 +503,10 @@ namespace vanta
                         output.frameTimeUs=metadata.timing.receivedUs?metadata.timing.receivedUs:metadata.timing.publishedUs;
                         output.activation=snapHoldButton;
                         output.isCurrent=[this,metadata,outputGeneration]{return running.load() && settingsRevision.load()==outputGeneration && capture && capture->IsCurrent(metadata);};
-                        const bool clicked = makcu && capture->IsCurrent(metadata) && makcu->TryClick(output);
-                        lastShotTime = now;
+                        const bool clicked = makcu && makcu->TryClick(output);
                         if (clicked)
                         {
-                            if (snapBurstLimiter)
-                            {
-                                ++burstCount;
-                            }
+                            repeat.Completed(snapBurstLimiter,now);
                             shotsFired.fetch_add(
                                 1,
                                 std::memory_order_relaxed);
@@ -515,13 +514,13 @@ namespace vanta
                         else
                         {
                             state.store(
-                                TestClickState::waitingForMakcu);
+                                TestClickState::waitingForOutput);
                         }
                     }
                 }
                 else
                 {
-                    burstCount = 0;
+                    repeat.Reset();
                 }
             }
 
@@ -616,7 +615,7 @@ namespace vanta
                     ? ImVec4(0.45F, 0.96F, 0.65F, 1.0F)
                     : currentState == TestClickState::waitingForKey ||
                             currentState == TestClickState::waitingForCapture ||
-                            currentState == TestClickState::waitingForMakcu
+                            currentState == TestClickState::waitingForOutput
                         ? ImVec4(1.0F, 0.75F, 0.32F, 1.0F)
                         : ImVec4(0.72F, 0.72F, 0.78F, 1.0F);
 
@@ -646,8 +645,23 @@ namespace vanta
             impl.hitRightState.load() ? ImVec4(0.4F, 1.0F, 0.4F, 1.0F) : ImVec4(0.4F, 0.4F, 0.4F, 1.0F),
             "[RIGHT]");
 
+        if(impl.makcu)
+        {
+            const auto output=impl.makcu->ClickStatus(InputOwner::testClick);
+            ImGui::TextDisabled("Output backend: %s",impl.makcu->GetConfig().backend==InputBackend::medius?"Medius":"Stock MAKCU");
+            if(!impl.makcu->IsMouseButtonInputAvailable())
+                ImGui::TextWrapped("Connect Mouse Output and wait for physical-button monitoring before activating TestClick.");
+            ImGui::TextWrapped("Click status: %s",output.message.c_str());
+            ImGui::TextDisabled("Requests: %llu | Started: %llu | Confirmed: %llu",
+                static_cast<unsigned long long>(output.attempts),static_cast<unsigned long long>(output.started),
+                static_cast<unsigned long long>(output.completed));
+            ImGui::TextDisabled("Rejected: %llu | Cancelled: %llu | Failed: %llu",static_cast<unsigned long long>(output.rejected),
+                static_cast<unsigned long long>(output.cancelled),static_cast<unsigned long long>(output.failed));
+        }
+
         custom::Separator();
 
+        bool publishPolicy{};bool policyEnabled{};std::uint64_t policyGeneration{};MouseButtonBinding policyButton{};
         {
             std::lock_guard<std::mutex> lk(impl.settingsMutex);
             bool settingsChanged = false;
@@ -663,7 +677,7 @@ namespace vanta
                     custom::Separator();
                 };
 
-            custom::Checkbox("Enable TestClick", &impl.enabled);
+            settingsChanged |= custom::Checkbox("Enable TestClick", &impl.enabled);
 
             if (impl.enabled)
             {
@@ -672,11 +686,13 @@ namespace vanta
             const char* buttonNames[]{
                 "Left click",
                 "Right click",
+                "Middle click",
                 "Mouse X1",
                 "Mouse X2"};
             const MouseButtonBinding buttonValues[]{
                 MouseButtonBinding::left,
                 MouseButtonBinding::right,
+                MouseButtonBinding::middle,
                 MouseButtonBinding::x1,
                 MouseButtonBinding::x2};
             constexpr int buttonCount =
@@ -694,7 +710,7 @@ namespace vanta
                 }
             }
             if (custom::Combo(
-                    "Hold key (MAKCU)",
+                    "Activation button",
                     &selectedButton,
                     buttonNames,
                     buttonCount))
@@ -702,6 +718,7 @@ namespace vanta
                 impl.holdButton = buttonValues[selectedButton];
                 settingsChanged = true;
             }
+            ImGui::TextWrapped("Hold this button to repeat left clicks while a fresh frame contains a valid target. Release to stop.");
 
             drawCategory("TARGET");
 
@@ -754,6 +771,7 @@ namespace vanta
             settingsChanged |= custom::Checkbox(
                 "Enable burst limiter",
                 &impl.burstLimiter);
+            if(!impl.burstLimiter)ImGui::TextDisabled("Repeats after each completed click while the target stays valid.");
             if (impl.burstLimiter)
             {
                 settingsChanged |= custom::SliderFloat(
@@ -768,11 +786,14 @@ namespace vanta
             }
             if (settingsChanged)
             {
-                impl.settingsRevision.fetch_add(
-                    1,
-                    std::memory_order_relaxed);
+                policyGeneration=impl.settingsRevision.fetch_add(1)+1;
+                policyEnabled=impl.enabled;policyButton=impl.holdButton;publishPolicy=true;
             }
         }
+        // Publish enable/disable/binding changes immediately. In-flight clicks
+        // see the new generation even while the capture worker is waiting.
+        if(publishPolicy && impl.makcu)
+            impl.makcu->SetInputPolicy(InputOwner::testClick,policyEnabled,policyGeneration,policyButton);
 
         ImGui::PopStyleVar();
         custom::EndChild();
@@ -805,6 +826,8 @@ namespace vanta
         const TestClickConfig& config)
     {
         auto& impl = *implementation_;
+        std::uint64_t generation{};MouseButtonBinding binding{};
+        {
         std::lock_guard<std::mutex> lock(
             impl.settingsMutex);
         impl.enabled = config.enabled;
@@ -847,9 +870,10 @@ namespace vanta
                 1.50F);
         impl.burstSize =
             std::clamp(config.burstSize, 1, 8);
-        impl.settingsRevision.fetch_add(
-            1,
-            std::memory_order_relaxed);
+        generation=impl.settingsRevision.fetch_add(1)+1;
+        binding=impl.holdButton;
+        }
+        if(impl.makcu)impl.makcu->SetInputPolicy(InputOwner::testClick,config.enabled,generation,binding);
     }
 
     std::uint64_t
@@ -858,5 +882,45 @@ namespace vanta
         return implementation_->
             settingsRevision.load(
                 std::memory_order_relaxed);
+    }
+
+    std::string TestClickController::DiagnosticsJson() const
+    {
+        const auto& impl=*implementation_;const auto config=GetConfig();
+        const auto output=impl.makcu?impl.makcu->ClickStatus(InputOwner::testClick):ClickOutputStatus{};
+        std::ostringstream out;out<<"{\"state\":"<<InputJsonString(StateLabel(impl.state.load()))
+            <<",\"worker_alive\":"<<(impl.threadAlive?"true":"false")<<",\"enabled\":"<<(config.enabled?"true":"false")
+            <<",\"configuration_generation\":"<<impl.settingsRevision.load()<<",\"activation\":"<<unsigned(config.holdButton)
+            <<",\"activation_held\":"<<(impl.makcu && impl.makcu->IsMouseButtonPressed(config.holdButton)?"true":"false")
+            <<",\"target_present\":"<<(impl.triggerActive?"true":"false")<<",\"ray_hits\":"<<impl.lastHits.load()
+            <<",\"shots_confirmed\":"<<impl.shotsFired.load()<<",\"burst_limiter\":"<<(config.burstLimiter?"true":"false")
+            <<",\"click_phase\":"<<int(output.phase)<<",\"attempts\":"<<output.attempts<<",\"started\":"<<output.started
+            <<",\"completed\":"<<output.completed<<",\"rejected\":"<<output.rejected<<",\"cancelled\":"<<output.cancelled
+            <<",\"failed\":"<<output.failed<<",\"click_status\":"<<InputJsonString(output.message)
+            <<",\"click_status_at_local_us\":"<<output.updatedAtUs<<'}';return out.str();
+    }
+
+    bool TestClickController::RunSelfTest()
+    {
+        // Opt-in, compile-only on the development PC. No capture or hardware.
+        ClickRepeatState repeat;
+        for(int i=0;i<20;++i)
+        {
+            const double now=1.0+i*0.04;
+            if(!repeat.Due(false,3,0.05,0.20,now))return false;
+            repeat.Completed(false,now);
+        }
+        repeat.Reset();
+        for(int i=0;i<3;++i)
+        {
+            const double now=1.0+i*0.06;
+            if(!repeat.Due(true,3,0.05,0.20,now))return false;
+            repeat.Completed(true,now);
+        }
+        if(repeat.Due(true,3,0.05,0.20,1.2) || !repeat.Due(true,3,0.05,0.20,1.4))return false;
+        // Rejected output never consumes a burst slot or a repeat interval.
+        if(!repeat.Due(true,3,0.05,0.20,1.4) || repeat.burstCount!=0)return false;
+        repeat.Reset();if(!repeat.Due(true,3,0.05,0.20,1.0))return false;
+        log::Info("TestClick repeat scheduling deterministic checks passed");return true;
     }
 }
